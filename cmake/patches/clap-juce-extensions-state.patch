@@ -1,0 +1,46 @@
+diff --git a/src/wrapper/clap-juce-wrapper.cpp b/src/wrapper/clap-juce-wrapper.cpp
+index ede12d2..270b5da 100644
+--- a/src/wrapper/clap-juce-wrapper.cpp
++++ b/src/wrapper/clap-juce-wrapper.cpp
+@@ -27,6 +27,14 @@
+ #include <juce_audio_processors/format_types/juce_LegacyAudioParameter.cpp>
+ #endif
+ 
++// HOT-STEP LINK patch: a processor may report whether its last setStateInformation
++// accepted the chunk. Keep this definition identical to source/ClapStateVerdict.h.
++struct clap_juce_state_load_verdict
++{
++    virtual ~clap_juce_state_load_verdict() = default;
++    virtual bool clapLastStateLoadAccepted() const = 0;
++};
++
+ #if JUCE_WINDOWS && JUCE_VERSION >= 0x070006
+ #include <juce_gui_basics/native/juce_WindowsHooks_windows.h>
+ #endif
+@@ -2450,7 +2458,26 @@ class ClapJuceWrapper : public clap::helpers::Plugin<
+ 
+         // JUCE has no way to report an unstream error; setStateInformation is void
+         // So we just have to assume it works.
++        // HOT-STEP LINK patch: a chunk that is not a JUCE binary XML state is rejected
++        if (juce::AudioProcessor::getXmlFromBinary(chunkMemory.getData(),
++                                                   (int)chunkMemory.getSize()) == nullptr)
++        {
++            chunkMemory.reset();
++            return false;
++        }
+         processor->setStateInformation(chunkMemory.getData(), (int)chunkMemory.getSize());
++        // HOT-STEP LINK patch: the processor may reject a well-formed but foreign state
++        if (auto *verdict = dynamic_cast<clap_juce_state_load_verdict *>(processor.get()))
++        {
++            if (!verdict->clapLastStateLoadAccepted())
++            {
++                chunkMemory.reset();
++                return false;
++            }
++        }
++        // MDMAchine patch: tell the host to re-read parameter values after a state load
++        if (_host.canUseParams())
++            _host.paramsRescan(CLAP_PARAM_RESCAN_VALUES);
+         chunkMemory.reset();
+         return true;
+     }

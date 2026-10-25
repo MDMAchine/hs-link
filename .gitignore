@@ -1,0 +1,10 @@
+docs/internal/
+docs/reports/
+docs/test_logs/
+reports/
+test_logs/
+_tmp/
+build/
+.env
+*SIGNING*
+*.env
