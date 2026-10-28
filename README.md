@@ -8,29 +8,55 @@
 
 # HOT-STEP LINK
 
-A VST3 plugin and Standalone application that connects a DAW (or desktop session) to a running local [HOT-Step](https://github.com/scragnog/HOT-Step-CPP) server. You type a caption, pick a mode, and the plugin sends a generation request over HTTP. Audio generation happens entirely in HOT-Step; the plugin handles host sync, capture, take playback, and drag-out.
+A VST3/CLAP/AU plugin and Standalone application that connects a DAW (or desktop session) to a running local [HOT-Step](https://github.com/scragnog/HOT-Step-CPP) server. You type a caption, pick a mode, and the plugin sends a generation request over HTTP. Audio generation happens entirely in HOT-Step; the plugin handles host sync, capture, take playback, and drag-out.
 
-**Status: v0.5.14, pre-release.** Rounds R1 through R6 pass the console test suite. Ableton Live was tested by hand on 2026-10-07. Reaper and Bitwig have not been tested by hand; see [Unverified sections](#unverified) below. An unsigned Windows zip (VST3, CLAP, Standalone, license file) is available; see [Install](#install). Code signing is not yet done. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for a summary of confirmed issues.
+**Status: v0.5.14 beta, pre-release.** Zips for Windows x64 and macOS arm64 are on the [Releases page](https://github.com/MDMAchine/hs-link/releases). Windows passes pluginval strictness 5; the Mac AU passes auval. Ableton Live was tested by hand; Reaper, Bitwig and Samplitude were not.
 
 ---
 
 ## Beta install
 
-HOT-STEP LINK 0.5.14 beta is a VST3/CLAP plugin and Standalone app that sends generation requests to a running local HOT-Step server and brings the takes back into your DAW. It makes no audio by itself: HOT-Step must be running and reachable (default `http://127.0.0.1:3001`).
+LINK makes no audio by itself: HOT-Step must be running and reachable (default `http://127.0.0.1:3001`). Get the zip for your platform from [Releases](https://github.com/MDMAchine/hs-link/releases) and check its SHA-256 against the value in the release notes or `SHA256SUMS` (Windows: `certutil -hashfile <zip> SHA256`; macOS: `shasum -a 256 <zip>`).
 
-1. Install the Microsoft Visual C++ 2015-2022 x64 runtime if you do not have it: https://aka.ms/vs/17/release/vc_redist.x64.exe
+Download the zip, unzip, copy the plugin into your plugin folder (Windows: `C:\Program Files\Common Files\VST3\`; Mac: `~/Library/Audio/Plug-Ins/Components/`).
+
+### Windows x64
+
+1. Install the Microsoft Visual C++ 2015-2022 x64 runtime if needed: https://aka.ms/vs/17/release/vc_redist.x64.exe
 2. Copy the `HOT-STEP LINK.vst3` folder to `C:\Program Files\Common Files\VST3\`.
 3. Copy `HOT-STEP LINK.clap` to `C:\Program Files\Common Files\CLAP\`.
 4. Optional: run `HOT-STEP LINK.exe` (Standalone) from anywhere.
-5. Rescan plugins in your host.
+5. Restart your host and rescan plugins. If LINK does not appear, check that the host scans `C:\Program Files\Common Files\VST3` (and `...\CLAP` for CLAP hosts).
 
-The build is unsigned, so Windows SmartScreen may warn on first run. Known issues for this beta are in `docs/KNOWN_ISSUES_BETA.md`; the user guide is `docs/MANUAL.md`.
+If SmartScreen shows "Windows protected your PC", click **More info**, then **Run anyway**. If the zip is blocked, right-click it, **Properties**, tick **Unblock**, then unzip.
 
-Reporting bugs: send your host name and version, the HOT-Step backend you used, the steps to reproduce, and the text of any error or status line. Screenshots help. For crashes, include the crash dump or host log if one was written.
+### macOS (Apple Silicon)
+
+1. Copy `AU/HOT-STEP LINK.component` to `~/Library/Audio/Plug-Ins/Components/`, `VST3/HOT-STEP LINK.vst3` to `~/Library/Audio/Plug-Ins/VST3/`, `CLAP/HOT-STEP LINK.clap` to `~/Library/Audio/Plug-Ins/CLAP/`, and `HOT-STEP LINK.app` to `/Applications/`.
+2. The Mac build is not notarized yet, so macOS may block it the first time; right-click > Open. If a plugin still says it "cannot be opened" or "is damaged", clear the quarantine flag in Terminal (the AU is the one Logic and GarageBand use):
+
+   ```
+   xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/Components/"HOT-STEP LINK.component"
+   xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/VST3/"HOT-STEP LINK.vst3"
+   xattr -dr com.apple.quarantine ~/Library/Audio/Plug-Ins/CLAP/"HOT-STEP LINK.clap"
+   xattr -dr com.apple.quarantine /Applications/"HOT-STEP LINK.app"
+   ```
+
+   For the Standalone you can instead right-click `HOT-STEP LINK.app` in Finder, choose **Open**, then **Open** again in the dialog. Plugins cannot be opened that way, so use `xattr` for the `.component`, `.vst3` and `.clap`.
+
+3. Quit and restart your DAW so it picks up the cleared files, then rescan. Logic Pro: Settings > Plug-in Manager, select LINK, **Reset & Rescan Selection**. Ableton Live: Settings > Plug-Ins, enable the system folders, **Rescan**.
+
+### DAW setup
+
+Insert LINK on an audio or instrument track, make sure the server field points at your HOT-Step server (default `http://127.0.0.1:3001`), and press Connect. See [Quick start](#quick-start) and [docs/MANUAL.md](docs/MANUAL.md).
+
+### Reporting bugs
+
+Open an [issue](https://github.com/MDMAchine/hs-link/issues) with: OS and version, host name and version, plugin format, the HOT-Step backend you used, steps to reproduce, and the exact error or status line. Screenshots help. For crashes, attach the crash dump or host log if one was written.
 
 ## Build from source
 
-If you prefer not to run unsigned binaries, build it yourself with Visual Studio 2022, CMake 3.22+ and JUCE 8.0.12. See `docs/DEVELOPING.md` and the Build section below.
+If you prefer, build it yourself with Visual Studio 2022, CMake 3.22+ and JUCE 8.0.12. See `docs/DEVELOPING.md` and the Build section below.
 
 ---
 
@@ -89,7 +115,7 @@ The test binary covers host sync, capture ring, DawWorker offline detection, aud
 
 ## Install
 
-Windows x64 only for now. Install by hand from the zip.
+Windows x64 only in this section; Mac steps are in [Beta install](#beta-install). Download the zip, unzip, copy the plugin into your plugin folder (Windows: `C:\Program Files\Common Files\VST3\`; Mac: `~/Library/Audio/Plug-Ins/Components/`).
 
 Download: **[release download link: TBD]** (`HOTSTEP_LINK_<version>_Windows_x64.zip`, with a `.sha256`)
 
@@ -101,7 +127,7 @@ Before you start, you need:
 
 ### Manual install from the zip
 
-The files are **not code-signed yet**. Windows SmartScreen may show a blue "Windows protected your PC" box when you run the Standalone. To continue, click **More info**, then **Run anyway**.
+Windows SmartScreen may show a blue "Windows protected your PC" box when you run the Standalone. To continue, click **More info**, then **Run anyway**.
 
 The zip (`HOTSTEP_LINK_<version>_Windows_x64.zip`) holds the three built files, plus `INSTALL.txt`, `LICENSE` and `THIRD_PARTY_NOTICES.md`:
 
@@ -175,7 +201,15 @@ The plugin communicates with HOT-Step over HTTP only. No HOT-Step source or bina
 
 ## Known issues
 
-- ACE renders can come out slightly shorter than the requested duration (a 10 s request gave 9.44 s). This is engine-side, not the plugin.
+- See the SmartScreen and Mac first-run steps above. No Linux binaries.
+- Mac: AU passes auval but has not been run in a DAW; audition playback on Mac is untested.
+- Some sandboxed hosts (Logic Pro, some Bitwig setups) refuse file drops from a plugin window. Use Export WAV and import from disk.
+- Multi-take jobs show only the requested seed, not a seed per take.
+- Backend switch is untested against a live server. If you see "Could not switch to", press Generate again.
+- Recovered takes may appear twice when switching between pre-0.5.14 and 0.5.14 builds on the same takes folder.
+- ACE renders can come out slightly shorter than requested (a 10 s request gave 9.44 s). This is engine-side, not the plugin.
+
+The full list for testers is in the [v0.5.14 release notes](https://github.com/MDMAchine/hs-link/releases/tag/v0.5.14).
 
 ---
 
@@ -190,4 +224,4 @@ The following items have not been verified in a real DAW:
 - YuE2 in batch mode: in the bench run the batch-4 path produced an OOM when SA3 was resident at the same time. Not reproduced under normal plugin startup conditions but possible with a warm keep-loaded server.
 - **Backend switch, live server.** The backend switch (Generate with Backend set to a specific value) has not been checked against a live HOT-Step server. The switch timeout (10 s against a silent server) and the cancel of a switch in flight are not covered by tests.
 
-See [docs/HOST_TEST.md](docs/HOST_TEST.md) for the checklist to fill in when first tested in a host.
+Tested a host? Open an issue with what worked and what did not.
