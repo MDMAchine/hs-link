@@ -23,11 +23,17 @@ FetchContent_Declare(clap-juce-extensions
 FetchContent_MakeAvailable(clap-juce-extensions)
 
 if(DEFINED ENV{JUCE_DIR})
-    set(_hsl_juce_default "$ENV{JUCE_DIR}")
+    set(_hslink_juce_default "$ENV{JUCE_DIR}")
 else()
-    set(_hsl_juce_default "${CMAKE_CURRENT_SOURCE_DIR}/../JUCE")
+    set(_hslink_juce_default "${CMAKE_CURRENT_SOURCE_DIR}/../JUCE")
 endif()
-set(JUCE_DIR "${_hsl_juce_default}" CACHE PATH "Path to a JUCE 8 checkout")
+set(JUCE_DIR "${_hslink_juce_default}" CACHE PATH "Path to a JUCE 8 checkout (env JUCE_DIR, else ../JUCE, else FetchContent)")
+# Default contract stub for live tests; override at runtime with env HSLINK_STUB.
+set(_hslink_stub_default "${CMAKE_CURRENT_SOURCE_DIR}/../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs")
+if(NOT EXISTS "${_hslink_stub_default}" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs")
+    get_filename_component(_hslink_stub_default "${CMAKE_CURRENT_SOURCE_DIR}/../../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs" ABSOLUTE)
+endif()
+set(HSLINK_STUB_DEFAULT "${_hslink_stub_default}" CACHE FILEPATH "Default daw-contract-stub.mjs for live tests (HOT-Step-CPP checkout next to or one level above this repo)")
 if(EXISTS "${JUCE_DIR}/CMakeLists.txt")
     add_subdirectory(${JUCE_DIR} ${CMAKE_BINARY_DIR}/JUCE)
 else()
@@ -41,7 +47,8 @@ juce_add_plugin(${PLUGIN_TARGET}
     BUNDLE_ID                com.hotstep.link
     PLUGIN_MANUFACTURER_CODE Hstp
     PLUGIN_CODE              ${PLUGIN_CODE}
-    FORMATS                  VST3 Standalone CLAP
+    FORMATS                  VST3 Standalone CLAP AU
+    AU_MAIN_TYPE             kAudioUnitType_Effect
     PRODUCT_NAME             "HOT-STEP LINK"
     IS_SYNTH                 FALSE
     NEEDS_MIDI_INPUT         FALSE
@@ -96,6 +103,7 @@ target_sources(HSLINK_Tests PRIVATE
     source/TakeEdit.cpp source/TakePeaks.cpp source/TakeEditorPanel.cpp source/WavTempoTag.cpp)
 target_include_directories(HSLINK_Tests PRIVATE source third_party)
 target_compile_definitions(HSLINK_Tests PRIVATE
+    HSLINK_STUB_DEFAULT_PATH="${HSLINK_STUB_DEFAULT}"
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 HSLINK_TEST_HOOKS=1
     JucePlugin_Name="HOT-STEP LINK" JucePlugin_VersionString="${PROJECT_VERSION}" NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
 if(HSLINK_TEETH)
@@ -176,6 +184,7 @@ target_sources(HSLINK_BypassUploadTest PRIVATE
     source/TakeEdit.cpp source/TakePeaks.cpp source/TakeEditorPanel.cpp source/WavTempoTag.cpp)
 target_include_directories(HSLINK_BypassUploadTest PRIVATE source third_party)
 target_compile_definitions(HSLINK_BypassUploadTest PRIVATE
+    HSLINK_STUB_DEFAULT_PATH="${HSLINK_STUB_DEFAULT}"
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
     JucePlugin_Name="HOT-STEP LINK" JucePlugin_VersionString="${PROJECT_VERSION}" NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
 target_link_libraries(HSLINK_BypassUploadTest PRIVATE
@@ -192,6 +201,7 @@ target_include_directories(HSLINK_CloseSpanTest PRIVATE source third_party)
 target_compile_options(HSLINK_CloseSpanTest PRIVATE /Zi)
 target_link_options(HSLINK_CloseSpanTest PRIVATE /DEBUG)
 target_compile_definitions(HSLINK_CloseSpanTest PRIVATE
+    HSLINK_STUB_DEFAULT_PATH="${HSLINK_STUB_DEFAULT}"
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
     JucePlugin_Name="HOT-STEP LINK" JucePlugin_VersionString="${PROJECT_VERSION}" NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
 target_link_libraries(HSLINK_CloseSpanTest PRIVATE

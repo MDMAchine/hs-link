@@ -1,3 +1,6 @@
+#ifndef HSLINK_STUB_DEFAULT_PATH
+ #define HSLINK_STUB_DEFAULT_PATH "../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs"
+#endif
 #include <stdexcept>
 #include <map>
 #include <functional>
@@ -218,7 +221,7 @@ void testDawWorkerLive()
 {
     const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "1";
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     std::printf ("DAW worker live vs stub (port 3911)%s\n", teeth ? "  [TEETH: deadline disabled]" : "");
     if (! stub.existsAsFile())
     {
@@ -564,7 +567,7 @@ bool waitFinished (DawWorker& w, int id, double limitS, DawJob& out, bool untilR
 void testJobsLive (const juce::File& tmpDir)
 {
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     std::printf ("DAW jobs live vs stub (port 3912)\n");
     if (! stub.existsAsFile())
     {
@@ -861,7 +864,7 @@ void testSourceCapture()
 
     // What the stub receives.
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile())
     {
         std::printf ("  [INFO] stub not found, live repaint skipped\n");
@@ -1546,7 +1549,7 @@ void testShutdownSafety (const juce::File& tmpDir)
     const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH_SHUTDOWN", {}) == "1";
     std::printf ("Shutdown safety%s\n", teeth ? "  [TEETH: legacy blocking paths]" : "");
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (stub.existsAsFile())
     {
         juce::ChildProcess server;
@@ -1668,7 +1671,7 @@ void testSlowSubmit (const juce::File& tmpDir)
     const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH_TIMEOUTS", {}) == "1";
     std::printf ("Slow submit%s\n", teeth ? "  [TEETH: short timeout everywhere]" : "");
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile()) { std::printf ("  [INFO] stub not found, skipped\n"); return; }
     juce::ChildProcess server;
     check (server.start ("node \"" + stub.getFullPathName() + "\" --ok --port 3914", 0), "stub started");
@@ -3120,7 +3123,7 @@ void testQueue (const juce::File& tmpDir)
     const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_QUEUE";
     std::printf ("Generation queue vs stub (port 3916)%s\n", teeth ? "  [TEETH: NO_QUEUE]" : "");
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile()) { std::printf ("  [INFO] stub not found, skipped\n"); return; }
     juce::ChildProcess server;
     check (server.start ("node \"" + stub.getFullPathName() + "\" --ok --port 3916", 0), "stub started");
@@ -3307,7 +3310,7 @@ void testSubmitRace (const juce::File& tmpDir)
     const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_SUBMIT_MARK";
     std::printf ("Submit window vs stub (port 3919)%s%c", teeth ? "  [TEETH: NO_SUBMIT_MARK]" : "", 10);
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile()) { std::printf ("  [INFO] stub not found, skipped%c", 10); return; }
     juce::ChildProcess server;
     check (server.start ("node \"" + stub.getFullPathName() + "\" --ok --port 3919", 0), "stub started");
@@ -3472,7 +3475,7 @@ void testTakeStore (const juce::File& tmpDir)
     const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_TAKE_STORE";
     std::printf ("Take list outlives job cards vs stub (port 3917)%s%c", teeth ? "  [TEETH: NO_TAKE_STORE]" : "", 10);
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile()) { std::printf ("  [INFO] stub not found, skipped%c", 10); return; }
     juce::ChildProcess server;
     check (server.start ("node \"" + stub.getFullPathName() + "\" --ok --port 3917", 0), "stub started");
@@ -3727,7 +3730,7 @@ void testAceModel (const juce::File& tmpDir)
 {
     std::printf ("ACE model field vs stub (port 3915)\n");
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile()) { std::printf ("  [INFO] stub not found, skipped\n"); return; }
     juce::ChildProcess server;
     check (server.start ("node \"" + stub.getFullPathName() + "\" --ok --port 3915", 0), "stub started");
@@ -6023,7 +6026,7 @@ void testTakeIdentity (const juce::File& tmp)
     {
         setEnvRoot (tmp.getChildFile ("r1b_d_stable"));
         auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-            "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+            "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
         juce::ChildProcess server;
         if (! stub.existsAsFile())
             std::printf ("  [INFO] stub not found, T-D download checks skipped%c", 10);
@@ -6505,7 +6508,7 @@ void testTakeFinalise (const juce::File& tmp)
     // download still leaves nothing.
     {
         auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-            "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+            "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
         juce::ChildProcess server;
         if (! stub.existsAsFile())
             std::printf ("  Y1-E [INFO] stub not found, skipped%c", 10);
@@ -7369,12 +7372,12 @@ void testSessionLockAndParts (const juce::File& tmp)
     {
         const auto d = tmp.getChildFile ("r2_p1");
         d.createDirectory();
-        const bool a1 = DawWorker::appendSavedLog (d, "a take with spaces.wav", 1234, "X:/lasting/a take with spaces.wav");
-        d.getChildFile (logName).appendText (nl + "a line without any tab" + nl + "bad_size.wav" + tab + "12x4" + tab + "X:/lasting/bad_size.wav" + nl
-                                                 + "no_path.wav" + tab + "77" + nl + "other_size.wav" + tab + "999" + tab + "X:/lasting/other_size.wav" + nl + nl,
+        const bool a1 = DawWorker::appendSavedLog (d, "a take with spaces.wav", 1234, "C:/lasting/a take with spaces.wav");
+        d.getChildFile (logName).appendText (nl + "a line without any tab" + nl + "bad_size.wav" + tab + "12x4" + tab + "C:/lasting/bad_size.wav" + nl
+                                                 + "no_path.wav" + tab + "77" + nl + "other_size.wav" + tab + "999" + tab + "C:/lasting/other_size.wav" + nl + nl,
                                              false, false, nullptr);
-        const bool a2 = DawWorker::appendSavedLog (d, "b.wav", 500, "X:/lasting/b.wav");
-        const bool a3 = DawWorker::appendSavedLog (d, "", 5, "X:/x"), a4 = DawWorker::appendSavedLog (d, "zero.wav", 0, "X:/zero.wav");
+        const bool a2 = DawWorker::appendSavedLog (d, "b.wav", 500, "/lasting/b.wav");
+        const bool a3 = DawWorker::appendSavedLog (d, "", 5, "/x"), a4 = DawWorker::appendSavedLog (d, "zero.wav", 0, "/zero.wav");
         const auto keys = DawWorker::readSavedLog (d);
         std::printf ("  P1 saved.log of %lld bytes; appends: valid %d %d (want 1 1), no name %d, zero size %d (want 0 0); parsed %d key(s) (want 3): %s%c",
                      (long long) d.getChildFile (logName).getSize(), (int) a1, (int) a2, (int) a3, (int) a4, keys.size(),
@@ -7622,7 +7625,7 @@ void testSessionLockAndParts (const juce::File& tmp)
     // G6 and G7 (A3): the real worker against the stub.
     {
         auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-            "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+            "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
         juce::ChildProcess server;
         if (! stub.existsAsFile())
             std::printf ("  G6 / G7-A3 [INFO] stub not found, skipped%c", 10);
@@ -8040,7 +8043,7 @@ void testLegacyAndZeroByte (const juce::File& tmp)
     // B2-d. The worker: a 200 whose file has no bytes is an incomplete download.
     {
         auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-            "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+            "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
         juce::ChildProcess server;
         if (! stub.existsAsFile())
             std::printf ("  B2-d [INFO] stub not found, skipped%c", 10);
@@ -9072,7 +9075,7 @@ void testSaverOwnsCopies (const juce::File& tmp)
     // C3 (ii). A mixed job: take 0 downloads fine, take 1 has an empty body.
     {
         auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-            "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+            "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
         juce::ChildProcess server;
         if (! stub.existsAsFile())
             std::printf ("  C3 (ii) [INFO] stub not found, skipped%c", 10);
@@ -10768,7 +10771,7 @@ void testBackendSwitch (const juce::File& tmpDir)
     }
 
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile()) { std::printf ("  [INFO] stub not found, skipped\n"); return; }
     juce::ChildProcess server;
     check (server.start ("node \"" + stub.getFullPathName() + "\" --ok --port 3931", 0), "stub started");
@@ -19692,7 +19695,7 @@ static void testTakeLoop (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, loop set=%d: %d areas (%d take the mouse, %d buttons or boxes), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty=%d (want 0), buttons under 48 x 24=%d (want 0)%c",
                      size.x, size.y, (int) panel.hasLoopForTest(), (int) areas.size(), hit, buttons, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small, 10);
-        ck (panel.hasLoopForTest() && areas.size() == 31 && hit == 21 && buttons == 18 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.hasLoopForTest() && areas.size() == 34 && hit == 24 && buttons == 21 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686" : "7: no two areas overlap and none leaves the panel at 490 x 566");
         panel.close (false);
     }
@@ -20953,7 +20956,7 @@ static void testTakeSnap (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, snap row filled (note '%s', fits=%d): %d areas (%d take the mouse, %d buttons or boxes, %d of the snap row), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty=%d (want 0), buttons under 48 x 24=%d (want 0)\n",
                      size.x, size.y, panel.noteTextForTest().toRawUTF8(), (int) panel.noteFitsForTest(), (int) areas.size(), hit, buttons, snapAreas, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small);
-        ck (panel.noteTextForTest().isNotEmpty() && panel.noteFitsForTest() && areas.size() == 31 && hit == 21 && buttons == 18 && snapAreas == 3 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.noteTextForTest().isNotEmpty() && panel.noteFitsForTest() && areas.size() == 34 && hit == 24 && buttons == 21 && snapAreas == 3 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the snap row filled" : "7: no two areas overlap and none leaves the panel at 490 x 566 with the snap row filled");
         panel.close (false);
     }
@@ -22074,7 +22077,7 @@ static void testTakeFit (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, fit row filled, Stretch to fit lit=%d: %d areas (%d take the mouse, %d buttons or boxes, %d of the fit row), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d, empty=%d, buttons under 48 x 24=%d (want 0 each)\n",
                      size.x, size.y, (int) panel.stretchEnabledForTest(), (int) areas.size(), hit, buttons, fitAreas, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small);
-        ck (panel.stretchEnabledForTest() && areas.size() == 31 && hit == 21 && buttons == 18 && fitAreas == 4 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.stretchEnabledForTest() && areas.size() == 34 && hit == 24 && buttons == 21 && fitAreas == 4 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the fit row filled" : "7: no two areas overlap and none leaves the panel at 490 x 566 with the fit row filled");
         if (size.x == 490)
         {

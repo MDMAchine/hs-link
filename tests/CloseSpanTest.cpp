@@ -1,3 +1,6 @@
+#ifndef HSLINK_STUB_DEFAULT_PATH
+ #define HSLINK_STUB_DEFAULT_PATH "../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs"
+#endif
 // HOT-STEP LINK -- CloseSpanTest.cpp
 // Copyright (C) 2026 A&E Concepts. SPDX-License-Identifier: AGPL-3.0-or-later
 // Full host close span: from the host close request (editor delete begins) through the
@@ -10,7 +13,7 @@
 // in system DLLs and are not counted.
 // Asserts span < 2000 ms. Teeth: HSLINK_CLOSE_STALL_MS=<ms> holds the destructor that
 // long through the testBeforePoolWait hook, which must make the test fail.
-// Needs node and the contract stub (HSLINK_STUB, default the HOT-Step-CPP copy).
+// Needs node and the contract stub (HSLINK_STUB, default HSLINK_STUB_DEFAULT_PATH from CMake).
 // Scratch under <cwd>/close_span_scratch, removed at the end.
 #include "PluginProcessor.h"
 
@@ -154,7 +157,7 @@ int main()
     std::printf ("Close span (host close to last plugin thread exit), stall=%d ms\n", stallMs);
 
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile())
     {
         std::printf ("  [INFO] stub not found, skipped\n");

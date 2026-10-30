@@ -3184,14 +3184,34 @@ bool SourceWaveView::poll()
     return true;
 }
 
+SourceWaveView::HeaderStyle SourceWaveView::headerStyleFor (CaptureState s)
+{
+    switch (s)
+    {
+        case CaptureState::recording: return { juce::Colour (0xffef4444), true };
+        case CaptureState::captured:  return { kText, false };
+        case CaptureState::idle:      break;
+    }
+    return { kDim, false };
+}
+
 void SourceWaveView::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds();
     auto head = r.removeFromTop (16);
     auto ruler = r.removeFromBottom (14);
     g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
-    g.setColour (kDim);
-    g.drawText (recording ? "RECORDING" : "CAPTURED", head.reduced (4, 0), juce::Justification::centredLeft);
+    const auto st = headerStyleFor (recording ? CaptureState::recording
+                                    : (peaks != nullptr && peaks->ok) ? CaptureState::captured : CaptureState::idle);
+    auto label = head.reduced (4, 0);
+    if (st.dot)
+    {
+        g.setColour (st.text);
+        g.fillEllipse (label.removeFromLeft (8).toFloat().withSizeKeepingCentre (6.0f, 6.0f));
+        label.removeFromLeft (3);
+    }
+    g.setColour (st.text);
+    g.drawText (recording ? "RECORDING" : "CAPTURED", label, juce::Justification::centredLeft);
 
     const double bars = bpm > 0.0 ? lengthS * bpm / 240.0 : 0.0; // 4/4 bars
     if (bars > 0.0)

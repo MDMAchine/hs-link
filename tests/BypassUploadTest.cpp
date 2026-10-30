@@ -1,3 +1,6 @@
+#ifndef HSLINK_STUB_DEFAULT_PATH
+ #define HSLINK_STUB_DEFAULT_PATH "../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs"
+#endif
 // HOT-STEP LINK -- BypassUploadTest.cpp
 // Copyright (C) 2026 A&E Concepts. SPDX-License-Identifier: AGPL-3.0-or-later
 // Host bypass arriving while a job is still sending (repaint with a source upload, the
@@ -6,7 +9,7 @@
 // state sequence printed; un-bypass gives the same output as before the bypass; the
 // take lands once; destroy is quick and leaves no partial file or open handle (the
 // takes folder can be deleted right after).
-// Needs node and the contract stub (HSLINK_STUB, default the HOT-Step-CPP copy).
+// Needs node and the contract stub (HSLINK_STUB, default HSLINK_STUB_DEFAULT_PATH from CMake).
 // Scratch under <cwd>/bypass_upload_scratch, removed at the end.
 #include "PluginProcessor.h"
 
@@ -68,7 +71,7 @@ int main()
     std::printf ("Bypass during source upload\n");
 
     auto stub = juce::File (juce::SystemStats::getEnvironmentVariable (
-        "HSLINK_STUB", juce::File::getCurrentWorkingDirectory().getChildFile ("../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs").getFullPathName()));
+        "HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
     if (! stub.existsAsFile())
     {
         std::printf ("  [INFO] stub not found, skipped\n");

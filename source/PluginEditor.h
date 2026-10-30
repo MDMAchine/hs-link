@@ -322,6 +322,10 @@ class SourceWaveView : public juce::Component, public juce::SettableTooltipClien
 {
 public:
     SourceWaveView() = default;
+    // Header capture-state look (pure, testable without a GUI).
+    enum class CaptureState { idle, recording, captured };
+    struct HeaderStyle { juce::Colour text; bool dot = false; };
+    static HeaderStyle headerStyleFor (CaptureState s);
     ~SourceWaveView() override;
     // Message thread. Starts a peak build when file or length changed; empty file clears.
     void setSource (const juce::File& file, double lengthS, double bpm);

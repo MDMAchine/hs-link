@@ -232,7 +232,19 @@ namespace TakeEditorMath
         return snapLoop (s, e, true, grid, sampleRate, length) && s == start && e == end;
     }
 
-    void beatLines (const View& v, const Grid& grid, double sampleRate, std::vector<BeatLine>& out)
+    bool scaleLoop (juce::int64& start, juce::int64& end, juce::int64 length, juce::int64 minLen, bool doubleIt)
+    {
+        if (! (start >= 0 && end > start && end <= length))
+            return false;
+        const auto len = end - start;
+        const auto newEnd = doubleIt ? start + 2 * len : start + len / 2;
+        if (newEnd - start < juce::jmax ((juce::int64) 1, minLen) || newEnd > length)
+            return false;
+        end = newEnd;
+        return true;
+    }
+
+    void beatLines (const View& v, const Grid& grid, double sampleRate, std::vector<BeatLine>& out, int resolution)
     {
         out.clear();
         if (! gridUsable (grid, sampleRate) || v.length <= 0 || v.widthPx < 1 || ! (v.framesPerPixel > 0.0))
@@ -242,12 +254,17 @@ namespace TakeEditorMath
         double step = 1.0, labelBars = 1.0; // beats from line to line, bars from number to number
         if (! all && pxPerBeat < kMinBeatPx)
             for (step = (double) kBeatsPerBar; step * pxPerBeat < kMinBeatPx && step < 1.0e12; step *= 2.0) {}
+        if (! all && resolution != 0)
+        {
+            step = std::ldexp (step, juce::jlimit (-kMaxResolutionStep, kMaxResolutionStep, resolution));
+            step = juce::jmax (1.0, step);
+        }
         if (! all)
             while (labelBars * kBeatsPerBar * pxPerBeat < kMinBarLabelPx && labelBars < 1.0e12)
                 labelBars *= 2.0;
         const double first = (double) v.firstFrame;
         const double last = juce::jmin ((double) v.length, first + (double) v.widthPx * v.framesPerPixel);
-        const size_t most = all ? (size_t) 100000 : (size_t) ((double) v.widthPx / kMinBeatPx) + 4; // by the width, never by the length
+        const size_t most = all ? (size_t) 100000 : (size_t) juce::jmin ((double) v.widthPx / juce::jmin (kMinBeatPx, step * pxPerBeat), 4000.0) + 4; // by the width, never by the length
         out.reserve (juce::jmin (most, (size_t) 4096));
         for (double k = std::ceil ((first - origin) / beat / step) * step; out.size() < most; k += step)
         {
@@ -585,6 +602,25 @@ TakeEditorPanel::TakeEditorPanel()
     addAndMakeVisible (playButton);
     addAndMakeVisible (stopButton);
     addAndMakeVisible (loopButton);
+    // Phase 2: loop length jump and manual grid resolution, in the middle of the zoom row.
+    loopHalfButton.setTooltip ("Halve the loop length; the loop start stays.");
+    loopDoubleButton.setTooltip ("Double the loop length; the loop start stays. Off when it would run past the end of the take.");
+    gridResBox.setSliderStyle (juce::Slider::IncDecButtons);
+    gridResBox.setIncDecButtonsMode (juce::Slider::incDecButtonsNotDraggable);
+    gridResBox.setRange ((double) -TakeEditorMath::kMaxResolutionStep, (double) TakeEditorMath::kMaxResolutionStep, 1.0);
+    gridResBox.setValue (0.0, juce::dontSendNotification);
+    gridResBox.setTextBoxStyle (juce::Slider::TextBoxLeft, true, 30, 28);
+    gridResBox.textFromValueFunction = [] (double v)
+    {
+        const int n = juce::roundToInt (v);
+        return n == 0 ? juce::String ("A") : (n > 0 ? "x" : "/") + juce::String (1 << std::abs (n));
+    };
+    gridResBox.setTooltip ("Grid resolution by hand: A = automatic, x2 x4... = fewer grid lines, /2 /4... = more (never finer than one line per beat)");
+    gridResBox.onValueChange = [this] { stepResolution (juce::roundToInt (gridResBox.getValue()) - gridResolution); };
+    loopHalfButton.onClick = [this] { scaleLoopLength (false); };
+    loopDoubleButton.onClick = [this] { scaleLoopLength (true); };
+    for (auto* b : { (juce::Component*) &loopHalfButton, (juce::Component*) &loopDoubleButton, (juce::Component*) &gridResBox })
+        addAndMakeVisible (*b);
     // Warp (Mock-up B, round 3): the middle of the zoom row, Apply warp at the right end of the bottom row.
     warpButton.setTooltip ("On: Play previews the take with the warp markers applied. Off: the plain take.");
     warpButton.setToggleState (true, juce::dontSendNotification);
@@ -616,6 +652,7 @@ void TakeEditorPanel::warpToHost()
         return;
     warpMarkers = WarpMarkers::scaleToTempo (warpMarkers, take.grid.bpm, to);
     warpTagBpm = to;
+    gridResBox.setValue ((double) gridResolution, juce::dontSendNotification);
     refreshButtons();
     repaint();
 }
@@ -773,7 +810,7 @@ std::vector<TakeEditorMath::BeatLine> TakeEditorPanel::beatLinesForTest() const
 {
     std::vector<TakeEditorMath::BeatLine> lines;
     if (length > 0)
-        TakeEditorMath::beatLines (view(), take.grid, sampleRate, lines);
+        TakeEditorMath::beatLines (view(), take.grid, sampleRate, lines, gridResolution);
     for (auto& l : lines)
         l.x += (double) waveArea.getX();
     return lines;
@@ -1168,6 +1205,27 @@ void TakeEditorPanel::createLoopAt (juce::int64 frame)
     repaint (loopLane.getUnion (waveArea));
 }
 
+void TakeEditorPanel::scaleLoopLength (bool doubleIt)
+{
+    if (! opened || length <= 0 || dragging != TakeEditorMath::handleNone)
+        return;
+    if (! TakeEditorMath::scaleLoop (loopStart, loopEnd, length, TakeEditorMath::minCropLength (sampleRate), doubleIt))
+        return;
+    if (! waiting)
+        resultHeld = false;
+    writeEdit();
+    refreshTexts();
+    refreshButtons();
+    repaint (loopLane.getUnion (waveArea));
+}
+
+void TakeEditorPanel::stepResolution (int delta)
+{
+    gridResolution = juce::jlimit (-TakeEditorMath::kMaxResolutionStep, TakeEditorMath::kMaxResolutionStep, gridResolution + delta);
+    refreshButtons();
+    repaint();
+}
+
 void TakeEditorPanel::clearLoop()
 {
     if (! opened || ! hasLoop())
@@ -1397,6 +1455,8 @@ void TakeEditorPanel::mouseUp (const juce::MouseEvent&)
 {
     const bool warpMoved = warpDrag >= 0;
     warpDrag = -1;
+    if (warpMoved)
+        refreshButtons(); // a hand move turns Reset markers and Apply warp on at once
     // Round 2b: a marker let go while the preview plays renders the warp again (on
     // the audition's job) and plays it from the start of the region.
     if (warpMoved && onAuditionState && onAuditionState() != 0)
@@ -1413,6 +1473,7 @@ void TakeEditorPanel::mouseDoubleClick (const juce::MouseEvent& e)
     {
         WarpMarkers::resetOne (warpMarkers, (std::size_t) i);
         warpTagBpm = 0.0;
+        refreshButtons(); // Reset markers / Apply warp follow the moved count
         repaint (warpLane.getUnion (waveArea));
     }
 }
@@ -1639,6 +1700,13 @@ void TakeEditorPanel::refreshButtons()
     resetButton.setEnabled (opened && (crop || loop));
     playButton.setEnabled (opened && length > 0 && peakError.isEmpty());
     {
+        const auto minLen = TakeEditorMath::minCropLength (sampleRate);
+        auto hs = loopStart, he = loopEnd, ds = loopStart, de = loopEnd;
+        loopHalfButton.setEnabled (opened && loop && TakeEditorMath::scaleLoop (hs, he, length, minLen, false));
+        loopDoubleButton.setEnabled (opened && loop && TakeEditorMath::scaleLoop (ds, de, length, minLen, true));
+        gridResBox.setEnabled (opened && length > 0 && gridIsUsable());
+    }
+    {
         ensureWarp();
         const bool markers = opened && length > 0 && warpMarkers.size() >= 2 && peakError.isEmpty();
         const bool moved = markers && WarpMarkers::movedCount (warpMarkers) > 0;
@@ -1667,6 +1735,8 @@ std::vector<TakeEditorPanel::Area> TakeEditorPanel::areasForTest() const
              { "Bars readout", barsLabel.getBounds(), false, false }, { "Stretch to fit", stretchButton.getBounds(), true, true },
              { "Play", playButton.getBounds(), true, true },         { "Stop", stopButton.getBounds(), true, true },
              { "Loop", loopButton.getBounds(), true, true },
+             { "Loop /2", loopHalfButton.getBounds(), true, true }, { "Loop x2", loopDoubleButton.getBounds(), true, true },
+             { "Grid resolution", gridResBox.getBounds(), true, true },
              { "Zoom row (empty)", zoomRow, false, false },
              { "Repeats label", repeatsLabel.getBounds(), false, false }, { "Repeats box", repeatsBox.getBounds(), true, true },
              { "Result line", resultLabel.getBounds(), false, false }, { "Reset", resetButton.getBounds(), true, true },
@@ -1730,6 +1800,10 @@ void TakeEditorPanel::resized()
     stopButton.setBounds (zoomRow.removeFromLeft (56));
     zoomRow.removeFromLeft (8);
     loopButton.setBounds (zoomRow.removeFromLeft (64));
+    zoomRow.removeFromLeft (8);
+    loopHalfButton.setBounds (zoomRow.removeFromLeft (48));
+    zoomRow.removeFromLeft (4);
+    loopDoubleButton.setBounds (zoomRow.removeFromLeft (48));
     // Warp controls (round 3): their own row under the zoom row, so the zoom row keeps
     // its width and every button stays at least 48x24 at the small sizes.
     {
@@ -1739,6 +1813,8 @@ void TakeEditorPanel::resized()
         warpHostButton.setBounds (wr.removeFromLeft (100));
         wr.removeFromLeft (8);
         warpResetButton.setBounds (wr.removeFromLeft (110));
+        wr.removeFromLeft (6);
+        gridResBox.setBounds (wr.removeFromLeft (60)); // phase 2: grid resolution, in the gap before Apply warp
         applyWarpButton.setBounds (wr.removeFromRight (110)); // at the right end of the warp row: the bottom row is full at 490 wide
     }
     resultLabel.setBounds (row (by + 186, 20));
@@ -1790,16 +1866,19 @@ void TakeEditorPanel::paintRuler (juce::Graphics& g) const
     g.fillRect (rulerArea.getX(), rulerArea.getBottom() - 1, rulerArea.getWidth(), 1);
     if (length <= 0 || ! (sampleRate > 0.0))
         return;
+    const int clipR = rulerClipRight (rulerArea.getRight(), rulerArea.getWidth(), playheadOverlayW > 0 ? playheadOverlayW : kPlayheadOverlayW);
     if (! beatCache.empty())
     {
         // Beats: a short tick per beat, a longer one per bar, bar numbers thinned by beatLines.
         g.setFont (juce::FontOptions (10.0f));
         for (const auto& b : beatCache)
         {
-            const int x = juce::jmin (rulerArea.getX() + (int) std::floor (b.x), rulerArea.getRight() - 1), th = b.bar ? 8 : 4;
+            const int x = rulerArea.getX() + (int) std::floor (b.x), th = b.bar ? 8 : 4;
+            if (x >= clipR)
+                continue;
             g.setColour (kDim.withAlpha (b.bar ? 0.9f : 0.55f));
             g.fillRect (x, rulerArea.getBottom() - th, 1, th);
-            if (b.label > 0 && x + 3 + 30 <= rulerArea.getRight())
+            if (b.label > 0 && x + 3 + 30 <= clipR)
             {
                 g.setColour (kDim);
                 g.drawText (juce::String (b.label), x + 3, rulerArea.getY(), 30, rulerArea.getHeight() - 2, juce::Justification::centredLeft, false);
@@ -1821,13 +1900,15 @@ void TakeEditorPanel::paintRuler (juce::Graphics& g) const
         const double t = k * step;
         const int x = rulerArea.getX() + (int) std::lround (t * pxPerSec);
         g.setColour (kDim.withAlpha (0.7f));
-        g.fillRect (juce::jmin (x, rulerArea.getRight() - 1), rulerArea.getBottom() - 6, 1, 6);
+        if (x >= clipR)
+            break;
+        g.fillRect (x, rulerArea.getBottom() - 6, 1, 6);
         juce::String label;
         if (seconds >= 60.0)
             label = juce::String ((int) (t / 60.0)) + ":" + juce::String ((int) std::lround (t) % 60).paddedLeft ('0', 2);
         else
             label = juce::String (t, step < 0.1 ? 2 : step < 1.0 ? 1 : 0) + " s";
-        if (x + 3 + 44 <= rulerArea.getRight()) // a label that would run over the right end is left out
+        if (x + 3 + 44 <= clipR) // a label that would run under the playhead overlay is left out
         {
             g.setColour (kDim);
             g.drawText (label, x + 3, rulerArea.getY(), 44, rulerArea.getHeight() - 2, juce::Justification::centredLeft, false);
@@ -1842,7 +1923,7 @@ void TakeEditorPanel::paint (juce::Graphics& g)
     g.drawRect (getLocalBounds().expanded (1, 0), 1);
     // The beats in view (none without a usable grid: the ruler shows seconds then).
     if (length > 0)
-        TakeEditorMath::beatLines (view(), take.grid, sampleRate, beatCache);
+        TakeEditorMath::beatLines (view(), take.grid, sampleRate, beatCache, gridResolution);
     else
         beatCache.clear();
     paintRuler (g);

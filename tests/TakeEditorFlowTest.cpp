@@ -8,6 +8,7 @@
 // Writes only under <cwd>/takeflow_scratch and removes it at the end.
 #include "PluginProcessor.h"
 #include "TakeEditorPanel.h"
+#include "PluginEditor.h"
 #include "TakeEdit.h"
 #include "WarpMarkers.h"
 
@@ -99,6 +100,31 @@ bool openAndWait (TakeEditorPanel& p, const juce::File& f, double bpm)
 int main()
 {
     juce::ScopedJuceInitialiser_GUI juceInit;
+    {
+        // Ruler clip: a label near the right edge must not run under the playhead overlay.
+        const int rulerX = 10, rulerW = 600, rulerR = rulerX + rulerW, overlayW = 126;
+        const int lim = TakeEditorPanel::rulerClipRight (rulerR, rulerW, overlayW);
+        const int x = rulerR - overlayW - 20; // a tick 20 px left of the overlay, its 44 px label reaches past it
+        const bool drawn = x + 3 + 44 <= lim;
+        std::printf ("ruler clip: right=%d overlayL=%d limit=%d labelX=%d labelEnd=%d drawn=%d%c",
+                     rulerR, rulerR - overlayW, lim, x + 3, x + 3 + 44, (int) drawn, 10);
+        check (lim <= rulerR - overlayW, "ruler clip: limit at or left of the overlay");
+        check (! drawn, "ruler clip: label overlapping the overlay is skipped");
+        check (TakeEditorPanel::rulerClipRight (rulerR, 80, overlayW) >= rulerX, "ruler clip: overlay wider than ruler keeps limit >= ruler left");
+    }
+    {
+        using CS = SourceWaveView::CaptureState;
+        const juce::Colour dim (0xff7c859d);
+        const auto rec = SourceWaveView::headerStyleFor (CS::recording);
+        const auto idl = SourceWaveView::headerStyleFor (CS::idle);
+        const auto cap = SourceWaveView::headerStyleFor (CS::captured);
+        std::printf ("header rec r=%.3f g=%.3f dot=%d | idle %08x dot=%d | captured %08x dot=%d\n",
+                     rec.text.getFloatRed(), rec.text.getFloatGreen(), (int) rec.dot,
+                     (unsigned) idl.text.getARGB(), (int) idl.dot, (unsigned) cap.text.getARGB(), (int) cap.dot);
+        check (rec.dot && rec.text.getFloatRed() > 0.7f && rec.text.getFloatGreen() < 0.4f, "header: recording shows red dot and red text");
+        check (! idl.dot && idl.text == dim, "header: idle unchanged (kDim, no dot)");
+        check (! cap.dot && cap.text != dim, "header: captured no dot, not kDim");
+    }
     const auto root = juce::File::getCurrentWorkingDirectory().getChildFile ("takeflow_scratch");
     root.deleteRecursively();
     const double sr = 48000.0;
@@ -268,6 +294,49 @@ int main()
         check (! panel.applyEnabledForTest(), "D: Apply off with Fit to bars and no tempo");
         panel.clickApplyForTest();
         check (fk.applyCalls == 0, "D: clicking Apply sends nothing");
+    }
+
+    // E: backlog GUI fix. Reset markers follows a real mouse drag in the warp lane:
+    // on once a marker is moved by hand, off again once the double-click puts it back.
+    {
+        TakeEditorPanel panel;
+        panel.setSize (900, 500);
+        Fakes fk;
+        fk.wire (panel);
+        check (openAndWait (panel, wavFile, 120.0), "E: peaks ready");
+        panel.setWarpForTest (true);
+        const bool offAtStart = panel.resetMarkersEnabledForTest();
+        const auto lane = panel.warpLaneForTest();
+        juce::Point<int> from (-1, -1);
+        for (int x = lane.getX(); x < lane.getRight() && from.x < 0; ++x)
+            if (panel.warpMarkerAtForTest ({ x, lane.getCentreY() }) == 1)
+                from = { x, lane.getCentreY() };
+        const juce::Point<int> to (from.x + 30, from.y);
+        auto mev = [&] (juce::Point<int> pos, juce::Point<int> down, bool dragged, int clicks)
+        {
+            const auto t = juce::Time::getCurrentTime();
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos.toFloat(), juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier),
+                                     juce::MouseInputSource::defaultPressure, juce::MouseInputSource::defaultOrientation, juce::MouseInputSource::defaultRotation,
+                                     juce::MouseInputSource::defaultTiltX, juce::MouseInputSource::defaultTiltY, &panel, &panel, t, down.toFloat(), t, clicks, dragged);
+        };
+        auto& comp = static_cast<juce::Component&> (panel);
+        comp.mouseDown (mev (from, from, false, 1));
+        comp.mouseDrag (mev (to, from, true, 1));
+        comp.mouseUp (mev (to, from, true, 1));
+        const int movedAfterDrag = WarpMarkers::movedCount (panel.warpMarkersForTest());
+        const bool onAfterDrag = panel.resetMarkersEnabledForTest();
+        const bool applyOnAfterDrag = panel.applyWarpEnabledForTest();
+        const int at = panel.warpMarkerAtForTest (to);
+        comp.mouseDoubleClick (mev (to, to, false, 2));
+        const int movedAfterReset = WarpMarkers::movedCount (panel.warpMarkersForTest());
+        const bool onAfterReset = panel.resetMarkersEnabledForTest();
+        std::printf ("  E: lane marker 1 at x %d; start enabled=%d (want 0); after drag moved=%d enabled=%d applyWarp=%d (want >=1 1 1); marker under drop=%d; after double-click moved=%d enabled=%d (want 0 0)\n",
+                     from.x, (int) offAtStart, movedAfterDrag, (int) onAfterDrag, (int) applyOnAfterDrag, at, movedAfterReset, (int) onAfterReset);
+        check (from.x >= 0, "E: marker 1 found in the warp lane");
+        check (! offAtStart, "E: Reset markers off with no moved marker");
+        check (movedAfterDrag >= 1 && onAfterDrag, "E: Reset markers on right after a hand drag");
+        check (applyOnAfterDrag, "E: Apply warp on right after a hand drag");
+        check (movedAfterReset == 0 && ! onAfterReset, "E: Reset markers off again after the double-click reset");
     }
 
     root.deleteRecursively();

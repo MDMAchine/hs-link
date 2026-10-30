@@ -126,7 +126,15 @@ namespace TakeEditorMath
     };
     constexpr double kMinBeatPx = 7.0, kMinBarLabelPx = 34.0;
     constexpr int kBeatsPerBar = 4;
-    void beatLines (const View& v, const Grid& grid, double sampleRate, std::vector<BeatLine>& out);
+    // resolution (manual stepping, phase 2): 0 = the automatic density above; each step
+    // up doubles the beats from line to line, each step down halves them, never finer
+    // than one line per beat. Clamped to -kMaxResolutionStep..kMaxResolutionStep.
+    constexpr int kMaxResolutionStep = 6;
+    void beatLines (const View& v, const Grid& grid, double sampleRate, std::vector<BeatLine>& out, int resolution = 0);
+    // Loop length jump (phase 2): the loop start stays, the length halves (doubleIt false)
+    // or doubles. false and the points unchanged when there is no loop, the half would be
+    // shorter than minLen, or the double would run past length.
+    bool scaleLoop (juce::int64& start, juce::int64& end, juce::int64 length, juce::int64 minLen, bool doubleIt);
     // The note of the snap row. tone 0 = plain, 1 = amber (grid snap asked for, no usable grid).
     juce::String snapNote (bool snapGrid, bool zeroCrossing, bool gridIsUsable);
     int snapNoteTone (bool snapGrid, bool gridIsUsable);
@@ -415,6 +423,11 @@ public:
     bool playheadFitsForTest (juce::Rectangle<int>* boundsOut = nullptr) const;
     juce::Rectangle<int> rulerAreaForTest() const { return rulerArea; }
     void setPlayheadOverlayWidthForTest (int w) { playheadOverlayW = w; resized(); }
+    // Right-hand x limit for ruler ticks and labels: they stop short of the playhead overlay.
+    static int rulerClipRight (int rulerRight, int rulerWidth, int overlayW) noexcept
+    {
+        return rulerRight - juce::jmax (0, juce::jmin (rulerWidth, overlayW)) - 4; // 4 px gap before the overlay
+    }
     // Every control and reserved row with its bounds in panel coordinates. hit = it
     // takes the mouse. button = a button or box (at least 48 x 24); the waveform and the
     // loop lane are drag areas with handles of their own.
@@ -440,6 +453,9 @@ public:
     bool noteFitsForTest() const; // the note, wrapped to the width of its label, is not higher than the label
     // The beat lines the ruler paints now; x in panel coordinates. Empty = the ruler shows seconds.
     std::vector<TakeEditorMath::BeatLine> beatLinesForTest() const;
+    int getResolutionForTest() const { return gridResolution; }
+    void stepResolution (int delta);   // the grid resolution box steps (phase 2), per panel, not saved
+    void scaleLoopLength (bool doubleIt); // /2 and x2 (phase 2), GUI and edit state only
     bool rulerShowsBeatsForTest() const { return gridIsUsable() && length > 0; }
     // Slice 4, fit to bars. The toggle and the tempo are per panel (not saved; the
     // toggle is off in a new editor, both stay when another take is opened).
@@ -558,6 +574,7 @@ private:
     juce::String stretchName;   // the take the last Apply made with a bar count; empty = nothing to stretch
     double stretchFrom = 0.0, stretchTo = 0.0;
     int stretchBars = 0;
+    int gridResolution = 0; // manual grid resolution step, 0 = automatic
     mutable std::vector<TakeEditorMath::BeatLine> beatCache; // reused by paint: no growth after the first frame
     void setResult (const juce::String& text, int tone);
     bool resultHeld = false; // a result of this take is shown; the "move a handle" hint does not replace it
@@ -607,8 +624,9 @@ private:
     TempoLabel tempoField;
     juce::ToggleButton snapGridButton { "Snap to grid" }, zeroButton { "Zero crossing" }, fitButton { "Fit to bars" },
                        loopButton { "Loop" };
-    juce::TextButton playButton { "Play" }, stopButton { "Stop" };
+    juce::TextButton playButton { "Play" }, stopButton { "Stop" }, loopHalfButton { "/2" }, loopDoubleButton { "x2" };
     juce::Slider repeatsBox;
+    juce::Slider gridResBox; // manual grid resolution (phase 2): -6..6, 0 = automatic
     juce::TextButton closeButton { "Close" }, resetButton { "Reset" }, cancelButton { "Cancel" }, applyButton { "Apply crop" },
                      exportButton { "Export loop" }, stretchButton { "Stretch to fit" };
     juce::ToggleButton warpButton { "Warp" };
