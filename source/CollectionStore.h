@@ -11,12 +11,12 @@
 #include <vector>
 
 // Which tempo a take's grid uses, and where it came from. Pure, no IO, no statics.
-// The cascade: a measured tempo the detector stands behind always wins; else a tempo
-// token in the take's file name; else the host tempo; else none. The measurement and
+// The cascade: a tempo token in the take's file name wins; else the host tempo; else a
+// measured tempo the detector stands behind (the estimate); else none. The measurement and
 // its certainty (TempoMeasure) are never changed here.
 namespace TempoResolve
 {
-    enum class Source { none = 0, measured = 1, fileName = 2, host = 3 };
+    enum class Source { none = 0, measured = 1, fileName = 2, host = 3, fitBars = 4 };
     // A file name or host tempo outside this range (both ends included) is not a tempo.
     constexpr double kMinBpm = 40.0, kMaxBpm = 300.0;
 
@@ -26,7 +26,7 @@ namespace TempoResolve
         double downbeatSec = 0.0;  // the measured downbeat for source measured, else 0 (the file start)
         Source source = Source::none;
         bool snapEnabled = false;  // a grid exists: true for every source but none
-        bool isFallback() const { return source == Source::fileName || source == Source::host; }
+        bool isFallback() const { return source == Source::fileName || source == Source::host || source == Source::fitBars; }
     };
 
     // The tempo named in a file name, 0 = none. Not case sensitive. Forms, N a number of
@@ -52,14 +52,33 @@ namespace TempoResolve
     // medium or high, and a grid TakeEdit accepts. The test the take cell and
     // requestTakeEdit already used.
     bool measuredCertain (const TempoMeasure::Result& measured);
-    // The cascade. hostBpm: 0 = no host tempo.
+    // How an estimate relates to a known tempo: 1, 2, 0.5, 1.5 or 2/3 when it is within
+    // kRelationTol of that multiple of known, else 0 (unrelated or not positive).
+    constexpr double kRelationTol = 0.03;
+    double relationTo (double estimate, double known);
+    // The cascade: a file name tempo, else the host tempo, else a certain estimate, else
+    // none. With a known tempo the estimate's downbeat is kept when relationTo > 0.
+    // The one tempo the grid, ruler and MIDI export use (takeEditorGridOf). hostBpm: 0 = none.
     Resolved resolve (const TempoMeasure::Result& measured, const juce::String& fileName, double hostBpm);
+    // The order with the take editor's Fit to bars tempo: file name, Fit to bars, host,
+    // estimate. userFitBpm is the field only when the user set it (0 = default or empty);
+    // a file name tempo is kept, anything else becomes userFitBpm with source fitBars
+    // ("(bars)"). The downbeat is kept when the old tempo is a related pulse of it, else 0.
+    // measured: the take's measurement, for rephase (nullptr = keep the downbeat as is).
+    Resolved applyFitBars (const Resolved& resolved, double userFitBpm, const TempoMeasure::Result* measured = nullptr);
+    // When the grid tempo is a related pulse of the estimate (2:1, 1:2, 3:2, 2:3, not 1:1)
+    // the estimate's downbeat may sit on a beat of the estimate that is not beat 1 of the
+    // grid's bar. Tries measured.downbeatSec + k * the estimate's beat period, k = 0, 1, 2,
+    // and keeps the k with the most onset strength within kRephaseTolSec of beat 1 of the
+    // grid's 4-beat bars (ties: k = 0). No onsets, no relation or 1:1: r unchanged.
+    constexpr double kRephaseTolSec = 0.015;
+    Resolved rephase (const Resolved& r, const TempoMeasure::Result& measured, const std::vector<TempoMeasure::Onset>& onsets);
     // "none" / "measured" / "file_name" / "host" (the sidecar key tempo_source), and back
     // (anything else: none).
     const char* sourceName (Source source);
     Source sourceFromName (const juce::String& name);
-    // The text of a fallback tempo: "120 bpm (file name)", "98.5 bpm (host)". A whole
-    // number has no decimals, else two. Empty for source none or measured.
+    // The text of a fallback tempo: "120.00 bpm (file)", "98.50 bpm (host)", two
+    // decimals. Empty for source none or measured.
     juce::String fallbackText (const Resolved& resolved);
 }
 
@@ -84,6 +103,10 @@ struct HslinkTakeEntry
     // (adoptDeadFolders). Its lasting copy goes to destFolder (recovered_<session>),
     // not to this instance's session folder. Not shown by getTakes.
     bool adopted = false;
+    // True for a take that points at a file the plugin does not own (the Standalone
+    // --shot-load option, addShotTake). Delete only takes it out of the list: the file
+    // is never moved, renamed or deleted.
+    bool external = false;
     juce::File destFolder;
     juce::String logKey;         // adopted: the saved.log key (a .wav.part is logged under its .wav name)
     // Generate settings known when the download completed.

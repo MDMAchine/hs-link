@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <vector>
 
 // Offline tempo measurement of one take. Pure: no JUCE, no globals, no statics, no
 // file IO, the same input always gives the same result. It works on its own copy of
@@ -14,6 +15,11 @@
 namespace TempoMeasure
 {
     enum class Level { none = 0, low = 1, medium = 2, high = 3 };
+
+    struct Onset { double sec = 0.0; double strength = 0.0; };
+
+    // Most onsets kept in Result::topOnsets.
+    constexpr std::size_t kTopOnsets = 256;
 
     struct Result
     {
@@ -31,6 +37,10 @@ namespace TempoMeasure
         double driftEndMs = 0.0;     // the same for the last window, signed (+ = late)
         double firstBeatSec = 0.0;   // first grid beat at or after 0
         int beats = 0;               // grid beats inside the file
+        // The strongest onsets (at most kTopOnsets, by strength), in time order. Lets a
+        // known tempo related to bpm (2:1, 3:2 ...) pick its own beat 1 (TempoResolve::
+        // rephase). Filled for level low and up; empty in sidecars written before it.
+        std::vector<Onset> topOnsets;
         // Relation of bpm to the asked tempo, set only with a hint and when bpm is within
         // kHintOctaveTol of hint * 2^k: 0 = the asked octave (or no octave of it at all),
         // +1 = double the asked tempo, -1 = half of it.
@@ -85,6 +95,12 @@ namespace TempoMeasure
     // downbeat guess from the low band; drift of the onsets against the fixed grid.
     Result analyse (const float* mono, std::size_t numSamples, double sampleRate,
                     double hintBpm = 0.0, const AbortFn& shouldAbort = {});
+
+    // The onset list analyse() works on (the same band energy curve and peak pick),
+    // for MIDI export: times in seconds from the file start, strength as analyse()
+    // weighs it. Pure as analyse(); empty for input under 16 frames or no signal.
+    std::vector<Onset> onsets (const float* mono, std::size_t numSamples, double sampleRate,
+                               const AbortFn& shouldAbort = {});
 
     const char* levelName (Level level); // "none" / "low" / "medium" / "high"
 }

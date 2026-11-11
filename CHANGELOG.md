@@ -6,6 +6,37 @@ Development through v0.4.0 happened inside the MDMAchine_VST monorepo. The plugi
 
 ---
 
+## v0.5.18 -- 2026-11-11
+
+- Tempo source: the take tempo now comes from the file name or the host tempo, and the header label shows which one is in use.
+- MIDI export: a percussive onset gate keeps only drum-like hits in the MIDI (audio export unchanged).
+- MIDI export: quantize hits to Off, 1/16 or 1/8 with a strength amount; the grid follows the downbeat.
+- Dev: Standalone --shot-load, --shot-open-editor, --shot-zoom and --shot-warp flags open Edit take, zoom and move a warp marker through the drag path for screenshots.
+
+## v0.5.17 -- 2026-11-11
+
+- Loop playback: the loop region now plays back correctly in the take editor.
+- Take editor: zoom in and out on the waveform so single hits are visible.
+- Warp markers: the waveform redraws as markers move; plain drag snaps to the grid, Shift drag places freely, double-click removes a marker.
+- Export WAV and Export MIDI now leave a "Saved to: <folder>" line under the export buttons with a Show in folder button.
+- MIDI export: each hit is classified as kick, snare, closed hat, open hat or other perc and written on its General MIDI drum note (36, 38, 42, 46, 39) instead of every hit on one note.
+- MIDI export: velocity follows hit strength relative to the take (loudest hit 127, 36 dB quieter 30).
+- MIDI export: tonal takes get a pitched notes track alongside the drum track.
+- MIDI export: only hits inside the loop/crop region are written (warp applied), with the tempo map shifted to match.
+
+## v0.5.16 -- 2026-11-10
+
+- MIDI export: real time signatures and a tempo map are written into exported MIDI files (no longer fixed at 4/4 and one tempo).
+- MIDI drag chip: builds the MIDI file itself when you drag it, so a drag works without pressing Export MIDI first.
+- Temp cleanup: old temporary MIDI drag files are removed.
+
+## v0.5.15 -- 2026-10-31
+
+- Editor: the smallest window is now 1080 x 760 (was 980 x 640), the smallest size that shows the whole Preview section. A host that offers an older, smaller size gets the new minimum.
+- Loop and warp editor: /2 and x2 buttons halve or double the loop length; the loop start stays.
+- Loop and warp editor: grid resolution box in the warp row. A = automatic, x2 x4 = fewer grid lines, /2 /4 = more.
+- Build: no hardcoded drive paths (JUCE_DIR from the environment or ../JUCE).
+
 ## v0.5.14 -- 2026-10-22
 
 - New GUIDANCE (0-20) and STEPS (1-300) controls in the Generate row. Both default to Auto, which sends neither field, so server behaviour is unchanged until one is moved off its far-left Auto position. Set values are clamped client-side before POST /api/v1/daw/generate. Saved state: two new APVTS params (guidance, steps); sessions saved before v0.5.14 load them as Auto. Not listened to, not cleared for deploy.
@@ -86,7 +117,7 @@ Development through v0.4.0 happened inside the MDMAchine_VST monorepo. The plugi
 - Fix (takes, o126): the stretch no longer deletes a file that was already at its temporary name. This holds for a file that was there before the exclusive create; the writer then reopens the temporary file by name, so a swap by another process between the create and that open is not ruled out. `stretchTakeFile` armed its cleanup guard before it looked whether the temporary name (`<dest>.<token>.stretching`) was taken, so a file already there was deleted on the early return. The temporary file is now created with the new `ExclusiveFile::createNew` (Windows `CreateFileW` with `CREATE_NEW`, elsewhere `open` with `O_CREAT | O_EXCL`) and the guard is armed only after that create succeeded; a name that is taken fails the call with `the temporary file exists already` and the file there is neither written nor removed. New test seam `TakeStretch::testPartToken` (null in the plugin) forces the token.
 - Tests (takes, o126): new group `HSLINK_Tests stretch` (`testStretch`, 49 checks, about 5 s, in the full run before `edit`, 1320 checks in all at that time): the temporary name, length and ratio direction, measured tempo of the output in both modes, the refusals, the source untouched (bytes and modification time), mono, 16 bit, 24 bit and float sources, abort at four points, and `requestTakeStretch` on a processor. Teeth and numbers in `docs/DEVELOPING.md`.
 - Feature (takes, o125b round 1, no GUI and no tests yet): offline change of a take's tempo. New `source/TakeStretch.h/.cpp`: `TakeStretch::stretchTakeFile (StretchRequest, shouldAbort)` reads one WAV and writes another with length `round (input length x sourceBpm / targetBpm)`. Mode `stretch` keeps the pitch (Signalsmith Stretch 1.4.0, default preset: 120 ms block, 30 ms interval); mode `repitch` is a plain windowed sinc resample (tempo and pitch move together), the A/B reference. The source is opened read only; refused are a dest equal to the source, a dest that exists, a tempo outside 30 to 300, a length ratio outside 0.5 to 2.0, a header that is not sane, more than 10 minutes, more than 8 channels, and anything but 16 bit, 24 bit or 32 bit float WAV. Rate, channels and sample format are kept. The output is written as `<dest>.<token>.stretching` and renamed without replace; a failure or abort removes the partial file. Never throws. Processor: `requestTakeStretch (tempFile, fromBpm, toBpm)` runs it on its own one-thread pool (`stretchPool`) under the tempo job's gate, writes `<stem>_st<target>bpm.wav` (`stretchedTakeName`) into the take's temp session folder and lists it as a new unsaved take (asked tempo = target, marker synced, tempo measured, saver woken); the original entry and file are untouched. Nothing calls it yet. Manual tools `HSLINK_Tests stretch-gen` and `stretch-file` (see DEVELOPING). Vendored, MIT: `third_party/signalsmith-stretch`, `third_party/signalsmith-linear`; new `THIRD_PARTY_NOTICES.md`. Smoke only (not a test): a 60 s synthetic 128 BPM drum pattern, stereo 48 kHz float, to 130: stretch 2880000 in, 2835692 out, 2835692 expected, measured 130.00 high, drift 0.2 ms, 0.60 s; repitch the same counts, 130.00 high, drift 0.2 ms, 1.54 s.
-- Change (tempo, o125): `kMediumConfidence` goes from 0.40 to 0.30 (`source/TempoMeasure.h`). A take whose confidence is between 0.30 and 0.40 now shows its number, amber (level medium); green still needs `kHighConfidence` 0.7 and the drift rules are unchanged. On the 32 real takes four gain a number, all amber: sa3 ba6f22 126.00 (0.340), ba5820 129.99 (0.399), c26c1e 130.00 (0.306) and the fourth take aa880c 130.01 (0.393). The 7 others without a number stay without one (bassline solo 8e4630 at 0.217, six at 0.000) and no take that had a number changed its number or colour. Tempo group: new case D2 (130 drums under 16 hits per second at random times, confidence 0.333, reads `130.01 bpm  30 ms` amber; 4 checks) and 8 new checks that every no-beat case stays at least 0.05 under the limit (all at 0.000); 179 checks. Teeth: with the constant back at 0.40 two D2 checks fail (level low, tag `tempo ?`, colour red).
+- Change (tempo, o125): `kMediumConfidence` goes from 0.40 to 0.30 (`source/TempoMeasure.h`). A take whose confidence is between 0.30 and 0.40 now shows its number, amber (level medium); green still needs `kHighConfidence` 0.7 and the drift rules are unchanged. On the 32 real takes four gain a number, all amber: sa3 ba6f22 126.00 (0.340), ba5820 129.99 (0.399), c26c1e 130.00 (0.306) and the short hit take aa880c 130.01 (0.393). The 7 others without a number stay without one (bassline solo 8e4630 at 0.217, six at 0.000) and no take that had a number changed its number or colour. Tempo group: new case D2 (130 drums under 16 hits per second at random times, confidence 0.333, reads `130.01 bpm  30 ms` amber; 4 checks) and 8 new checks that every no-beat case stays at least 0.05 under the limit (all at 0.000); 179 checks. Teeth: with the constant back at 0.40 two D2 checks fail (level low, tag `tempo ?`, colour red).
 - Fix (tempo, o124): `requestTakeMeasure` cannot leave a take at `bpm ...` and cannot throw. The whole pool job body (the gate lock and `storeTakeTempo` included) and the `addJob` call are guarded; a throw at either step stores the take as measured with level none (`tempo ?`). Before, a throw at the queue step reached the download worker and a throw at the store step was swallowed by the JUCE pool, both with the take stuck at measuring. New test-only seam `measureStepHook`; tempo group H, 13 checks (167 in the group).
 - Tempo (o124): the level gate is unchanged. `TempoMeasure::Result::why` now carries what the level was decided on (rule, onsets, coarse tempo and strength, best tempo, grid share, significance, drift, confidence), `tempo-scan` prints it as a second table and the no-beat cases print it. On the 32 real takes no single threshold separates the 5 beat-driven takes without a number from the 6 beatless ones (see LESSONS o124).
 

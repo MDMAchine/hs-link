@@ -312,31 +312,44 @@ int main()
             if (panel.warpMarkerAtForTest ({ x, lane.getCentreY() }) == 1)
                 from = { x, lane.getCentreY() };
         const juce::Point<int> to (from.x + 30, from.y);
-        auto mev = [&] (juce::Point<int> pos, juce::Point<int> down, bool dragged, int clicks)
+        auto mev = [&] (juce::Point<int> pos, juce::Point<int> down, bool dragged, int clicks, bool shift = false)
         {
             const auto t = juce::Time::getCurrentTime();
-            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos.toFloat(), juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier),
+            const auto mods = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier | (shift ? juce::ModifierKeys::shiftModifier : 0));
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos.toFloat(), mods,
                                      juce::MouseInputSource::defaultPressure, juce::MouseInputSource::defaultOrientation, juce::MouseInputSource::defaultRotation,
                                      juce::MouseInputSource::defaultTiltX, juce::MouseInputSource::defaultTiltY, &panel, &panel, t, down.toFloat(), t, clicks, dragged);
         };
         auto& comp = static_cast<juce::Component&> (panel);
+        // Plain drag: snaps to the beat grid (4eed68e), so +30 px falls back on marker 1's own beat.
         comp.mouseDown (mev (from, from, false, 1));
         comp.mouseDrag (mev (to, from, true, 1));
         comp.mouseUp (mev (to, from, true, 1));
+        const int movedAfterSnapDrag = WarpMarkers::movedCount (panel.warpMarkersForTest());
+        std::printf ("  E: plain +30 px drag moved=%d (want 0, snapped back to its beat)\n", movedAfterSnapDrag);
+        check (movedAfterSnapDrag == 0, "E: plain drag snaps to the beat grid");
+        // Shift held: free placement under the pointer.
+        comp.mouseDown (mev (from, from, false, 1, true));
+        comp.mouseDrag (mev (to, from, true, 1, true));
+        comp.mouseUp (mev (to, from, true, 1, true));
         const int movedAfterDrag = WarpMarkers::movedCount (panel.warpMarkersForTest());
         const bool onAfterDrag = panel.resetMarkersEnabledForTest();
         const bool applyOnAfterDrag = panel.applyWarpEnabledForTest();
         const int at = panel.warpMarkerAtForTest (to);
+        const auto countBefore = panel.warpMarkersForTest().size();
         comp.mouseDoubleClick (mev (to, to, false, 2));
+        const auto countAfter = panel.warpMarkersForTest().size();
         const int movedAfterReset = WarpMarkers::movedCount (panel.warpMarkersForTest());
         const bool onAfterReset = panel.resetMarkersEnabledForTest();
-        std::printf ("  E: lane marker 1 at x %d; start enabled=%d (want 0); after drag moved=%d enabled=%d applyWarp=%d (want >=1 1 1); marker under drop=%d; after double-click moved=%d enabled=%d (want 0 0)\n",
+        std::printf ("  E: lane marker 1 at x %d; start enabled=%d (want 0); after drag moved=%d enabled=%d applyWarp=%d (want >=1 1 1); marker under drop=%d; after double-click moved=%d enabled=%d (want 0 1)\n",
                      from.x, (int) offAtStart, movedAfterDrag, (int) onAfterDrag, (int) applyOnAfterDrag, at, movedAfterReset, (int) onAfterReset);
         check (from.x >= 0, "E: marker 1 found in the warp lane");
         check (! offAtStart, "E: Reset markers off with no moved marker");
         check (movedAfterDrag >= 1 && onAfterDrag, "E: Reset markers on right after a hand drag");
         check (applyOnAfterDrag, "E: Apply warp on right after a hand drag");
-        check (movedAfterReset == 0 && ! onAfterReset, "E: Reset markers off again after the double-click reset");
+        // Since 4eed68e a double-click removes an interior marker; Reset stays on (the set was edited).
+        std::printf ("  E: double-click marker count %d -> %d (want one fewer)\n", (int) countBefore, (int) countAfter);
+        check (at == 1 && countAfter + 1 == countBefore && movedAfterReset == 0 && onAfterReset, "E: double-click removes the dropped marker; Reset markers stays on");
     }
 
     root.deleteRecursively();

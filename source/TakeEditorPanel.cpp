@@ -29,6 +29,43 @@ namespace TakeEditorMath
         return v;
     }
 
+    double maxZoom (juce::int64 length, int widthPx)
+    {
+        const double whole = length > 0 ? (double) length / (double) juce::jmax (1, widthPx) : 1.0;
+        if (testMutant.load (std::memory_order_relaxed) == mutZoomNoCap)
+            return juce::jmax (1.0, whole * 4.0);
+        return juce::jmax (1.0, whole / kMinFramesPerPixel);
+    }
+
+    juce::int64 clampViewStart (juce::int64 length, int widthPx, double zoom, juce::int64 start)
+    {
+        juce::ignoreUnused (widthPx);
+        if (testMutant.load (std::memory_order_relaxed) == mutZoomNoClamp)
+            return start;
+        const auto visible = (juce::int64) std::llround ((double) juce::jmax ((juce::int64) 0, length) / juce::jmax (1.0, zoom));
+        return juce::jlimit ((juce::int64) 0, juce::jmax ((juce::int64) 0, length - visible), start);
+    }
+
+    View zoomedView (juce::int64 length, int widthPx, double zoom, juce::int64 start)
+    {
+        auto v = wholeTake (length, widthPx);
+        const double z = juce::jlimit (1.0, maxZoom (length, widthPx), zoom);
+        v.framesPerPixel /= z;
+        v.firstFrame = clampViewStart (length, widthPx, z, start);
+        return v;
+    }
+
+    void zoomAround (juce::int64 length, int widthPx, double& zoom, juce::int64& start, double anchorX, double factor)
+    {
+        const auto before = zoomedView (length, widthPx, zoom, start);
+        const double anchorFrame = (double) before.firstFrame + anchorX * before.framesPerPixel;
+        zoom = juce::jlimit (1.0, maxZoom (length, widthPx), zoom * factor);
+        const auto after = zoomedView (length, widthPx, zoom, 0);
+        if (testMutant.load (std::memory_order_relaxed) == mutZoomNoAnchor)
+            return; // the start stays: the frame under the pointer moves
+        start = clampViewStart (length, widthPx, zoom, (juce::int64) std::llround (anchorFrame - anchorX * after.framesPerPixel));
+    }
+
     juce::int64 frameAtX (const View& v, double x)
     {
         if (testMutant.load (std::memory_order_relaxed) == mutPixelOff)
@@ -39,6 +76,12 @@ namespace TakeEditorMath
     double xOfFrame (const View& v, juce::int64 frame)
     {
         return v.framesPerPixel > 0.0 ? (double) (frame - v.firstFrame) / v.framesPerPixel : 0.0;
+    }
+
+    bool frameInView (const View& v, juce::int64 frame)
+    {
+        const double x = xOfFrame (v, frame);
+        return x >= -0.5 && x <= (double) v.widthPx + 0.5;
     }
 
     juce::int64 minCropLength (double sampleRate)
@@ -262,6 +305,16 @@ namespace TakeEditorMath
         if (! all)
             while (labelBars * kBeatsPerBar * pxPerBeat < kMinBarLabelPx && labelBars < 1.0e12)
                 labelBars *= 2.0;
+        // bar.beat labels when one beat is at least kMinTagPx wide; halved while the half
+        // is wide enough too (bar.beat.part). The lines follow the labels down.
+        double tagStep = 0.0;
+        if (! all && pxPerBeat >= kMinTagPx)
+        {
+            tagStep = 1.0;
+            for (int n = 0; n < kMaxTagHalvings && 0.5 * tagStep * pxPerBeat >= (testMutant.load (std::memory_order_relaxed) == mutTagTight ? 0.5 * kMinTagPx : kMinTagPx); ++n)
+                tagStep *= 0.5;
+            step = juce::jmin (step, tagStep);
+        }
         const double first = (double) v.firstFrame;
         const double last = juce::jmin ((double) v.length, first + (double) v.widthPx * v.framesPerPixel);
         const size_t most = all ? (size_t) 100000 : (size_t) juce::jmin ((double) v.widthPx / juce::jmin (kMinBeatPx, step * pxPerBeat), 4000.0) + 4; // by the width, never by the length
@@ -280,6 +333,13 @@ namespace TakeEditorMath
             b.bar = barIndex * (double) kBeatsPerBar == k;
             if (b.bar && barIndex >= 0.0 && barIndex < 2.0e9 && std::fmod (barIndex, labelBars) == 0.0)
                 b.label = (int) barIndex + 1;
+            else if (tagStep > 0.0 && ! b.bar && barIndex >= 0.0 && barIndex < 2.0e9 && std::fmod (k, tagStep) == 0.0)
+            {
+                const double inBar = k - barIndex * (double) kBeatsPerBar, whole = std::floor (inBar);
+                b.tagBar = (int) barIndex + 1;
+                b.tagBeat = (int) whole + 1;
+                b.tagPart = inBar > whole ? (int) std::lround ((inBar - whole) / tagStep) + 1 : 0;
+            }
             out.push_back (b);
         }
     }
@@ -634,6 +694,21 @@ TakeEditorPanel::TakeEditorPanel()
     applyWarpButton.onClick = [this] { applyWarp(); };
     for (auto* b : { (juce::Button*) &warpButton, (juce::Button*) &warpHostButton, (juce::Button*) &warpResetButton, (juce::Button*) &applyWarpButton })
         addAndMakeVisible (*b);
+    // Horizontal zoom: -, +, Fit at the right of the scroll bar row. Not persisted.
+    zoomOutButton.setTooltip ("Zoom out (the mouse wheel over the waveform zooms about the pointer; Shift + wheel scrolls)");
+    zoomInButton.setTooltip ("Zoom in (the mouse wheel over the waveform zooms about the pointer; Shift + wheel scrolls)");
+    zoomFitButton.setTooltip ("Show the whole take");
+    zoomOutButton.onClick = [this] { zoomBy (1.0 / (1.25 * 1.25), 0.5 * waveArea.getWidth()); };
+    zoomInButton.onClick = [this] { zoomBy (1.25 * 1.25, 0.5 * waveArea.getWidth()); };
+    zoomFitButton.onClick = [this] { zoom = 1.0; viewStart = 0; zoomChanged(); };
+    zoomLoopButton.setTooltip ("Zoom to the loop (or the crop when there is no loop)");
+    zoomLoopButton.onClick = [this] { zoomToLoop(); };
+    for (auto* b : { &zoomOutButton, &zoomInButton, &zoomFitButton, &zoomLoopButton })
+        addAndMakeVisible (*b);
+    scrollBar.setAutoHide (false);
+    scrollBar.addListener (this);
+    addChildComponent (scrollBar);
+    zoomChanged();
     refreshButtons();
     refreshAudition();
 }
@@ -662,6 +737,7 @@ void TakeEditorPanel::resetMarkers()
     if (! opened)
         return;
     warpBuilt = false;
+    markersEdited = false;
     warpTagBpm = 0.0;
     ensureWarp();
     refreshButtons();
@@ -690,7 +766,9 @@ void TakeEditorPanel::auditionPlay()
         ensureWarp();
         onAuditionWarp (warpButton.getToggleState() && WarpMarkers::movedCount (warpMarkers) > 0 ? warpMarkers : std::vector<WarpMarkers::Marker> {});
     }
-    onAuditionPlay (take.temp, loop ? loopStart : 0, loop ? loopEnd : length, length, loopButton.getToggleState());
+    sentRegionStart = loop ? loopStart : 0;
+    sentRegionEnd = loop ? loopEnd : length;
+    onAuditionPlay (take.temp, sentRegionStart, sentRegionEnd, length, loopButton.getToggleState());
     refreshAudition();
 }
 
@@ -833,7 +911,10 @@ void TakeEditorPanel::setLiveGrid (const TakeEditorMath::Grid& g, const juce::St
     take.tempoText = tempoText;
     refreshTexts(); // the info line and the snap note
     if (! sameGrid)
-        repaint();  // ruler and beat lines; the points stay where they are
+    {
+        refreshButtons(); // a grid that became usable enables the Warp row and grid resolution
+        repaint();        // ruler and beat lines; the points stay where they are
+    }
 }
 
 void TakeEditorPanel::refreshNote()
@@ -969,6 +1050,7 @@ void TakeEditorPanel::open (const Take& t)
     loopStart = loopEnd = -1;
     warpMarkers.clear();
     warpBuilt = false;
+    markersEdited = false;
     warpDrag = -1;
     dragLoop = loopJustMade = runSeen = false;
     loopAnchor = -1;
@@ -988,7 +1070,9 @@ void TakeEditorPanel::open (const Take& t)
         fitBpm = TakeEditorMath::fitTempoFromHost (onHostBpm ? onHostBpm() : 0.0);
         tempoField.setText (TakeEditorMath::fitFieldText (fitBpm), juce::dontSendNotification);
     }
-    waveDirty = true;
+    zoom = 1.0; // a new take opens whole
+    viewStart = 0;
+    zoomChanged();
 
     shared = std::make_shared<Shared>();
     // The job holds the shared block and the path, never the panel (it may be gone first).
@@ -1039,6 +1123,19 @@ void TakeEditorPanel::tick()
     if (! opened)
         return;
     refreshAudition();
+    if (onAuditionRegion && length > 0)
+    {
+        // A moved loop brace reaches the audition at the next tick, playing or not.
+        const bool loop = hasLoop();
+        const juce::int64 rs = loop ? loopStart : 0, re = loop ? loopEnd : length;
+        if (rs != sentRegionStart || re != sentRegionEnd)
+        {
+            sentRegionStart = rs;
+            sentRegionEnd = re;
+            if (auditionShown != 0)
+                onAuditionRegion (rs, re, length);
+        }
+    }
     {
         // The playhead follows the audition's own position (an atomic the audio thread
         // writes), only while it plays; stopped or loading = hidden.
@@ -1075,6 +1172,9 @@ void TakeEditorPanel::tick()
                 TakeEditorMath::loopFromEditData (take.edit, length, loopStart, loopEnd);
                 if (hasLoop())
                     TakeEditorMath::clampCrop (loopStart, loopEnd, length, TakeEditorMath::minCropLength (sampleRate), true);
+                // open() ran zoomChanged() with length 0, which disabled -, + and Fit; the
+                // real length is known only now, so the zoom state is refreshed here.
+                zoomChanged();
             }
             if (g == 2 && done != nullptr)
             {
@@ -1151,7 +1251,104 @@ void TakeEditorPanel::tick()
 //==============================================================================
 TakeEditorMath::View TakeEditorPanel::view() const
 {
-    return TakeEditorMath::wholeTake (length, waveArea.getWidth());
+    if (TakeEditorMath::testMutant.load() == TakeEditorMath::mutZoomWhole)
+        return TakeEditorMath::wholeTake (length, waveArea.getWidth());
+    return TakeEditorMath::zoomedView (length, waveArea.getWidth(), zoom, viewStart);
+}
+
+bool TakeEditorPanel::gripShown (juce::int64 frame) const
+{
+    return length > 0 && (TakeEditorMath::testMutant.load() == TakeEditorMath::mutHandleEdgeClamp || TakeEditorMath::frameInView (view(), frame));
+}
+
+void TakeEditorPanel::zoomBy (double factor, double anchorX)
+{
+    if (length <= 0)
+        return;
+    TakeEditorMath::zoomAround (length, waveArea.getWidth(), zoom, viewStart, anchorX, factor);
+    zoomChanged();
+}
+
+void TakeEditorPanel::setViewStart (juce::int64 start)
+{
+    const auto s = TakeEditorMath::clampViewStart (length, waveArea.getWidth(), zoom, start);
+    if (s == viewStart)
+        return;
+    viewStart = s;
+    zoomChanged();
+}
+
+void TakeEditorPanel::zoomChanged()
+{
+    const bool zoomed = zoom > 1.0 + 1.0e-9 && length > 0;
+    const auto v = view();
+    scrollBar.setRangeLimits (0.0, (double) juce::jmax ((juce::int64) 1, length), juce::dontSendNotification);
+    scrollBar.setCurrentRange ((double) v.firstFrame, v.framesPerPixel * (double) v.widthPx, juce::dontSendNotification);
+    scrollBar.setVisible (zoomed);
+    zoomOutButton.setEnabled (zoomed);
+    zoomFitButton.setEnabled (zoomed);
+    zoomInButton.setEnabled (length > 0 && zoom < TakeEditorMath::maxZoom (length, waveArea.getWidth()) - 1.0e-9);
+    zoomLoopButton.setEnabled (length > 0);
+    waveDirty = true;
+    repaint();
+}
+
+void TakeEditorPanel::zoomToFrames (juce::int64 first, juce::int64 end)
+{
+    if (length <= 0 || end <= first)
+        return;
+    const auto whole = TakeEditorMath::wholeTake (length, waveArea.getWidth());
+    const double span = (double) (end - first);
+    zoom = juce::jlimit (1.0, TakeEditorMath::maxZoom (length, waveArea.getWidth()), (whole.framesPerPixel * (double) whole.widthPx) / span);
+    viewStart = TakeEditorMath::clampViewStart (length, waveArea.getWidth(), zoom, first);
+    zoomChanged();
+}
+
+void TakeEditorPanel::zoomToLoop()
+{
+    const auto s = hasLoop() ? loopStart : cropStart, e = hasLoop() ? loopEnd : cropEnd;
+    const auto pad = (e - s) / 20; // a little room either side for the handles
+    zoomToFrames (juce::jmax ((juce::int64) 0, s - pad), juce::jmin (length, e + pad));
+}
+
+void TakeEditorPanel::overviewSeek (double xInOverview)
+{
+    if (length <= 0 || overviewArea.getWidth() < 1)
+        return;
+    const auto v = view();
+    const double centre = juce::jlimit (0.0, 1.0, xInOverview / (double) overviewArea.getWidth()) * (double) length;
+    setViewStart ((juce::int64) std::llround (centre - 0.5 * v.framesPerPixel * (double) v.widthPx));
+}
+
+void TakeEditorPanel::scrollBarMoved (juce::ScrollBar*, double newRangeStart)
+{
+    setViewStart ((juce::int64) std::llround (newRangeStart));
+}
+
+void TakeEditorPanel::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w)
+{
+    if (length <= 0)
+        return;
+    const auto top = juce::Rectangle<int> (waveArea.getX(), rulerArea.getY(), waveArea.getWidth(), waveArea.getBottom() - rulerArea.getY());
+    if (! top.contains (e.getPosition()))
+        return;
+    const float dy = std::abs (w.deltaY) >= std::abs (w.deltaX) ? w.deltaY : -w.deltaX;
+    if (dy == 0.0f)
+        return;
+    // The wheel zooms 1.25x per notch about the pointer (with or without Ctrl / Cmd);
+    // Shift + wheel or a horizontal swipe scrolls, as in most DAWs.
+    const bool pan = e.mods.isShiftDown() || std::abs (w.deltaX) > std::abs (w.deltaY);
+    if (! pan)
+    {
+        const double notches = (double) dy / 0.25; // about 0.25 per wheel notch
+        zoomBy (std::pow (1.25, juce::jlimit (-4.0, 4.0, notches)), (double) e.position.x - waveArea.getX());
+        return;
+    }
+    if (zoom <= 1.0 + 1.0e-9)
+        return;
+    const auto v = view();
+    // A notch pans an eighth of the view.
+    setViewStart (v.firstFrame - (juce::int64) std::llround ((double) dy / 0.25 * 0.125 * v.framesPerPixel * v.widthPx));
 }
 
 TakeEdit::EditData TakeEditorPanel::currentEdit() const
@@ -1165,7 +1362,21 @@ TakeEditorMath::Handle TakeEditorPanel::handleAt (juce::Point<int> p) const
     if (length <= 0 || (! waveArea.contains (p) && testMutant.load() != mutFlagAnywhere))
         return handleNone; // crop handles live in the waveform only
     const auto v = view();
-    const double xs = waveArea.getX() + xOfFrame (v, cropStart), xe = waveArea.getX() + xOfFrame (v, cropEnd);
+    double xs = waveArea.getX() + xOfFrame (v, cropStart), xe = waveArea.getX() + xOfFrame (v, cropEnd);
+    if (testMutant.load() == mutHandleEdgeClamp)
+        xe = juce::jmin ((double) waveArea.getRight(), xe); // the old clamp: picked at the edge
+    else if (! gripShown (cropStart) || ! gripShown (cropEnd))
+    {
+        // A handle off the view is not picked; the one in it is, by its own grab rule.
+        const bool sIn = gripShown (cropStart), eIn = gripShown (cropEnd);
+        const bool tabS = sIn && p.y < waveArea.getY() + kTabPx && p.x >= xs && p.x < xs + kTabPx;
+        const bool tabE = eIn && p.y >= waveArea.getBottom() - kTabPx && p.x > xe - kTabPx && p.x <= xe;
+        if (tabS || (sIn && std::abs (p.x - xs) <= kGrabPx))
+            return handleStart;
+        if (tabE || (eIn && std::abs (p.x - xe) <= kGrabPx))
+            return handleEnd;
+        return handleNone;
+    }
     const bool inStartTab = p.y < waveArea.getY() + kTabPx && p.x >= xs && p.x < xs + kTabPx;
     const bool inEndTab = p.y >= waveArea.getBottom() - kTabPx && p.x > xe - kTabPx && p.x <= xe;
     if (inStartTab != inEndTab)
@@ -1179,7 +1390,18 @@ TakeEditorMath::Handle TakeEditorPanel::flagAt (juce::Point<int> p) const
     if (length <= 0 || ! hasLoop() || (! loopLane.contains (p) && testMutant.load() != mutFlagAnywhere))
         return handleNone; // loop flags live in the loop lane only
     const auto v = view();
-    const double xs = loopLane.getX() + xOfFrame (v, loopStart), xe = loopLane.getX() + xOfFrame (v, loopEnd);
+    double xs = loopLane.getX() + xOfFrame (v, loopStart), xe = loopLane.getX() + xOfFrame (v, loopEnd);
+    if (testMutant.load() == mutHandleEdgeClamp)
+        xe = juce::jmin ((double) loopLane.getRight(), xe);
+    else if (! gripShown (loopStart) || ! gripShown (loopEnd))
+    {
+        const bool sIn = gripShown (loopStart), eIn = gripShown (loopEnd);
+        if (sIn && ((p.x >= xs && p.x < xs + kTabPx) || std::abs (p.x - xs) <= kGrabPx))
+            return handleStart;
+        if (eIn && ((p.x > xe - kTabPx && p.x <= xe) || std::abs (p.x - xe) <= kGrabPx))
+            return handleEnd;
+        return handleNone;
+    }
     const bool inStartTab = p.x >= xs && p.x < xs + kTabPx, inEndTab = p.x > xe - kTabPx && p.x <= xe;
     if (inStartTab != inEndTab)
         return inStartTab ? handleStart : handleEnd;
@@ -1336,6 +1558,13 @@ void TakeEditorPanel::mouseDown (const juce::MouseEvent& e)
     if (! anyButton)
         endDrag(); // a press while a drag is still on (a second button) ends it with its write
     dragLoop = loopJustMade = false;
+    overviewDrag = false;
+    if (overviewArea.contains (e.getPosition()) && length > 0)
+    {
+        overviewDrag = true;
+        overviewSeek ((double) e.position.x - overviewArea.getX());
+        return;
+    }
     loopAnchor = -1;
     dragging = handleNone;
     warpDrag = -1;
@@ -1343,7 +1572,13 @@ void TakeEditorPanel::mouseDown (const juce::MouseEvent& e)
     {
         // The warp lane: a left press takes the marker under the pointer. Nothing else here.
         if (leftOnly (e.mods) && length > 0)
-            warpDrag = warpMarkerAt (e.getPosition());
+        {
+            // Alt + click (Option on macOS) removes the marker under the pointer.
+            if (e.mods.isAltDown())
+                removeWarpMarker (warpMarkerAt (e.getPosition()));
+            else
+                warpDrag = warpMarkerAt (e.getPosition());
+        }
         return;
     }
     const bool inLane = loopLane.contains (e.getPosition());
@@ -1393,14 +1628,14 @@ void TakeEditorPanel::mouseDown (const juce::MouseEvent& e)
 void TakeEditorPanel::mouseDrag (const juce::MouseEvent& e)
 {
     using namespace TakeEditorMath;
+    if (overviewDrag)
+    {
+        overviewSeek ((double) e.position.x - overviewArea.getX());
+        return;
+    }
     if (warpDrag >= 0)
     {
-        // Horizontal only: dstFrame follows the pointer, clamped between the neighbours.
-        const auto before = warpMarkers[(std::size_t) warpDrag].dstFrame;
-        WarpMarkers::moveTo (warpMarkers, (std::size_t) warpDrag, frameAtX (view(), (double) e.position.x - waveArea.getX()), length);
-        warpTagBpm = 0.0; // a hand move: the tag tempo comes from the markers
-        if (warpMarkers[(std::size_t) warpDrag].dstFrame != before)
-            repaint (warpLane.getUnion (waveArea));
+        warpDragMove (frameAtX (view(), (double) e.position.x - waveArea.getX()), e.mods.isShiftDown());
         return;
     }
     if (dragging == handleNone)
@@ -1453,6 +1688,12 @@ void TakeEditorPanel::mouseDrag (const juce::MouseEvent& e)
 
 void TakeEditorPanel::mouseUp (const juce::MouseEvent&)
 {
+    releaseDrag();
+}
+
+void TakeEditorPanel::releaseDrag()
+{
+    overviewDrag = false;
     const bool warpMoved = warpDrag >= 0;
     warpDrag = -1;
     if (warpMoved)
@@ -1464,18 +1705,103 @@ void TakeEditorPanel::mouseUp (const juce::MouseEvent&)
     endDrag();
 }
 
-void TakeEditorPanel::mouseDoubleClick (const juce::MouseEvent& e)
+bool TakeEditorPanel::removeWarpMarker (int i)
 {
-    if (! warpLane.contains (e.getPosition()))
-        return;
-    const int i = warpMarkerAt (e.getPosition());
-    if (i >= 0)
+    if (i < 0 || ! WarpMarkers::removeAt (warpMarkers, (std::size_t) i))
+        return false;
+    markersEdited = true;
+    warpTagBpm = 0.0;
+    refreshButtons();
+    repaint (warpLane.getUnion (waveArea));
+    return true;
+}
+
+int TakeEditorPanel::addWarpMarkerAtX (double xInWave)
+{
+    ensureWarp();
+    if (! warpButton.getToggleState() || length <= 0 || warpMarkers.size() < 2)
+        return -1;
+    // x is a warped position (the markers are drawn at dst): back to the source frame.
+    auto src = WarpMarkers::mapFrame (warpMarkers, TakeEditorMath::frameAtX (view(), xInWave), false);
+    if (snapGridButton.getToggleState() && gridIsUsable())
+        src = juce::jlimit ((juce::int64) 0, length, TakeEdit::snapToGrid (src, sampleRate, take.grid.bpm, take.grid.downbeatSec));
+    const int at = WarpMarkers::insertAt (warpMarkers, src);
+    if (at >= 0)
     {
-        WarpMarkers::resetOne (warpMarkers, (std::size_t) i);
-        warpTagBpm = 0.0;
-        refreshButtons(); // Reset markers / Apply warp follow the moved count
+        markersEdited = true;
+        refreshButtons();
         repaint (warpLane.getUnion (waveArea));
     }
+    return at;
+}
+
+void TakeEditorPanel::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    const bool inLane = warpLane.contains (e.getPosition());
+    if (! inLane && ! waveArea.contains (e.getPosition()))
+        return;
+    const int i = inLane ? warpMarkerAt (e.getPosition()) : -1;
+    if (i < 0)
+    {
+        // Empty space with Warp on: a new marker there.
+        addWarpMarkerAtX ((double) e.position.x - waveArea.getX());
+        return;
+    }
+    warpMarkerDoubleClicked (i);
+}
+
+void TakeEditorPanel::warpMarkerDoubleClicked (int i)
+{
+    if (i < 0 || (std::size_t) i >= warpMarkers.size())
+        return;
+    if (removeWarpMarker (i)) // double-click removes a marker; the end anchors reset instead
+        return;
+    WarpMarkers::resetOne (warpMarkers, (std::size_t) i);
+    warpTagBpm = 0.0;
+    refreshButtons(); // Reset markers / Apply warp follow the moved count
+    repaint (warpLane.getUnion (waveArea));
+}
+
+void TakeEditorPanel::warpDragMove (juce::int64 frame, bool shiftDown)
+{
+    // Horizontal only: dstFrame follows the pointer, clamped between the neighbours.
+    const auto before = warpMarkers[(std::size_t) warpDrag].dstFrame;
+    WarpMarkers::moveTo (warpMarkers, (std::size_t) warpDrag, warpDragTarget (frame, shiftDown), length);
+    warpTagBpm = 0.0; // a hand move: the tag tempo comes from the markers
+    if (warpMarkers[(std::size_t) warpDrag].dstFrame != before)
+        repaint (warpLane.getUnion (waveArea));
+}
+
+bool TakeEditorPanel::shotDragWarp (int marker, double dstSec, bool snap)
+{
+    // Dev shot hook: press on the marker, one drag step to dstSec, release, as the mouse does.
+    ensureWarp();
+    if (length <= 0 || marker < 0 || (std::size_t) marker >= warpMarkers.size())
+        return false;
+    warpDrag = marker;
+    warpDragMove ((juce::int64) std::llround (dstSec * sampleRate), ! snap);
+    releaseDrag();
+    return true;
+}
+
+void TakeEditorPanel::shotZoom (double startSec, double endSec)
+{
+    zoomToFrames ((juce::int64) std::llround (startSec * sampleRate), (juce::int64) std::llround (endSec * sampleRate));
+}
+
+juce::int64 TakeEditorPanel::warpDragTarget (juce::int64 dst, bool shiftDown) const
+{
+    // Snap to the take's beat grid (fixed, from the measured tempo); Shift is free.
+    if (! shiftDown && gridIsUsable())
+        dst = juce::jlimit ((juce::int64) 0, length, TakeEdit::snapToGrid (dst, sampleRate, take.grid.bpm, take.grid.downbeatSec));
+    return dst;
+}
+
+juce::int64 TakeEditorPanel::columnSource (juce::int64 d) const
+{
+    // A warped frame back to the source frame under it while a warp is in effect.
+    const bool on = warpButton.getToggleState() && WarpMarkers::movedCount (warpMarkers) > 0; // = effectiveWarp(), no copy
+    return on ? WarpMarkers::mapFrame (warpMarkers, d, false) : d;
 }
 
 void TakeEditorPanel::ensureWarp() const
@@ -1531,9 +1857,11 @@ void TakeEditorPanel::paintWarp (juce::Graphics& g) const
     }
     for (const auto& m : warpMarkers)
     {
-        const int x = juce::jmin (waveArea.getRight() - 1, xAt (m.dstFrame));
+        const int x = xAt (m.dstFrame);
+        if (x < waveArea.getX() || x > waveArea.getRight())
+            continue; // out of the zoomed view
         g.setColour ((m.moved() ? kAmber : kAccent).withAlpha (0.45f));
-        g.fillRect (x, waveArea.getY(), 1, waveArea.getHeight());
+        g.fillRect (juce::jmin (waveArea.getRight() - 1, x), waveArea.getY(), 1, waveArea.getHeight());
     }
 }
 
@@ -1712,7 +2040,7 @@ void TakeEditorPanel::refreshButtons()
         const bool moved = markers && WarpMarkers::movedCount (warpMarkers) > 0;
         warpButton.setEnabled (markers);
         warpHostButton.setEnabled (markers && ! waiting && gridIsUsable() && warpTargetBpm() > 0.0);
-        warpResetButton.setEnabled (moved && ! waiting);
+        warpResetButton.setEnabled ((moved || (markers && markersEdited && TakeEditorMath::testMutant.load() != TakeEditorMath::mutResetMovedOnly)) && ! waiting); // an added or removed marker counts too
         applyWarpButton.setEnabled (moved && ! waiting);
     }
     stretchButton.setEnabled (opened && ((! waiting && stretchName.isNotEmpty() && stretchFrom > 0.0) || TakeEditorMath::testMutant.load() == TakeEditorMath::mutFitStretchLoose));
@@ -1728,7 +2056,9 @@ std::vector<TakeEditorPanel::Area> TakeEditorPanel::areasForTest() const
     return { { "Title", titleLabel.getBounds(), false, false },      { "Close", closeButton.getBounds(), true, true },
              { "Info line", infoLabel.getBounds(), false, false },   { "Time ruler", rulerArea, false, false },
              { "Warp lane + markers", warpLane, true, false },        { "Loop lane + loop flags", loopLane, true, false },
-             { "Waveform + crop handles", waveArea, true, false },   { "Scroll bar (empty)", scrollArea, false, false },
+             { "Waveform + crop handles", waveArea, true, false },   { "Scroll bar", scrollArea, true, false },
+             { "Zoom out", zoomOutButton.getBounds(), true, true },  { "Zoom in", zoomInButton.getBounds(), true, true },
+             { "Zoom fit", zoomFitButton.getBounds(), true, true },     { "Zoom loop", zoomLoopButton.getBounds(), true, true },
              { "Readout", readoutLabel.getBounds(), false, false },  { "Snap to grid", snapGridButton.getBounds(), true, true },
              { "Zero crossing", zeroButton.getBounds(), true, true }, { "Snap note", noteLabel.getBounds(), false, false },
              { "Fit to bars", fitButton.getBounds(), true, true },   { "Tempo field", tempoField.getBounds(), true, true },
@@ -1763,7 +2093,24 @@ void TakeEditorPanel::resized()
     const auto oldWave = waveArea;
     waveArea = row (kAboveWave, juce::jmax (40, getHeight() - kFixedRows));
     const int by = waveArea.getBottom();
-    scrollArea = row (by + 4, 14);   // slice 5
+    {
+        // Scroll bar row: -, +, Fit at the right (24 px tall, ending above the readout),
+        // the scroll bar in the rest, 14 px tall.
+        auto zr = row (by + 1, 24);
+        zoomFitButton.setBounds (zr.removeFromRight (48));
+        zr.removeFromRight (4);
+        zoomInButton.setBounds (zr.removeFromRight (48));
+        zr.removeFromRight (4);
+        zoomOutButton.setBounds (zr.removeFromRight (48));
+        zr.removeFromRight (8);
+        zoomLoopButton.setBounds (zr.removeFromRight (48));
+        zr.removeFromRight (8);
+        // The overview strip of the whole take (top) and the scroll bar under it.
+        overviewArea = zr.removeFromTop (13);
+        zr.removeFromTop (1);
+        scrollArea = zr;
+        scrollBar.setBounds (scrollArea);
+    }
     readoutLabel.setBounds (row (by + 26, 18));
     snapRow = row (by + 50, 28);     // slice 3: two toggles, the note takes the rest
     {
@@ -1826,7 +2173,10 @@ void TakeEditorPanel::resized()
     b.removeFromRight (8);
     cancelButton.setBounds (b.removeFromRight (90));
     if (waveArea.getWidth() != oldWave.getWidth() || waveArea.getHeight() != oldWave.getHeight())
+    {
         waveDirty = true;
+        zoomChanged(); // the zoom cap and scroll range follow the width
+    }
 }
 
 void TakeEditorPanel::renderWave()
@@ -1841,6 +2191,7 @@ void TakeEditorPanel::renderWave()
     waveImage = juce::Image (juce::Image::ARGB, w, h, true);
     juce::Graphics g (waveImage);
     const auto v = view();
+    const bool warpOn = ! effectiveWarp().empty();
     const int lanes = juce::jmax (1, peaks->lanes), gapPx = 2;
     const float laneH = (float) (h - gapPx * (lanes - 1)) / (float) lanes;
     for (int lane = 0; lane < lanes; ++lane)
@@ -1852,12 +2203,31 @@ void TakeEditorPanel::renderWave()
         for (int px = 0; px < w; ++px)
         {
             float lo = 0.0f, hi = 0.0f;
-            if (! TakePeaks::columnMinMax (*peaks, lane, v.firstFrame + (juce::int64) std::llround (px * v.framesPerPixel), v.framesPerPixel, lo, hi))
+            // The column covers warped frames [d0, d1); with a warp in effect the source
+            // frames under it come back through the marker map, so the picture is what Play hears.
+            const auto d0 = v.firstFrame + (juce::int64) std::llround (px * v.framesPerPixel);
+            const auto s0 = columnSource (d0);
+            double span = v.framesPerPixel;
+            if (warpOn)
+            {
+                const auto d1 = v.firstFrame + (juce::int64) std::llround ((px + 1) * v.framesPerPixel);
+                span = juce::jmax (1.0, (double) (columnSource (d1) - s0));
+            }
+            if (! TakePeaks::columnMinMax (*peaks, lane, s0, span, lo, hi))
                 continue;
             const float y1 = mid - juce::jlimit (-1.0f, 1.0f, hi) * half, y2 = mid - juce::jlimit (-1.0f, 1.0f, lo) * half;
             g.fillRect ((float) px, y1, 1.0f, juce::jmax (1.0f, y2 - y1));
         }
     }
+}
+
+int TakeEditorPanel::rulerClipNow() const
+{
+    // Ticks and labels stop short of the playhead readout only while it is shown; with no
+    // readout they run the full ruler width.
+    const bool overlay = playheadValue.isVisible() || TakeEditorMath::testMutant.load() == TakeEditorMath::mutRulerAlwaysClip;
+    return overlay ? rulerClipRight (rulerArea.getRight(), rulerArea.getWidth(), playheadOverlayW > 0 ? playheadOverlayW : kPlayheadOverlayW)
+                   : rulerArea.getRight();
 }
 
 void TakeEditorPanel::paintRuler (juce::Graphics& g) const
@@ -1866,7 +2236,7 @@ void TakeEditorPanel::paintRuler (juce::Graphics& g) const
     g.fillRect (rulerArea.getX(), rulerArea.getBottom() - 1, rulerArea.getWidth(), 1);
     if (length <= 0 || ! (sampleRate > 0.0))
         return;
-    const int clipR = rulerClipRight (rulerArea.getRight(), rulerArea.getWidth(), playheadOverlayW > 0 ? playheadOverlayW : kPlayheadOverlayW);
+    const int clipR = rulerClipNow();
     if (! beatCache.empty())
     {
         // Beats: a short tick per beat, a longer one per bar, bar numbers thinned by beatLines.
@@ -1883,10 +2253,20 @@ void TakeEditorPanel::paintRuler (juce::Graphics& g) const
                 g.setColour (kDim);
                 g.drawText (juce::String (b.label), x + 3, rulerArea.getY(), 30, rulerArea.getHeight() - 2, juce::Justification::centredLeft, false);
             }
+            else if (b.tagBar > 0 && x + 3 + 40 <= clipR)
+            {
+                auto t = juce::String (b.tagBar) + "." + juce::String (b.tagBeat);
+                if (b.tagPart > 0)
+                    t << "." << b.tagPart;
+                g.setColour (kDim.withAlpha (0.8f));
+                g.drawText (t, x + 3, rulerArea.getY(), 40, rulerArea.getHeight() - 2, juce::Justification::centredLeft, false);
+            }
         }
         return;
     }
-    const double seconds = (double) length / sampleRate, pxPerSec = (double) rulerArea.getWidth() / seconds;
+    const auto rv = view();
+    const double seconds = (double) length / sampleRate, pxPerSec = sampleRate / rv.framesPerPixel;
+    const double t0 = (double) rv.firstFrame / sampleRate, t1 = t0 + (double) rulerArea.getWidth() / pxPerSec;
     double step = 600.0;
     for (double s : { 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0 })
         if (s * pxPerSec >= 56.0)
@@ -1895,10 +2275,10 @@ void TakeEditorPanel::paintRuler (juce::Graphics& g) const
             break;
         }
     g.setFont (juce::FontOptions (10.0f));
-    for (int k = 0; k * step <= seconds + 1.0e-9; ++k)
+    for (int k = (int) std::ceil (t0 / step - 1.0e-9); k * step <= juce::jmin (seconds, t1) + 1.0e-9; ++k)
     {
         const double t = k * step;
-        const int x = rulerArea.getX() + (int) std::lround (t * pxPerSec);
+        const int x = rulerArea.getX() + (int) std::lround ((t - t0) * pxPerSec);
         g.setColour (kDim.withAlpha (0.7f));
         if (x >= clipR)
             break;
@@ -1927,26 +2307,81 @@ void TakeEditorPanel::paint (juce::Graphics& g)
     else
         beatCache.clear();
     paintRuler (g);
+    if (scrollBar.isVisible())
+    {
+        // The scroll track: JUCE draws only the thumb, so the track is shown here.
+        g.setColour (kEdge.withAlpha (0.6f));
+        g.fillRoundedRectangle (scrollArea.toFloat().reduced (0.5f), 4.0f);
+    }
+    if (! overviewArea.isEmpty())
+    {
+        // The overview: the whole take, the loop tinted, the view as a box to drag.
+        g.setColour (kField);
+        g.fillRect (overviewArea);
+        if (peaks != nullptr && length > 0)
+        {
+            const auto ov = TakeEditorMath::wholeTake (length, overviewArea.getWidth());
+            const float mid = (float) overviewArea.getCentreY(), half = 0.5f * (float) overviewArea.getHeight() - 1.0f;
+            g.setColour (kDim);
+            for (int px = 0; px < overviewArea.getWidth(); ++px)
+            {
+                float lo = 0.0f, hi = 0.0f;
+                if (! TakePeaks::columnMinMax (*peaks, 0, (juce::int64) std::llround (px * ov.framesPerPixel), ov.framesPerPixel, lo, hi))
+                    continue;
+                const float y1 = mid - juce::jlimit (-1.0f, 1.0f, hi) * half, y2 = mid - juce::jlimit (-1.0f, 1.0f, lo) * half;
+                g.fillRect ((float) (overviewArea.getX() + px), y1, 1.0f, juce::jmax (1.0f, y2 - y1));
+            }
+            if (hasLoop())
+            {
+                const float xs = (float) (overviewArea.getX() + TakeEditorMath::xOfFrame (ov, loopStart));
+                const float xe = (float) (overviewArea.getX() + TakeEditorMath::xOfFrame (ov, loopEnd));
+                g.setColour (kAccent.withAlpha (0.25f));
+                g.fillRect (xs, (float) overviewArea.getY(), juce::jmax (1.0f, xe - xs), (float) overviewArea.getHeight());
+            }
+            const auto v = view();
+            const float bx = (float) (overviewArea.getX() + TakeEditorMath::xOfFrame (ov, v.firstFrame));
+            const float bw = juce::jmax (3.0f, (float) (v.framesPerPixel * (double) v.widthPx / ov.framesPerPixel));
+            g.setColour (kText.withAlpha (0.12f));
+            g.fillRect (bx, (float) overviewArea.getY(), bw, (float) overviewArea.getHeight());
+            g.setColour (kText.withAlpha (0.8f));
+            g.drawRect (juce::Rectangle<float> (bx, (float) overviewArea.getY(), bw, (float) overviewArea.getHeight()), 1.0f);
+        }
+    }
 
     // Loop lane: the two flags and the bar between them, or how to make a loop.
     g.setColour (kField.withAlpha (0.55f));
     g.fillRect (loopLane);
     int loopXs = -1, loopXe = -1;
+    bool loopShowS = false, loopShowE = false;
     if (length > 0 && hasLoop())
     {
         using namespace TakeEditorMath;
         const auto v = view();
+        juce::Graphics::ScopedSaveState clipLoop (g);
+        g.reduceClipRegion (loopLane);
         const int y = loopLane.getY(), h = loopLane.getHeight();
-        loopXs = loopLane.getX() + (int) std::floor (xOfFrame (v, loopStart));
-        loopXe = juce::jmin (loopLane.getRight(), loopLane.getX() + (int) std::floor (xOfFrame (v, loopEnd)));
+        // A flag off the view is not drawn (the old clamp pinned it to the edge); the
+        // band runs to the view edge.
+        loopShowS = gripShown (loopStart);
+        loopShowE = gripShown (loopEnd);
+        loopXs = loopLane.getX() + (int) std::floor (juce::jlimit (-1.0, (double) loopLane.getWidth() + 1.0, xOfFrame (v, loopStart)));
+        loopXe = loopLane.getX() + (int) std::floor (juce::jlimit (-1.0, (double) loopLane.getWidth() + 1.0, xOfFrame (v, loopEnd)));
+        if (testMutant.load() == mutHandleEdgeClamp)
+            loopXe = juce::jmin (loopLane.getRight(), loopXe);
         g.setColour (kGreen.withAlpha (0.30f));
         g.fillRect (loopXs, y + 6, loopXe - loopXs, h - 12);
         g.setColour (kGreen);
-        g.fillRect (loopXs, y, 2, h);
-        g.fillRect (loopXe - 2, y, 2, h);
         juce::Path pennants; // each flag points into the loop
-        pennants.addTriangle ((float) loopXs, (float) y, (float) (loopXs + kTabPx), (float) y + 0.5f * (float) h, (float) loopXs, (float) (y + h));
-        pennants.addTriangle ((float) loopXe, (float) y, (float) (loopXe - kTabPx), (float) y + 0.5f * (float) h, (float) loopXe, (float) (y + h));
+        if (loopShowS)
+        {
+            g.fillRect (loopXs, y, 2, h);
+            pennants.addTriangle ((float) loopXs, (float) y, (float) (loopXs + kTabPx), (float) y + 0.5f * (float) h, (float) loopXs, (float) (y + h));
+        }
+        if (loopShowE)
+        {
+            g.fillRect (loopXe - 2, y, 2, h);
+            pennants.addTriangle ((float) loopXe, (float) y, (float) (loopXe - kTabPx), (float) y + 0.5f * (float) h, (float) loopXe, (float) (y + h));
+        }
         g.fillPath (pennants);
     }
     else if (length > 0)
@@ -1966,6 +2401,9 @@ void TakeEditorPanel::paint (juce::Graphics& g)
         const float y = (float) warpLane.getY() + 3.0f, hh = (float) warpLane.getHeight() - 6.0f;
         for (const auto& m : warpMarkers)
         {
+            const double mx = TakeEditorMath::xOfFrame (v, m.dstFrame);
+            if (mx < -5.0 || mx > (double) warpLane.getWidth() + 5.0)
+                continue; // out of the zoomed view
             const float x = (float) juce::jlimit (warpLane.getX() + 5, warpLane.getRight() - 5,
                                                   warpLane.getX() + (int) std::floor (TakeEditorMath::xOfFrame (v, m.dstFrame)));
             juce::Path tag;
@@ -1983,6 +2421,18 @@ void TakeEditorPanel::paint (juce::Graphics& g)
     // Waveform
     g.setColour (kField);
     g.fillRect (waveArea);
+    {
+        // A marker move, add, remove, reset or the Warp toggle redraws the wave in warped time.
+        std::uint64_t sig = warpButton.getToggleState() ? 1u : 0u;
+        if (sig != 0)
+            for (const auto& m : warpMarkers)
+                sig = sig * 1000003u + (std::uint64_t) m.srcFrame * 31u + (std::uint64_t) m.dstFrame;
+        if (sig != waveWarpSig)
+        {
+            waveWarpSig = sig;
+            waveDirty = true;
+        }
+    }
     if (waveDirty)
         renderWave();
     if (waveImage.isValid())
@@ -1997,6 +2447,8 @@ void TakeEditorPanel::paint (juce::Graphics& g)
                                                  : "Reading take... " + juce::String (shared != nullptr ? shared->percent.load() : 0) + "%";
         g.drawFittedText (text, waveArea.reduced (10, 0).withTrimmedBottom (waveArea.getHeight() / 2 + 4), juce::Justification::centredBottom, 2);
     }
+    g.saveState(); // a zoomed view draws handles and lines off the waveform: clip to it
+    g.reduceClipRegion (waveArea);
     for (const auto& b : beatCache) // faint beat lines, bars a little stronger
     {
         g.setColour (kDim.withAlpha (b.bar ? 0.30f : 0.13f));
@@ -2007,29 +2459,41 @@ void TakeEditorPanel::paint (juce::Graphics& g)
     {
         using namespace TakeEditorMath;
         const auto v = view();
-        const int xs = waveArea.getX() + (int) std::floor (xOfFrame (v, cropStart));
-        const int xe = juce::jmin (waveArea.getRight(), waveArea.getX() + (int) std::floor (xOfFrame (v, cropEnd)));
-        // Outside the crop: dimmed.
+        auto at = [&] (juce::int64 f) { return waveArea.getX() + (int) std::floor (juce::jlimit (-1.0, (double) waveArea.getWidth() + 1.0, xOfFrame (v, f))); };
+        const int xs = at (cropStart);
+        const int xe = testMutant.load() == mutHandleEdgeClamp ? juce::jmin (waveArea.getRight(), at (cropEnd)) : at (cropEnd);
+        // Outside the crop: dimmed. A handle off the view is not drawn (the dimming runs to the edge).
         g.setColour (kBg.withAlpha (0.72f));
-        g.fillRect (waveArea.withRight (xs));
-        g.fillRect (waveArea.withLeft (xe));
-        g.setColour (kAccent);
-        g.fillRect (xs, waveArea.getY(), 2, waveArea.getHeight());
-        g.fillRect (xe - 2, waveArea.getY(), 2, waveArea.getHeight());
-        g.fillRect (xs, waveArea.getY(), kTabPx, kTabPx);                            // start grip, top
-        g.fillRect (xe - kTabPx, waveArea.getBottom() - kTabPx, kTabPx, kTabPx);     // end grip, bottom
-        g.setColour (kBg);
+        g.fillRect (waveArea.withRight (juce::jlimit (waveArea.getX(), waveArea.getRight(), xs)));
+        g.fillRect (waveArea.withLeft (juce::jlimit (waveArea.getX(), waveArea.getRight(), xe)));
         g.setFont (juce::FontOptions (10.0f, juce::Font::bold));
-        g.drawText ("S", xs, waveArea.getY(), kTabPx, kTabPx, juce::Justification::centred, false);
-        g.drawText ("E", xe - kTabPx, waveArea.getBottom() - kTabPx, kTabPx, kTabPx, juce::Justification::centred, false);
+        if (gripShown (cropStart))
+        {
+            g.setColour (kAccent);
+            g.fillRect (xs, waveArea.getY(), 2, waveArea.getHeight());
+            g.fillRect (xs, waveArea.getY(), kTabPx, kTabPx);                        // start grip, top
+            g.setColour (kBg);
+            g.drawText ("S", xs, waveArea.getY(), kTabPx, kTabPx, juce::Justification::centred, false);
+        }
+        if (gripShown (cropEnd))
+        {
+            g.setColour (kAccent);
+            g.fillRect (xe - 2, waveArea.getY(), 2, waveArea.getHeight());
+            g.fillRect (xe - kTabPx, waveArea.getBottom() - kTabPx, kTabPx, kTabPx); // end grip, bottom
+            g.setColour (kBg);
+            g.drawText ("E", xe - kTabPx, waveArea.getBottom() - kTabPx, kTabPx, kTabPx, juce::Justification::centred, false);
+        }
     }
-    if (loopXs >= 0)
+    if (loopShowS || loopShowE)
     {
         // The loop points run down through the waveform as thin lines; they are grabbed in the lane only.
         g.setColour (kGreen.withAlpha (0.55f));
-        g.fillRect (loopXs, waveArea.getY(), 1, waveArea.getHeight());
-        g.fillRect (juce::jmax (loopXs, loopXe - 1), waveArea.getY(), 1, waveArea.getHeight());
+        if (loopShowS)
+            g.fillRect (loopXs, waveArea.getY(), 1, waveArea.getHeight());
+        if (loopShowE)
+            g.fillRect (juce::jmax (loopXs, loopXe - 1), waveArea.getY(), 1, waveArea.getHeight());
     }
+    g.restoreState();
     g.setColour (kEdge);
     g.drawRect (waveArea, 1);
     if (const int px = playheadX(); px >= 0)

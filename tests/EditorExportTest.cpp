@@ -12,6 +12,8 @@
 // leave no partial file.
 // Writes only under <cwd>/editexport_scratch and removes it at the end.
 #include "PluginProcessor.h"
+#include "PluginEditor.h"
+#include "CollectionStore.h"
 #include "TakeEdit.h"
 #include "TakeStretch.h"
 #include "WarpMarkers.h"
@@ -19,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 namespace
@@ -182,7 +185,7 @@ int main()
         j.takeFiles.add (dl);
         j.takeSeeds.add (4242);
         p->registerTakeAndWait (j, 0);
-        p->waitTakeMeasureIdle();
+        p->waitTakeMeasureIdle (120000); // generous: under a loaded CPU the measure can pass the 10 s default
         const auto takes = p->getTakes();
         const auto take = takes.empty() ? HslinkTakeEntry() : takes[0];
         const auto src = readWav (take.temp);
@@ -203,7 +206,7 @@ int main()
         juce::String whyNot;
         const auto ticket = p->requestTakeEdit (take.temp, edit, opt, &whyNot);
         p->waitTakeEditIdle();
-        p->waitTakeMeasureIdle();
+        p->waitTakeMeasureIdle (120000); // generous: under a loaded CPU the measure can pass the 10 s default
         p->waitSaverIdle();
         HotStepLinkProcessor::TakeEditReport rep;
         const bool got = ticket != 0 && p->getTakeEditReport (ticket, rep);
@@ -345,6 +348,65 @@ int main()
         std::printf ("  C abort: ok=%d err='%s' part seen while writing=%d dest exists=%d parts after=%d\n", (int) r4.ok, r4.error.toRawUTF8(), partSeen,
                      (int) rq.dest.exists(), partsIn (d));
         check (! r4.ok && partSeen > 0 && ! rq.dest.exists() && partsIn (d) == 0, "C: an export aborted mid write leaves no file and no partial");
+    }
+
+    // R (gated, HSLINK_REALTAKE=1): a real take exported with quantize 1/16 at 100%;
+    // every hit must land on a multiple of 240 ticks (960 ppq). Reads the wav only.
+    const char* rtEnv = std::getenv ("HSLINK_REALTAKE");
+    const char* rtWav = std::getenv ("HSLINK_REALTAKE_WAV");
+    if (rtEnv == nullptr || rtEnv[0] != '1' || rtWav == nullptr || rtWav[0] == 0)
+        std::printf ("  R real take: SKIP (set HSLINK_REALTAKE=1 and HSLINK_REALTAKE_WAV=<take wav>)\n");
+    else
+    {
+        const juce::File wav (juce::String::fromUTF8 (rtWav));
+        TempoMeasure::Result tm;
+        const bool measuredOk = HotStepLinkProcessor::measureTakeFile (wav, 0.0, tm, nullptr);
+        const auto res = TempoResolve::resolve (tm, wav.getFileName(), 0.0);
+        MidiBuildInputs in;
+        in.src = wav;
+        in.grid.bpm = res.bpm;
+        in.grid.downbeatSec = res.downbeatSec;
+        in.grid.fallback = res.isFallback();
+        in.grid.measured = measuredOk && tm.valid && ! res.isFallback();
+        in.srcBpm = res.bpm;
+        in.hasTempo = res.bpm > 0.0;
+        in.quantDiv = 16;
+        in.quantStrength = 1.0;
+        const auto out = root.getChildFile ("realtake");
+        out.createDirectory();
+        const auto mr = buildMidiFiles (in, out);
+        juce::MidiFile mf;
+        {
+            juce::FileInputStream fin (mr.hits);
+            if (! fin.openedOk() || ! mf.readFrom (fin))
+                mf = juce::MidiFile();
+        }
+        juce::String rows;
+        int hits = 0, off = 0;
+        for (int t = 0; t < mf.getNumTracks(); ++t)
+            for (const auto* e : *mf.getTrack (t))
+                if (e->message.isNoteOn())
+                {
+                    const auto tick = (long long) std::llround (e->message.getTimeStamp());
+                    ++hits;
+                    off += (tick % 240) != 0 ? 1 : 0;
+                    rows << juce::String (tick) << "\t" << juce::String (tick % 240) << "\t" << e->message.getNoteNumber() << "\t"
+                         << (int) e->message.getVelocity() << "\n";
+                }
+        juce::String txt;
+        txt << "# take: " << wav.getFileName() << "\n# measuredOk=" << (int) measuredOk << " measuredBpm=" << tm.bpm
+            << " resolvedBpm=" << res.bpm << " downbeatSec=" << res.downbeatSec << " fallback=" << (int) res.isFallback()
+            << "\n# ppq=" << mf.getTimeFormat() << " quant=1/16 strength=1.0 hits=" << hits << " offGrid=" << off
+            << " err='" << mr.err << "'\n# tick\ttick%240\tpitch\tvel\n" << rows;
+        const char* reviewEnv = std::getenv ("HSLINK_REVIEW_DIR");
+        const juce::File reviewDir = (reviewEnv != nullptr && reviewEnv[0] != 0) ? juce::File (juce::String::fromUTF8 (reviewEnv)) : out;
+        reviewDir.createDirectory();
+        reviewDir.getChildFile ("r4_midi_q16.txt").replaceWithText (txt);
+        std::printf ("  R real take: bpm=%.3f downbeat=%.4f hits=%d offGrid=%d err='%s'\n", res.bpm, res.downbeatSec, hits, off, mr.err.toRawUTF8());
+        check (mr.err.isEmpty() && hits > 0 && off == 0 && std::abs (res.bpm - 88.0) < 0.01, "R: real take q16 100% hits all on 240-tick grid");
+        // W2: estimate 130.14 resolved to 88 (3:2); the rephased downbeat must be on the kick at 0.0042 s.
+        std::printf ("  R real take downbeat: %.4f (want 0.0042 +- 0.020) estimate=%.3f\n", res.downbeatSec, tm.bpm);
+        check (std::abs (res.downbeatSec - 0.0042) <= 0.020, "R: real take 3:2 downbeat rephased onto the kick");
     }
 
     root.deleteRecursively();

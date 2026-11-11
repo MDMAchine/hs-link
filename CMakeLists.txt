@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 set(PLUGIN_TARGET "HOTSTEP_LINK")
 set(PLUGIN_CODE   "Hslk")
 
-project(${PLUGIN_TARGET} VERSION 0.5.14)
+project(${PLUGIN_TARGET} VERSION 0.5.18)
 # project(VERSION) is the single version source: juce_add_plugin inherits it as JucePlugin_VersionString;
 # the console test app gets the same define below.
 set(CMAKE_CXX_STANDARD 17)
@@ -94,7 +94,7 @@ target_link_libraries(${PLUGIN_TARGET} PRIVATE
     juce::juce_recommended_warning_flags)
 
 # Console tests: host sync (R1b) and capture ring + WAV writer (R2a).
-# -DHSLINK_TEETH=BAD_SYNC, NO_RESAMPLE, NO_GAIN, NO_AUD_RESAMPLE, BAD_PPQ, NO_XFADE, NO_LOOP_END, NO_REGION, NO_SOURCE_GATE, KEY_IN_STATE, NO_MODEL, NO_SEED_KEY, NO_PEAKS, NO_LYRICS, NO_CAPTION_STATE, NO_POLL_GATE, BAD_PACK, NO_AB, NO_SANITIZE, NO_ROLE, EA_BYPASS_CUT, EA_FLAG_FIRST, EA_BYPASS_PUBLISH, NO_TEMPO_GATE, URL_LEAK, URL_TYPED_SAVE, NO_PHASE, EA_NO_TRY or PRESETS
+# -DHSLINK_TEETH=BAD_SYNC, NO_RESAMPLE, NO_GAIN, NO_AUD_RESAMPLE, BAD_PPQ, NO_XFADE, NO_LOOP_END, NO_REGION, NO_SOURCE_GATE, KEY_IN_STATE, NO_MODEL, NO_SEED_KEY, NO_PEAKS, NO_LYRICS, NO_CAPTION_STATE, NO_POLL_GATE, BAD_PACK, NO_AB, NO_SANITIZE, NO_ROLE, EA_BYPASS_CUT, EA_FLAG_FIRST, EA_BYPASS_PUBLISH, NO_TEMPO_GATE, MIDI_SINGLE_TEMPO, URL_LEAK, URL_TYPED_SAVE, NO_PHASE, EA_NO_TRY, MIDI_CLEAN_FRESH or PRESETS
 # builds a deliberately broken copy.
 juce_add_console_app(HSLINK_Tests PRODUCT_NAME "HSLINK_Tests")
 target_sources(HSLINK_Tests PRIVATE
@@ -112,6 +112,17 @@ endif()
 target_link_libraries(HSLINK_Tests PRIVATE
     juce::juce_audio_utils juce::juce_audio_processors juce::juce_dsp
     juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+
+# Console test for MIDI drum export: GM note per hit type and take-relative velocity.
+# -DHSLINK_TEETH=MIDI_ONE_NOTE builds the old one-note export; MIDI_NO_GATE drops the onset gate.
+juce_add_console_app(HSLINK_MidiDrumTest PRODUCT_NAME "HSLINK_MidiDrumTest")
+target_sources(HSLINK_MidiDrumTest PRIVATE tests/MidiDrumTest.cpp source/TempoMeasure.cpp)
+target_include_directories(HSLINK_MidiDrumTest PRIVATE source)
+target_compile_definitions(HSLINK_MidiDrumTest PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
+if(HSLINK_TEETH)
+    target_compile_definitions(HSLINK_MidiDrumTest PRIVATE HSLINK_TEETH_${HSLINK_TEETH}=1)
+endif()
+target_link_libraries(HSLINK_MidiDrumTest PRIVATE juce::juce_audio_basics juce::juce_audio_formats juce::juce_recommended_config_flags)
 
 # Console test for the WAV tempo tag injector (acid + smpl chunks).
 juce_add_console_app(HSLINK_WavTagTest PRODUCT_NAME "HSLINK_WavTagTest")

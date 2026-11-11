@@ -29,8 +29,10 @@ namespace WarpMarkers
 
     // Test mutants (teeth), 0 in the plugin. 1: placement drops the last bar start.
     // 2: a drag is not clamped by its neighbours. 3: the percent is dst over src.
-    // 4: scaleToTempo leaves every dst at its src (no scaling).
-    enum Mutant { mutNone = 0, mutDropLast = 1, mutNoClamp = 2, mutInverse = 3, mutNoScale = 4 };
+    // 4: scaleToTempo leaves every dst at its src (no scaling). 5: insertAt ignores the
+    // minimum gap. 6: removeAt also removes the fixed anchors. 7: insertAt sets dst = src.
+    enum Mutant { mutNone = 0, mutDropLast = 1, mutNoClamp = 2, mutInverse = 3, mutNoScale = 4,
+                  mutNoInsertGap = 5, mutRemoveAnchor = 6, mutInsertNoMap = 7 };
     inline std::atomic<int> testMutant { mutNone };
 
     // One marker on every bar start inside 0..length, plus the fixed anchors at 0 and
@@ -137,5 +139,53 @@ namespace WarpMarkers
             return 0.0;
         const double s = (double) (m.back().srcFrame - m.front().srcFrame), d = (double) (m.back().dstFrame - m.front().dstFrame);
         return s > 0.0 && d > 0.0 ? fromBpm * s / d : 0.0;
+    }
+
+    // Piecewise-linear map between source and warped frames through the markers
+    // (round 4). toDst: src -> dst, else dst -> src. Outside the markers: identity.
+    inline std::int64_t mapFrame (const std::vector<Marker>& m, std::int64_t f, bool toDst)
+    {
+        for (std::size_t i = 0; i + 1 < m.size(); ++i)
+        {
+            const auto a0 = toDst ? m[i].srcFrame : m[i].dstFrame, a1 = toDst ? m[i + 1].srcFrame : m[i + 1].dstFrame;
+            const auto b0 = toDst ? m[i].dstFrame : m[i].srcFrame, b1 = toDst ? m[i + 1].dstFrame : m[i + 1].srcFrame;
+            if (f >= a0 && f <= a1 && a1 > a0)
+                return b0 + (std::int64_t) std::llround ((double) (f - a0) * (double) (b1 - b0) / (double) (a1 - a0));
+        }
+        return f;
+    }
+
+    // Adds a marker at source frame src with dst = the warped position there now, so the
+    // audio does not move. Refused (-1) outside the first..last marker or closer than
+    // kMinGapFrames (src or dst) to a neighbour. Returns the new index; the list stays
+    // sorted, so the neighbour clamps of moveTo hold.
+    inline int insertAt (std::vector<Marker>& m, std::int64_t src)
+    {
+        if (m.size() < 2)
+            return -1;
+        const bool noGap = testMutant.load() == mutNoInsertGap;
+        for (std::size_t i = 0; i + 1 < m.size(); ++i)
+        {
+            if (! (src >= m[i].srcFrame && src <= m[i + 1].srcFrame))
+                continue;
+            const auto dst = testMutant.load() == mutInsertNoMap ? src : mapFrame (m, src, true);
+            const std::int64_t g = noGap ? 1 : kMinGapFrames;
+            if (src - m[i].srcFrame < g || m[i + 1].srcFrame - src < g || dst - m[i].dstFrame < g || m[i + 1].dstFrame - dst < g)
+                return -1;
+            m.insert (m.begin() + (std::ptrdiff_t) (i + 1), Marker { src, dst });
+            return (int) i + 1;
+        }
+        return -1;
+    }
+
+    // Removes marker i. The first and last markers are the fixed anchors (frame 0 and the
+    // take end) and are never removed: every region must sit inside a marker pair.
+    inline bool removeAt (std::vector<Marker>& m, std::size_t i)
+    {
+        const bool anchor = i == 0 || i + 1 == m.size();
+        if (i >= m.size() || (anchor && testMutant.load() != mutRemoveAnchor))
+            return false;
+        m.erase (m.begin() + (std::ptrdiff_t) i);
+        return true;
     }
 }

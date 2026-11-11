@@ -2,6 +2,10 @@
 // Copyright (C) 2026 A&E Concepts. SPDX-License-Identifier: AGPL-3.0-or-later
 // Layout and painting follow mock-up B (three plates: setup, generate, queue/preview).
 #include "PluginEditor.h"
+#include "WavTempoTag.h"
+#include "TakeStretch.h"
+#include "MidiExport.h"
+#include "TempoMeasure.h"
 
 namespace
 {
@@ -189,6 +193,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
       standalone (juce::JUCEApplicationBase::isStandaloneApp()),
       vblank (this, [this] { tick ((++vblankTick % 10) == 0); })
 {
+    clearMidiDragTempRoot (midiDragTempRoot()); // drag-out MIDI files left by earlier sessions
     setLookAndFeel (&look);
     titleLabel.setText ("HOT-STEP LINK", juce::dontSendNotification);
     titleLabel.setFont (juce::FontOptions (21.0f, juce::Font::bold));
@@ -318,6 +323,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     takeEditor.onAuditionWarp = [this] (const std::vector<WarpMarkers::Marker>& m) { proc.editorAudition.setWarp (m); };
     takeEditor.onAuditionStop = [this] { proc.editorAudition.stop(); };
     takeEditor.onAuditionLoop = [this] (bool on) { proc.editorAudition.setLoop (on); };
+    takeEditor.onAuditionRegion = [this] (juce::int64 s, juce::int64 e, juce::int64 n) { proc.editorAudition.setRegion (s, e, n); };
     takeEditor.onAuditionState = [this] { return (int) proc.editorAudition.getState(); };
     takeEditor.onAuditionPosition = [this] { return proc.editorAudition.getPlayFraction(); };
     addChildComponent (takeEditor);
@@ -486,9 +492,32 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     exportWavButton.onClick = [this] { exportWav(); };
     addAndMakeVisible (exportWavButton);
     exportMidiButton.setEnabled (false);
-    exportMidiButton.setTooltip ("MIDI export: later");
-    exportMidiButton.setButtonText ("Export MIDI (later)");
+    exportMidiButton.setTooltip ("Write a tempo map (bar markers) and a hits file (one GM drum note per detected hit: kick, snare, hats or perc) "
+                                 "as MIDI beside the selected take");
+    exportMidiButton.onClick = [this] { exportMidi(); };
+    quantizeBox.addItem ("Q Off", 1);
+    quantizeBox.addItem ("Q 1/16", 2);
+    quantizeBox.addItem ("Q 1/8", 3);
+    quantizeBox.setSelectedId (1, juce::dontSendNotification);
+    quantizeBox.setTooltip ("Quantize the exported hits to the take's grid");
+    addAndMakeVisible (quantizeBox);
+    quantStrengthSlider.setRange (0.0, 100.0, 1.0);
+    quantStrengthSlider.setValue (100.0, juce::dontSendNotification);
+    quantStrengthSlider.setTextValueSuffix (" %");
+    quantStrengthSlider.setTooltip ("Quantize strength: how far each hit moves toward the grid");
+    addAndMakeVisible (quantStrengthSlider);
+    exportPathLabel.setMinimumHorizontalScale (0.6f);
+    exportPathLabel.setJustificationType (juce::Justification::centredLeft);
+    addChildComponent (exportPathLabel);
+    showExportButton.setTooltip ("Open the folder the last export was written to");
+    showExportButton.onClick = [this] { if (lastExportFile.exists()) lastExportFile.revealToUser(); };
+    addChildComponent (showExportButton);
     addAndMakeVisible (exportMidiButton);
+    midiDrag.setTooltip ("Drag the selected take's MIDI files (hits + tempo map) into the DAW. "
+                         "Built on the fly when Export MIDI has not been run.");
+    midiDrag.filesFor = [this] { return midiFilesForSelection(); };
+    midiDrag.requestBuild = [this] { return buildMidiForDrag(); };
+    addAndMakeVisible (midiDrag);
     addAndMakeVisible (takeList);
     levelMatchButton.setTooltip ("Match each take to the captured source RMS (or -18 dBFS RMS)");
     addAndMakeVisible (levelMatchButton);
@@ -667,7 +696,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     refreshSource();
     refreshTakes();
     setResizable (true, true);
-    setResizeLimits (980, 640, 1920, 1300);
+    setResizeLimits (kMinWindowW, kMinWindowH, 1920, 1300);
     // Test hook (standalone): HSLINK_PREVIEW_WAV preselects a local WAV for the preview.
     if (standalone)
     {
@@ -697,6 +726,8 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     addAndMakeVisible (settingsButton);
     refreshUnderstand();
 
+    if (standalone)
+        parseShotArgs (juce::JUCEApplicationBase::getCommandLineParameters());
     setSize (1180, 760);
 }
 
@@ -1250,6 +1281,8 @@ void HotStepLinkEditor::filesDropped (const juce::StringArray& files, int, int)
 // periodic: every 10th tick (about 6 times a second).
 void HotStepLinkEditor::tick (bool periodic)
 {
+    if (periodic && shot.step > 0)
+        runShotStep();
     // Header bars: 20 fps (every 3rd VBlank). isShowing() is false while the editor is
     // hidden or its window minimised, so the animation pauses then.
     if (headerAnimOn && (vblankTick % 3) == 0 && isShowing())
@@ -1412,6 +1445,26 @@ static TakeEditorMath::Grid takeEditorGridOf (const Cell& cell)
     return g;
 }
 
+// The take editor header: the cell tag, and "(est)" when the grid is the estimate
+// (no file name or host tempo): "88.00 bpm (file)", "98.00 bpm (host)", "130.10 bpm  3 ms (est)".
+// A user-set Fit to bars tempo outranks the host and the estimate (TempoResolve::applyFitBars).
+template <typename Cell>
+static Cell withFitBars (Cell cell, double userFitBpm)
+{
+    if (cell.tempoState == HslinkTakeEntry::tempoMeasured)
+        cell.resolved = TempoResolve::applyFitBars (cell.resolved, userFitBpm, &cell.tempo);
+    return cell;
+}
+
+template <typename Cell>
+static juce::String editorTempoText (const Cell& cell)
+{
+    auto text = TakeGrid::tempoTagOf (cell.tempoState, cell.tempo, cell.resolved).text;
+    if (cell.resolved.source == TempoResolve::Source::measured)
+        text << " (est)";
+    return text;
+}
+
 void HotStepLinkEditor::refreshTakes()
 {
     proc.audition.collectGarbage();
@@ -1443,7 +1496,10 @@ void HotStepLinkEditor::refreshTakes()
             // The open editor follows the take's tempo: a measurement that lands while it
             // is open would else leave the panel on the grid of the moment it was opened.
             if (takeEditor.isOpen() && cell.temp == takeEditor.getTemp())
-                takeEditor.setLiveGrid (takeEditorGridOf (cell), TakeGrid::tempoTagOf (cell.tempoState, cell.tempo, cell.resolved).text);
+            {
+                const auto fc = withFitBars (cell, takeEditor.userFitBpm());
+                takeEditor.setLiveGrid (takeEditorGridOf (fc), editorTempoText (fc));
+            }
         }
         editTakeButton.setEnabled (anySelected);
         moreLikeKey = selKey;
@@ -1496,6 +1552,13 @@ void HotStepLinkEditor::refreshTakes()
         const auto sel = proc.audition.getSelected();
         exportWavButton.setEnabled (sel != juce::File()
                                     && (! TakeGrid::testEditorStats.load() || EditorFs::exists (sel, EditorFs::tagTick)));
+        exportMidiButton.setEnabled (sel != juce::File() && ! midiBusy);
+        const bool canDrag = sel != juce::File() && (! midiBusy || midiDrag.isBuilding());
+        if (midiDrag.isEnabled() != canDrag)
+        {
+            midiDrag.setEnabled (canDrag);
+            midiDrag.repaint();
+        }
     }
     const float g = proc.audition.lastGain.load (std::memory_order_relaxed);
     if (std::abs (g - lastGainShown) > 1.0e-3f)
@@ -1548,9 +1611,10 @@ bool HotStepLinkEditor::openTakeEditor()
         TakeEditorPanel::Take t;
         t.temp = cell.temp;
         t.name = cell.key;
-        t.tempoText = TakeGrid::tempoTagOf (cell.tempoState, cell.tempo, cell.resolved).text;
+        const auto fc = withFitBars (cell, takeEditor.userFitBpm());
+        t.tempoText = editorTempoText (fc);
         // The grid of the snap toggle and the beat ruler: the test of requestTakeEdit.
-        t.grid = takeEditorGridOf (cell);
+        t.grid = takeEditorGridOf (fc);
         for (const auto& e : proc.getTakes()) // a copy, no disk IO
             if (e.temp == cell.temp)
                 t.edit = e.edit;
@@ -1618,7 +1682,90 @@ juce::File HotStepLinkEditor::dragFileFor (const juce::String& key)
     // take is refused. A lasting file removed by hand is left to the host to report.
     const auto model = buildTakeModel();
     const auto* c = model.find (key);
-    return c != nullptr && c->dragAllowed ? c->stable : juce::File();
+    return c != nullptr && c->dragAllowed ? warpedFileFor (c->temp, c->stable) : juce::File();
+}
+
+juce::File HotStepLinkEditor::warpedFileFor (const juce::File& temp, const juce::File& src)
+{
+    // A warp is in effect only while the take editor shows this take with Warp on and a
+    // marker moved (what Play hears). The render is TakeStretch::renderWarped, as Play,
+    // written once as 32 bit float beside the lasting root and reused while the take
+    // and the marker list stay the same.
+    if (noWarpExportForTest || src == juce::File() || ! takeEditor.isOpen() || takeEditor.getTemp() != temp)
+        return src;
+    const auto markers = takeEditor.effectiveWarp();
+    if (markers.empty())
+        return src;
+    juce::String sig (src.getFullPathName());
+    for (const auto& m : markers)
+        sig << ";" << (juce::int64) m.srcFrame << "," << (juce::int64) m.dstFrame;
+    const auto root = proc.getStableRoot();
+    const auto dir = root.getSiblingFile (root.getFileName() + "_warped");
+    const auto out = dir.getChildFile (src.getFileNameWithoutExtension() + "_warp_" + juce::String::toHexString (sig.hashCode64()) + ".wav");
+    if (out.existsAsFile())
+        return out;
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatReader> rd (wav.createReaderFor (new juce::FileInputStream (src), true));
+    if (rd == nullptr || rd->lengthInSamples <= 0 || rd->lengthInSamples > (juce::int64) std::numeric_limits<int>::max())
+        return {};
+    juce::AudioBuffer<float> in ((int) rd->numChannels, (int) rd->lengthInSamples);
+    rd->read (&in, 0, in.getNumSamples(), 0, true, true);
+    const double sr = rd->sampleRate;
+    rd.reset();
+    const auto warped = TakeStretch::renderWarped (in, sr, markers);
+    if (warped.getNumSamples() <= 0 || ! dir.createDirectory())
+        return {};
+    const auto part = out.withFileExtension ("wavpart");
+    part.deleteFile();
+    {
+        std::unique_ptr<juce::OutputStream> os (part.createOutputStream());
+        if (os == nullptr)
+            return {};
+        auto w = wav.createWriterFor (os, juce::AudioFormatWriterOptions {}
+                                              .withSampleRate (sr)
+                                              .withNumChannels (warped.getNumChannels())
+                                              .withBitsPerSample (32)
+                                              .withSampleFormat (juce::AudioFormatWriterOptions::SampleFormat::floatingPoint));
+        if (w == nullptr || ! w->writeFromAudioSampleBuffer (warped, 0, warped.getNumSamples()))
+        {
+            w.reset();
+            part.deleteFile();
+            return {};
+        }
+    }
+    if (! noWarpTagForTest)
+        WavTempoTag::inject (part, takeEditor.warpResultBpm());
+    if (! part.moveFileTo (out))
+    {
+        part.deleteFile();
+        return out.existsAsFile() ? out : juce::File();
+    }
+    if (! noWarpCacheCapForTest)
+        trimWarpCache (dir, out);
+    return out;
+}
+
+void HotStepLinkEditor::trimWarpCache (const juce::File& dir, const juce::File& keep)
+{
+    // Only *_warp_*.wav in the app-owned cache folder. Files touched in the last minute
+    // are kept too, so a path a drag is handing out right now is never pulled away.
+    auto files = dir.findChildFiles (juce::File::findFiles, false, "*_warp_*.wav");
+    std::sort (files.begin(), files.end(), [] (const juce::File& a, const juce::File& b)
+               { return a.getLastModificationTime() < b.getLastModificationTime(); });
+    const auto now = juce::Time::getCurrentTime();
+    const auto maxAge = juce::RelativeTime::days (kWarpCacheMaxAgeDays);
+    int count = files.size();
+    for (const auto& f : files)
+    {
+        const auto t = f.getLastModificationTime();
+        const bool tooOld = now - t > maxAge;
+        if (count <= kWarpCacheMax && ! tooOld)
+            break;
+        if (f == keep || now - t < juce::RelativeTime::minutes (1))
+            continue;
+        if (f.deleteFile())
+            --count;
+    }
 }
 
 juce::File HotStepLinkEditor::exportSource()
@@ -1632,7 +1779,10 @@ juce::File HotStepLinkEditor::exportSource()
     // lasting copy has one file, so it is not checked.
     for (const auto& c : buildTakeModel().cells)
         if (c.selected)
+        {
             src = c.saved ? TakeGrid::actionFileOf (c, EditorFs::tagExport) : c.file;
+            return warpedFileFor (c.temp, src);
+        }
     return src;
 }
 
@@ -1667,8 +1817,428 @@ void HotStepLinkEditor::exportWav()
                                       true, 8000);
         }
         else
+        {
             jobLabel.setText ("Exported " + dest.getFileName(), juce::dontSendNotification);
+            showExportResult (dest);
+        }
     });
+}
+
+void HotStepLinkEditor::showExportResult (const juce::File& written)
+{
+    // Same for Export WAV and Export MIDI: the full output folder stays on screen until the next export.
+    lastExportFile = written;
+    const auto folder = written.getParentDirectory().getFullPathName();
+    exportPathLabel.setText ("Saved to: " + folder, juce::dontSendNotification);
+    exportPathLabel.setTooltip (written.getFullPathName());
+    const bool wasVisible = exportPathLabel.isVisible();
+    exportPathLabel.setVisible (true);
+    showExportButton.setVisible (true);
+    if (! wasVisible)
+        resized();
+}
+
+juce::StringArray HotStepLinkEditor::midiFilesForSelection() const
+{
+    if (proc.audition.getSelected() != lastMidiSelection || lastMidiHits == juce::File())
+        return {};
+    juce::StringArray out;
+    for (const auto& f : { lastMidiHits, lastMidiNotes, lastMidiTempo })
+        if (f != juce::File() && f.existsAsFile())
+            out.add (f.getFullPathName());
+    return out;
+}
+
+MidiBuildResult buildMidiFiles (const MidiBuildInputs& in, const juce::File& destDir)
+{
+    MidiBuildResult r;
+    auto& tempoOut = r.tempo;
+    auto& hitsOut = r.hits;
+    auto& err = r.err;
+    const auto& src = in.src;
+    const auto& grid = in.grid;
+    const auto& markers = in.markers;
+    const double srcBpm = in.srcBpm;
+    const bool hasTempo = in.hasTempo;
+    const int beatsPerBar = in.beatsPerBar, sigDen = in.sigDen, mutant = in.mutant;
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatReader> rd (wav.createReaderFor (new juce::FileInputStream (src), true));
+    if (rd == nullptr || rd->lengthInSamples <= 0 || rd->lengthInSamples > (juce::int64) std::numeric_limits<int>::max())
+        err = "could not read " + src.getFullPathName();
+    else
+    {
+        const double sr = rd->sampleRate;
+        juce::AudioBuffer<float> buf ((int) rd->numChannels, (int) rd->lengthInSamples);
+        rd->read (&buf, 0, buf.getNumSamples(), 0, true, true);
+        rd.reset();
+        std::vector<float> mono ((size_t) buf.getNumSamples(), 0.0f);
+        const float k = 1.0f / (float) juce::jmax (1, buf.getNumChannels());
+        for (int ch = 0; ch < buf.getNumChannels(); ++ch)
+        {
+            const float* p = buf.getReadPointer (ch);
+            for (size_t i = 0; i < mono.size(); ++i)
+                mono[i] += p[i] * k;
+        }
+        std::vector<double> onSecs;
+        for (const auto& on : TempoMeasure::onsets (mono.data(), mono.size(), sr))
+            onSecs.push_back (on.sec);
+        // Hits only from drum-like transients (horns and pads stay out of the hits file);
+        // the notes track below still splits at every onset.
+        auto hits = MidiExport::hitsFromOnsets (buf, sr, MidiExport::percussiveOnsets (buf, sr, onSecs));
+        const auto pitch = MidiExport::trackNotes (mono.data(), (int) mono.size(), sr, onSecs);
+        auto notes = pitch.notes;
+        if (mutant == 2)
+            for (auto& h : hits)
+                h.sec += 1.0 / 400.0;
+        // The loop / crop region in this file's frames (already warped time).
+        const juce::int64 len = buf.getNumSamples();
+        const juce::int64 r0 = juce::jlimit<juce::int64> (0, len, in.regionStart < 0 ? 0 : in.regionStart);
+        const juce::int64 r1 = juce::jlimit<juce::int64> (r0, len, in.regionEnd < 0 ? len : in.regionEnd);
+        const bool cut = r1 > r0 && (r0 > 0 || r1 < len);
+        const double regionSec = cut ? (double) r0 / sr : 0.0;
+        if (cut)
+        {
+            hits = MidiExport::hitsInRegion (hits, regionSec, (double) r1 / sr);
+            notes = MidiExport::notesInRegion (notes, regionSec, (double) r1 / sr);
+        }
+        const double bpm = (hasTempo && mutant != 1) ? grid.bpm : MidiExport::kDefaultBpm;
+        // The downbeat in the file's time: through the warp markers (piecewise linear).
+        double down = grid.downbeatSec;
+        if (markers.size() >= 2)
+        {
+            const double f = down * sr;
+            for (size_t i = 0; i + 1 < markers.size(); ++i)
+            {
+                const double s0 = (double) markers[i].srcFrame, s1 = (double) markers[i + 1].srcFrame;
+                if (f >= s0 && f <= s1 && s1 > s0)
+                {
+                    const double d0 = (double) markers[i].dstFrame, d1 = (double) markers[i + 1].dstFrame;
+                    down = (d0 + (f - s0) / (s1 - s0) * (d1 - d0)) / sr;
+                    break;
+                }
+            }
+        }
+        // One tempo per warp segment (empty map = the single tempo above).
+        auto map = (hasTempo && mutant != 1) ? MidiExport::tempoMapFromWarp (markers, srcBpm, sr)
+                                             : MidiExport::TempoMap();
+        double bpmOut = bpm;
+        if (cut)
+        {
+            map = MidiExport::shiftTempoMap (map, regionSec);
+            if (map.size() == 1) // the region sits in one segment: that is its tempo
+            {
+                bpmOut = map[0].bpm;
+                map.clear();
+            }
+            down -= regionSec;
+            const double barSec = 60.0 / (map.empty() ? bpmOut : map[0].bpm) * MidiExport::quartersPerBar (beatsPerBar, sigDen);
+            if (barSec > 0.0 && std::isfinite (barSec))
+                while (down < 0.0)
+                    down += barSec;
+        }
+        const auto& dir = destDir;
+    dir.createDirectory();
+        const auto name = src.getFileNameWithoutExtension();
+        const double dur = (double) (cut ? r1 - r0 : len) / sr;
+        if (hasTempo)
+        {
+            tempoOut = dir.getChildFile (name + "_tempo.mid");
+            if (! MidiExport::writeFile (MidiExport::buildTempoFile (bpmOut, down, beatsPerBar, dur, sigDen, std::nullopt, map,
+                                                                 MidiExport::exportOriginTicks (hits, bpmOut, beatsPerBar, sigDen, map, down)), tempoOut))
+            {
+                err = "could not write " + tempoOut.getFullPathName();
+                tempoOut = juce::File();
+            }
+        }
+        hitsOut = dir.getChildFile (name + "_hits.mid");
+        if (! MidiExport::writeFile (MidiExport::buildHitsFile (hits, bpmOut, beatsPerBar, sigDen, std::nullopt, map,
+                                                                 in.quantDiv, in.quantStrength, down), hitsOut))
+        {
+            err = "could not write " + hitsOut.getFullPathName();
+            hitsOut = juce::File();
+        }
+        // Tonal takes also get a pitched note track (the hits track is always written).
+        if (MidiExport::isTonal (pitch) && ! notes.empty())
+        {
+            r.notes = dir.getChildFile (name + "_notes.mid");
+            if (! MidiExport::writeFile (MidiExport::buildNotesFile (notes, name + " notes", bpmOut, beatsPerBar, sigDen, std::nullopt, map), r.notes))
+            {
+                err = "could not write " + r.notes.getFullPathName();
+                r.notes = juce::File();
+            }
+        }
+    }
+    return r;
+}
+
+juce::StringArray buildMidiFilesForDrag (const MidiBuildInputs& in, const juce::File& destDir)
+{
+    const auto r = buildMidiFiles (in, destDir);
+    juce::StringArray out;
+    if (r.err.isNotEmpty())
+        return out;
+    for (const auto& f : { r.hits, r.notes, r.tempo })
+        if (f != juce::File() && f.existsAsFile())
+            out.add (f.getFullPathName());
+    return out;
+}
+
+juce::File midiDragTempRoot()
+{
+    return juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("HOTSTEP_LINK_midi");
+}
+
+int clearMidiDragTempRoot (const juce::File& root, juce::RelativeTime minAge, juce::Time now)
+{
+    if (now == juce::Time())
+        now = juce::Time::getCurrentTime();
+    if (root.getFileName() != "HOTSTEP_LINK_midi" || ! root.isDirectory())
+        return -1;
+#if defined (HSLINK_TEETH_MIDI_CLEAN_PARENT)
+    const auto target = root.getParentDirectory();
+#else
+    const auto& target = root;
+#endif
+    int left = 0;
+    for (const auto& c : target.findChildFiles (juce::File::findFilesAndDirectories, false, "*"))
+    {
+#if ! defined (HSLINK_TEETH_MIDI_CLEAN_FRESH)
+        // another LINK window may be writing this one right now: only clear children over minAge old
+        if (now - c.getLastModificationTime() < minAge)
+            continue;
+#endif
+        if (! (c.isDirectory() ? c.deleteRecursively (false) : c.deleteFile()))
+            ++left;
+    }
+    return left;
+}
+
+juce::File midiDragTempDir()
+{
+    auto d = midiDragTempRoot()
+                 .getNonexistentChildFile ("drag_" + juce::String (juce::Time::currentTimeMillis()), {}, false);
+    d.createDirectory();
+    return d;
+}
+
+bool HotStepLinkEditor::midiInputsForSelection (MidiBuildInputs& in)
+{
+    const auto sel = proc.audition.getSelected();
+    if (sel == juce::File())
+        return false;
+    in.quantDiv = quantizeBox.getSelectedId() == 2 ? 16 : quantizeBox.getSelectedId() == 3 ? 8 : 0;
+    in.quantStrength = quantStrengthSlider.getValue() / 100.0;
+    // The file Export WAV reads (a warped copy while a warp is in effect), and the grid
+    // of that file: the take's measured tempo, or with a warp the tempo the warp tags
+    // its result at and the downbeat moved through the markers.
+    juce::File src;
+    TakeEditorMath::Grid grid;
+    std::vector<WarpMarkers::Marker> markers;
+    double srcBpm = 0.0; // the unwarped take's tempo, for the per-segment tempo map
+    juce::int64 regionStart = -1, regionEnd = -1;
+    for (const auto& c : buildTakeModel().cells)
+        if (c.selected)
+        {
+            const auto base = c.saved ? TakeGrid::actionFileOf (c, EditorFs::tagExport) : c.file;
+            src = warpedFileFor (c.temp, base);
+            grid = takeEditorGridOf (c);
+            // The loop, else the crop, in frames of the take (the source of any warp).
+            for (const auto& e : proc.getTakes()) // a copy, no disk IO
+                if (e.temp == c.temp)
+                {
+                    const auto ed = e.edit.sanitized();
+                    if (ed.hasLoop())
+                    {
+                        regionStart = ed.loopStart;
+                        regionEnd = ed.loopEnd;
+                    }
+                    else if (ed.hasCrop())
+                    {
+                        regionStart = ed.cropStart;
+                        regionEnd = ed.cropEnd;
+                    }
+                }
+            if (src != base)
+            {
+                markers = takeEditor.effectiveWarp();
+                grid.bpm = takeEditor.warpResultBpm();
+                // The source tempo the warp's result tempo was taken from, so the
+                // per-segment map averages to exactly that result tempo.
+                if (markers.size() >= 2)
+                {
+                    const double s = (double) (markers.back().srcFrame - markers.front().srcFrame);
+                    const double d = (double) (markers.back().dstFrame - markers.front().dstFrame);
+                    srcBpm = s > 0.0 && d > 0.0 ? grid.bpm * d / s : 0.0;
+                }
+                // The region into the warped file's frames (onsets are read there).
+                if (regionStart >= 0)
+                    regionStart = (juce::int64) WarpMarkers::mapFrame (markers, regionStart, true);
+                if (regionEnd >= 0)
+                    regionEnd = (juce::int64) WarpMarkers::mapFrame (markers, regionEnd, true);
+            }
+            break;
+        }
+    if (src == juce::File())
+        src = sel;
+    const bool hasTempo = grid.bpm > 0.0 && std::isfinite (grid.bpm) && (grid.measured || grid.fallback);
+    const int beatsPerBar = juce::jmax (1, proc.hostSync.timeSigNum.load (std::memory_order_relaxed));
+    const int sigDen = MidiExport::validDen (proc.hostSync.timeSigDen.load (std::memory_order_relaxed));
+    in.src = src;
+    in.grid = grid;
+    in.markers = markers;
+    in.srcBpm = srcBpm;
+    in.hasTempo = hasTempo;
+    in.beatsPerBar = beatsPerBar;
+    in.sigDen = sigDen;
+    in.regionStart = regionStart;
+    in.regionEnd = regionEnd;
+    return true;
+}
+
+void HotStepLinkEditor::exportMidi()
+{
+    const auto sel = proc.audition.getSelected();
+    if (sel == juce::File() || midiBusy)
+        return;
+    MidiBuildInputs in;
+    if (! midiInputsForSelection (in))
+        return;
+    in.mutant = midiMutantForTest;
+    const bool hasTempo = in.hasTempo;
+    midiBusy = true;
+    exportMidiButton.setEnabled (false);
+    jobLabel.setText ("Exporting MIDI...", juce::dontSendNotification);
+    juce::Component::SafePointer<HotStepLinkEditor> safe (this);
+    const bool sync = midiSyncForTest;
+    auto work = [safe, sel, in, hasTempo, sync]
+    {
+        const auto r = buildMidiFiles (in, in.src.getParentDirectory());
+        const auto tempoOut = r.tempo, hitsOut = r.hits, notesOut = r.notes;
+        const auto err = r.err;
+        auto done = [safe, sel, tempoOut, hitsOut, notesOut, err, hasTempo]
+        {
+            if (safe == nullptr)
+                return;
+            auto& ed = *safe;
+            ed.midiBusy = false;
+            ed.lastMidiSelection = sel;
+            ed.lastMidiTempo = tempoOut;
+            ed.lastMidiHits = hitsOut;
+            ed.lastMidiNotes = notesOut;
+            if (err.isNotEmpty())
+            {
+                ed.jobLabel.setText ("MIDI export failed", juce::dontSendNotification);
+                ed.collectionPanel.showNote ("MIDI export failed: " + err, true, 8000);
+                return;
+            }
+            juce::String note ("Exported MIDI to " + hitsOut.getParentDirectory().getFullPathName() + ": "
+                               + hitsOut.getFileName());
+            if (notesOut != juce::File())
+                note << ", " << notesOut.getFileName();
+            if (tempoOut != juce::File())
+                note << ", " << tempoOut.getFileName();
+            else if (! hasTempo)
+                note << " (no tempo map: the take has no tempo; hits at 120 BPM)";
+            ed.jobLabel.setText ("Exported " + hitsOut.getFileName(), juce::dontSendNotification);
+            ed.collectionPanel.showNote (note, false, 8000);
+            ed.showExportResult (hitsOut);
+        };
+        if (sync)
+            done();
+        else
+            juce::MessageManager::callAsync (done);
+    };
+    if (sync)
+        work();
+    else
+        juce::Thread::launch (work);
+}
+
+bool HotStepLinkEditor::buildMidiForDrag()
+{
+    const auto sel = proc.audition.getSelected();
+    if (sel == juce::File() || midiBusy)
+        return false;
+    MidiBuildInputs in;
+    if (! midiInputsForSelection (in))
+        return false;
+    midiBusy = true;
+    exportMidiButton.setEnabled (false);
+    jobLabel.setText ("Building MIDI for drag...", juce::dontSendNotification);
+    juce::Component::SafePointer<HotStepLinkEditor> safe (this);
+    juce::Thread::launch ([safe, sel, in]
+    {
+        const auto r = buildMidiFiles (in, midiDragTempDir());
+        juce::MessageManager::callAsync ([safe, sel, r]
+        {
+            if (safe == nullptr)
+                return;
+            auto& ed = *safe;
+            ed.midiBusy = false;
+            juce::StringArray files;
+            if (r.err.isEmpty())
+            {
+                ed.lastMidiSelection = sel;
+                ed.lastMidiTempo = r.tempo;
+                ed.lastMidiHits = r.hits;
+                files = ed.midiFilesForSelection();
+                ed.jobLabel.setText ("MIDI ready to drag", juce::dontSendNotification);
+            }
+            else
+            {
+                ed.jobLabel.setText ("MIDI build failed", juce::dontSendNotification);
+                ed.collectionPanel.showNote ("MIDI build failed: " + r.err, true, 8000);
+            }
+            ed.midiDrag.buildFinished (files);
+        });
+    });
+    return true;
+}
+
+void MidiDragChip::paint (juce::Graphics& g)
+{
+    const auto r = getLocalBounds().toFloat().reduced (0.5f);
+    const auto c = isEnabled() ? kAccent : kDim.withAlpha (0.5f);
+    g.setColour (c.withAlpha (0.15f));
+    g.fillRoundedRectangle (r, 3.0f);
+    g.setColour (c);
+    g.drawRoundedRectangle (r, 3.0f, 1.0f);
+    g.setFont (juce::FontOptions (9.5f, juce::Font::bold));
+    g.drawText (building ? "..." : "MIDI", getLocalBounds(), juce::Justification::centred);
+}
+
+void MidiDragChip::mouseDrag (const juce::MouseEvent& e)
+{
+    if (dragStarted || ! isEnabled() || e.getDistanceFromDragStart() < 6 || filesFor == nullptr)
+        return;
+    if (building)
+        return;
+    const auto files = filesFor();
+    if (files.isEmpty())
+    {
+        // Not exported yet: build to a temp folder off the message thread, drag when ready.
+        if (requestBuild != nullptr && requestBuild())
+        {
+            dragStarted = true;
+            building = true;
+            repaint();
+        }
+        return;
+    }
+    dragStarted = true;
+    juce::DragAndDropContainer::performExternalDragDropOfFiles (files, false, this);
+}
+
+void MidiDragChip::buildFinished (const juce::StringArray& files)
+{
+    building = false;
+    repaint();
+    // Only start the OS drag while the button is still held; otherwise the files stay
+    // ready and the next drag starts at once.
+    if (files.isEmpty() || ! juce::ModifierKeys::getCurrentModifiersRealtime().isAnyMouseButtonDown())
+        return;
+    dragStarted = true;
+    juce::DragAndDropContainer::performExternalDragDropOfFiles (files, false, this);
 }
 
 void HotStepLinkEditor::applyModeGating (const DawStatus& st)
@@ -1905,7 +2475,7 @@ void HotStepLinkEditor::paint (juce::Graphics& g)
                   queueList.getNumCards());
     paintSection (g, queuePlate.reduced (inset, 0).withY (takeList.getY() - 22).withHeight (20).withTrimmedRight (100),
                   "Takes", takeList.getNumCells());
-    paintSection (g, genPlate.reduced (inset, 0).withY (previewCard.getY() - 22).withHeight (20), "Preview", -1);
+    paintSection (g, previewHeaderArea(), "Preview", -1);
 
     // SOURCE panel (Mockup A, left column) and the GENERATE knob row card
     if (! sourcePanel.isEmpty())
@@ -2137,6 +2707,14 @@ void HotStepLinkEditor::refreshPreview()
         repaint (previewCard);
 }
 
+juce::Rectangle<int> HotStepLinkEditor::previewHeaderArea() const
+{
+    // No card at small heights: then there is no room for the header either.
+    if (previewCard.isEmpty())
+        return {};
+    return genPlate.reduced (12, 0).withY (previewCard.getY() - 22).withHeight (20);
+}
+
 void HotStepLinkEditor::resized()
 {
     auto r = getLocalBounds();
@@ -2201,8 +2779,11 @@ void HotStepLinkEditor::resized()
     // Left plate: setup
     {
         auto a = setupPlate.reduced (pad).withTrimmedTop (22);
-        // SOURCE panel (Mockup A): waveform card, then ARM (plugin) / Drop WAV (standalone)
-        sourcePanel = a.removeFromTop (104);
+        // SOURCE panel (Mockup A): waveform card, then ARM (plugin) / Drop WAV (standalone).
+        // The waveform gives way on short windows so the rows under it stay whole;
+        // kBelowSource is everything removed from a below this line.
+        const int kBelowSource = 6 + 28 + 20 + 24 + 46 + 6 + 24 + 96 + 6 + 24 + 50 + 8 + 28;
+        sourcePanel = a.removeFromTop (juce::jlimit (60, 104, a.getHeight() - kBelowSource));
         sourceWave.setBounds (sourcePanel.reduced (6));
         a.removeFromTop (6);
         {
@@ -2335,12 +2916,27 @@ void HotStepLinkEditor::resized()
             deleteNotice.setBounds (n);
         }
         // PREVIEW (audition + export) under GENERATE, freed by moving TAKES right.
+        if (exportPathLabel.isVisible())
+        {
+            auto row = a.removeFromBottom (22);
+            showExportButton.setBounds (row.removeFromRight (104));
+            row.removeFromRight (gap);
+            exportPathLabel.setBounds (row);
+            a.removeFromBottom (4);
+        }
         auto exp = a.removeFromBottom (26);
         exportWavButton.setBounds (exp.removeFromLeft ((exp.getWidth() - gap) / 2));
         exp.removeFromLeft (gap);
+        midiDrag.setBounds (exp.removeFromRight (40));
+        exp.removeFromRight (gap);
+        quantStrengthSlider.setBounds (exp.removeFromRight (juce::jmin (60, exp.getWidth() / 4)));
+        exp.removeFromRight (gap);
+        quantizeBox.setBounds (exp.removeFromRight (juce::jmin (72, exp.getWidth() / 3)));
+        exp.removeFromRight (gap);
         exportMidiButton.setBounds (exp);
         a.removeFromBottom (6);
-        auto tr = a.removeFromBottom (26);
+        // All or nothing: no squeezed transport row while the window is too short for it.
+        auto tr = a.removeFromBottom (a.getHeight() >= 26 ? 26 : 0);
         playButton.setBounds (tr.removeFromLeft (70));
         tr.removeFromLeft (gap);
         gainLabel.setBounds (tr.removeFromRight (130));
@@ -2417,9 +3013,9 @@ void QueueListComponent::paint (juce::Graphics& g)
     if (cards.empty())
     {
         g.setColour (kDim);
-        g.setFont (juce::FontOptions (11.0f));
-        g.drawText ("No jobs yet. Generate while a job runs to queue more.",
-                    getLocalBounds().reduced (6, 0), juce::Justification::centredLeft, true);
+        g.setFont (juce::FontOptions (kEmptyHintFontH));
+        g.drawFittedText (kEmptyHint, getLocalBounds().reduced (kEmptyHintInsetX, 0),
+                          juce::Justification::centredLeft, kEmptyHintLines, 1.0f);
         return;
     }
     for (int i = 0; i < (int) cards.size(); ++i)
@@ -3274,4 +3870,78 @@ void SourceWaveView::paint (juce::Graphics& g)
             }
         }
     }
+}
+
+// Dev shot hooks (Standalone only; the plugin wrappers never parse a command line):
+//   --shot-load "<wav>"        drop that WAV in as Drop WAV does and list it as take 0
+//   --shot-open-editor         open Edit take on take --shot-take (default 0) once listed
+//   --shot-zoom "<s>,<e>"      zoom the take editor to s..e seconds (implies open)
+//   --shot-warp "<t>,<m>,<d>"  open take t, drag warp marker m to d seconds through the
+//                              mouse-drag path (Shift = free, so no snap; add --shot-snap to snap)
+void HotStepLinkEditor::parseShotArgs (const juce::String& cmd)
+{
+    const auto args = juce::StringArray::fromTokens (cmd, true);
+    auto valueOf = [&args] (const char* flag) {
+        const int i = args.indexOf (flag);
+        return i >= 0 && i + 1 < args.size() ? args[i + 1].unquoted() : juce::String();
+    };
+    shot.snap = args.contains ("--shot-snap");
+    if (const auto w = valueOf ("--shot-load"); w.isNotEmpty())
+    {
+        useSourceFile (juce::File (w));
+        if (proc.addShotTake (juce::File (w))) // listed as take 0, so --shot-take 0 works on a fresh launch
+            refreshTakes();
+    }
+    if (const auto t = valueOf ("--shot-take"); t.isNotEmpty())
+        shot.take = t.getIntValue();
+    if (const auto z = valueOf ("--shot-zoom"); z.isNotEmpty())
+    {
+        const auto p = juce::StringArray::fromTokens (z, ",", "");
+        if (p.size() == 2)
+        {
+            shot.zoomStart = p[0].getDoubleValue();
+            shot.zoomEnd = p[1].getDoubleValue();
+        }
+    }
+    if (const auto w = valueOf ("--shot-warp"); w.isNotEmpty())
+    {
+        const auto p = juce::StringArray::fromTokens (w, ",", "");
+        if (p.size() == 3)
+        {
+            shot.take = p[0].getIntValue();
+            shot.marker = p[1].getIntValue();
+            shot.dstSec = p[2].getDoubleValue();
+        }
+    }
+    if (args.contains ("--shot-open-editor") || shot.zoomEnd > shot.zoomStart || shot.marker >= 0)
+        shot.step = 1;
+}
+
+void HotStepLinkEditor::runShotStep()
+{
+    // Periodic ticks (about 6 a second): 1 = wait for the take, open; 2 = zoom; 3 = warp.
+    if (shot.step == 1)
+    {
+        const auto cells = takeModel.shown();
+        if (shot.take < 0 || (std::size_t) shot.take >= cells.size())
+            return;
+        // Hold the open while the take is still being measured (cap about 60 s of ticks),
+        // so the editor opens with its tempo, grid and warp markers like a normal take.
+        if (cells[(std::size_t) shot.take].tempoState == HslinkTakeEntry::tempoMeasuring && ++shot.waitTicks < 360)
+            return;
+        selectTake (cells[(std::size_t) shot.take].key);
+        if (openTakeEditor())
+            shot.step = 2;
+        return;
+    }
+    if (shot.step == 2)
+    {
+        if (shot.zoomEnd > shot.zoomStart)
+            takeEditor.shotZoom (shot.zoomStart, shot.zoomEnd);
+        shot.step = 3;
+        return;
+    }
+    if (shot.marker >= 0)
+        takeEditor.shotDragWarp (shot.marker, shot.dstSec, shot.snap);
+    shot.step = 0;
 }

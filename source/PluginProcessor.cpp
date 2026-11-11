@@ -817,6 +817,9 @@ bool HotStepLinkProcessor::requestTakeStretch (const juce::File& tempFile, doubl
                 if (gate->closed)
                     return; // closing: the file stays in the temp session folder, unlisted
                 TakeEntry e = src;
+#if ! defined (HSLINK_TEETH_COPY_EXTERNAL)
+                e.external = false; // the copy is the plugin's own file, not the user's
+#endif
                 e.temp = rq.dest;
                 e.name = rq.dest.getFileName();
                 e.stable = juce::File();
@@ -964,6 +967,37 @@ void HotStepLinkProcessor::setTakeNameForTest (const juce::File& tempFile, const
             t.name = name;
 }
 
+bool HotStepLinkProcessor::addShotTake (const juce::File& wav)
+{
+    if (! wav.existsAsFile())
+        return false;
+    TakeEntry e;
+    e.temp = wav;
+    e.stable = wav; // already a lasting file: the saver leaves it alone
+    e.name = wav.getFileName();
+    e.copyFailed = e.handingOver = false;
+    e.external = true; // the user's file: delete never moves it
+    e.createdMs = juce::Time::currentTimeMillis();
+    {
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        if (std::unique_ptr<juce::AudioFormatReader> r (fm.createReaderFor (wav)); r != nullptr && r->sampleRate > 0.0)
+            e.durationS = (double) r->lengthInSamples / r->sampleRate;
+    }
+    {
+        std::lock_guard<std::mutex> g (takesLock);
+        for (const auto& t : takes)
+            if (t.temp == wav)
+                return false;
+        takes.insert (takes.begin(), e);
+        stableByTemp[wav.getFullPathName()] = wav;
+    }
+    // Same tempo path as a generated take: measure, then resolve (file name first), so
+    // the grid and warp markers exist for the loaded file.
+    requestTakeMeasure (wav, 0.0);
+    return true;
+}
+
 juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, const TakeEdit::EditData& edit, const TakeEdit::EditOptions& options,
                                                     juce::String* whyNot)
 {
@@ -1057,6 +1091,9 @@ juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, 
                     return; // closing: a finished file stays in the temp session folder, unlisted
                 bool listed = false;
                 TakeEntry e = src;
+#if ! defined (HSLINK_TEETH_COPY_EXTERNAL)
+                e.external = false; // the copy is the plugin's own file, not the user's
+#endif
                 if (res.ok)
                 {
                     e.temp = rq.dest;
@@ -1154,8 +1191,9 @@ void HotStepLinkProcessor::storeTakeTempo (const juce::File& tempFile, bool meas
     {
         t.tempoState = measured ? TakeEntry::tempoMeasured : TakeEntry::tempoNotMeasured;
         t.tempo = measured ? r : TempoMeasure::Result();
-        // Resolved once, here: measured, else the file name, else the host. Kept with the
-        // take; it does not follow the host afterwards.
+        // Resolved once, here, in this order: the file name, Fit-to-bars (user-typed), the
+        // host, then the estimate kept only at 1:1, 2:1, 1:2, 3:2 or 2:3 of a known tempo,
+        // then the rephase of its downbeat. Kept with the take; it does not follow the host.
         t.resolvedTempo = measured ? TempoResolve::resolve (r, t.name.isEmpty() ? t.temp.getFileName() : t.name, hostBpm)
                                    : TempoResolve::Resolved();
     };
@@ -3001,7 +3039,7 @@ void HotStepLinkProcessor::finishTakeDelete (const PendingTakeDelete& p)
     // moved: done. kept: the file is where it was, the entry goes back. alreadyGone:
     // nothing to move, no error, and the entry is NOT put back (no take without a file).
     bool ok = true;
-    if (! kept)
+    if (! kept && ! p.entry.external) // an external (shot-loaded) file is never moved
     {
         auto result = MoveToDeleted::alreadyGone;
         if (auto* fn = testTrashFile.load())
@@ -5335,6 +5373,28 @@ void EditorAudition::publish (const Audio& a, juce::int64 start, juce::int64 end
     activeSerial.store (serial, std::memory_order_release);
 }
 
+juce::uint64 EditorAudition::packRegion (juce::int64 start, juce::int64 end, juce::int64 length)
+{
+    juce::uint64 lo = 0, hi = 0xFFFFFFFFull;
+    if (length > 0 && end > start)
+    {
+        const auto q = [length] (juce::int64 f)
+        {
+            const double x = juce::jlimit (0.0, 1.0, (double) f / (double) length);
+            return (juce::uint64) std::llround (x * 4294967295.0);
+        };
+        lo = q (start);
+        hi = juce::jmax (lo + 1, q (end));
+        if (hi > 0xFFFFFFFFull) { hi = 0xFFFFFFFFull; lo = hi - 1; }
+    }
+    return (hi << 32) | lo;
+}
+
+void EditorAudition::setRegion (juce::int64 start, juce::int64 end, juce::int64 length)
+{
+    regionReq.store (packRegion (start, end, length), std::memory_order_release);
+}
+
 void EditorAudition::setWarp (std::vector<WarpMarkers::Marker> markers)
 {
     std::lock_guard<std::mutex> g (ownLock);
@@ -5365,6 +5425,7 @@ void EditorAudition::play (const juce::File& take, juce::int64 start, juce::int6
     if (afterGenForTest)
         afterGenForTest();
     loopOn.store (loop, std::memory_order_relaxed);
+    setRegion (start, end, length);
     const double r = rate.load();
     Audio have;
     std::vector<WarpMarkers::Marker> warp;
@@ -5611,6 +5672,10 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
         pos = cur->start;
         gain = 0.0f;
         tailLoop = false;
+        curStart = cur->start;
+        curEnd = cur->end;
+        seenRegion = kNoRegion; // the region is read below: a newer one wins
+        jumpLeft = 0;
         // Play: the clip is not heard before the main output is fully down, so the
         // two never add up. Already down (a Play over a playing clip): no wait.
         hold = duckPos < duckN;
@@ -5622,7 +5687,41 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
     const auto& src = *cur->audio;
     const int sc = src.getNumChannels();
     const int nc = buf.getNumChannels();
-    const int start = cur->start, end = cur->end;
+#if ! defined (HSLINK_TEETH_NO_REGION_MOVE)
+    {
+        // A region moved by setRegion(): taken at once. A fresh clip starts at it.
+        const auto rq = regionReq.load (std::memory_order_acquire);
+        if (rq != seenRegion)
+        {
+            const bool fresh = seenRegion == kNoRegion;
+            seenRegion = rq;
+            const int na = src.getNumSamples();
+            const auto fr = [na] (juce::uint64 v) { return (int) std::llround ((double) v / 4294967295.0 * (double) na); };
+            const int ns = juce::jlimit (0, juce::jmax (0, na - 1), fr (rq & 0xFFFFFFFFull));
+            const int ne = juce::jlimit (ns + 1, juce::jmax (ns + 1, na), fr (rq >> 32));
+            if (fresh)
+            {
+                curStart = ns;
+                curEnd = ne;
+                pos = ns;
+            }
+            else if (ns != curStart || ne != curEnd)
+            {
+                curStart = ns;
+                curEnd = ne;
+                const int nxf = juce::jmin (cur->fade, (ne - ns) / 2);
+                tailLoop = false;
+                if (pos < ns || pos > ne - nxf)
+                {
+                    jumpFrom = pos; // the old read position fades out from here
+                    jumpLeft = cur->fade;
+                    pos = ns;
+                }
+            }
+        }
+    }
+#endif
+    const int start = curStart, end = curEnd;
     const int xf = juce::jmin (cur->fade, (end - start) / 2);
     const bool preRoll = start >= xf; // audio before the region to fade the wrap into
     const bool loop = loopOn.load (std::memory_order_relaxed);
@@ -5676,6 +5775,23 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
                 l *= 1.0f - t; // the end of the clip, or a wrap with nothing before the start
                 r *= 1.0f - t;
             }
+        }
+        if (jumpLeft > 0)
+        {
+            // Region moved: the old read position fades out under the new one.
+            const float t = (float) jumpLeft / (float) cur->fade;
+            if (jumpFrom < src.getNumSamples())
+            {
+                l = l * (1.0f - t) + s0[jumpFrom] * t;
+                r = r * (1.0f - t) + s1[jumpFrom] * t;
+                ++jumpFrom;
+            }
+            else
+            {
+                l *= 1.0f - t;
+                r *= 1.0f - t;
+            }
+            --jumpLeft;
         }
         if (nc == 1)
             out[0][i] += 0.5f * (l + r) * g;

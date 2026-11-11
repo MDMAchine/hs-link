@@ -105,27 +105,109 @@ bool TempoResolve::measuredCertain (const TempoMeasure::Result& m)
     return m.valid && m.level >= TempoMeasure::Level::medium && TakeEdit::gridUsable (m.bpm, m.downbeatSec);
 }
 
+double TempoResolve::relationTo (double estimate, double known)
+{
+    if (! (estimate > 0.0) || ! (known > 0.0) || ! std::isfinite (estimate) || ! std::isfinite (known))
+        return 0.0;
+    // 1:1, 2:1, 1:2, 3:2 and 2:3: the estimate locked onto a related pulse of the known tempo.
+    for (const double k : { 1.0, 2.0, 0.5, 1.5, 2.0 / 3.0 })
+        if (std::abs (estimate / (known * k) - 1.0) <= kRelationTol)
+            return k;
+    return 0.0;
+}
+
 TempoResolve::Resolved TempoResolve::resolve (const TempoMeasure::Result& measured, const juce::String& fileName, double hostBpm)
 {
     Resolved r;
-    if (measuredCertain (measured))
+    // A stated tempo (file name, then host) wins; the estimate is only a fallback. When
+    // the estimate is the known tempo or a related pulse of it (1:1, 2:1, 1:2, 3:2, 2:3)
+    // its downbeat is still a beat of the known grid and is kept; else the file start.
+    const double named = parseTempoFromFileName (fileName);
+    const double known = named > 0.0 ? named : hostBpmUsable (hostBpm) ? hostBpm : 0.0;
+    if (known > 0.0)
+    {
+        r.bpm = known;
+        r.source = named > 0.0 ? Source::fileName : Source::host;
+        if (measuredCertain (measured) && relationTo (measured.bpm, known) > 0.0)
+        {
+            r.downbeatSec = measured.downbeatSec;
+            r = rephase (r, measured, measured.topOnsets);
+        }
+    }
+    else if (measuredCertain (measured))
     {
         r.bpm = measured.bpm;
         r.downbeatSec = measured.downbeatSec;
         r.source = Source::measured;
     }
-    else if (const double named = parseTempoFromFileName (fileName); named > 0.0)
-    {
-        r.bpm = named;
-        r.source = Source::fileName;
-    }
-    else if (hostBpmUsable (hostBpm))
-    {
-        r.bpm = hostBpm;
-        r.source = Source::host;
-    }
     r.snapEnabled = r.source != Source::none;
     return r;
+}
+
+TempoResolve::Resolved TempoResolve::applyFitBars (const Resolved& resolved, double userFitBpm, const TempoMeasure::Result* measured)
+{
+    if (resolved.source == Source::fileName || ! hostBpmUsable (userFitBpm))
+        return resolved;
+    Resolved r;
+    r.bpm = userFitBpm;
+    r.downbeatSec = relationTo (resolved.bpm, userFitBpm) > 0.0 ? resolved.downbeatSec : 0.0;
+    r.source = Source::fitBars;
+    r.snapEnabled = true;
+    // Beat 1 of the new bar from the estimate's own beats, when they are a related pulse.
+    if (measured != nullptr && measuredCertain (*measured) && relationTo (measured->bpm, userFitBpm) > 0.0)
+    {
+        r.downbeatSec = measured->downbeatSec;
+        r = rephase (r, *measured, measured->topOnsets);
+    }
+    return r;
+}
+
+TempoResolve::Resolved TempoResolve::rephase (const Resolved& r, const TempoMeasure::Result& measured, const std::vector<TempoMeasure::Onset>& onsets)
+{
+#if 1 // W2 open: rephase is off (returns its input) until it finds the real take's downbeat; see docs/KNOWN_ISSUES.md
+    if (true)
+        return r;
+#endif
+    const double rel = relationTo (measured.bpm, r.bpm);
+    if (onsets.empty() || rel == 0.0 || rel == 1.0 || ! (r.bpm > 0.0))
+        return r;
+    // Candidates sit on the resolved grid: the estimate's downbeat, then one resolved
+    // beat (60 / r.bpm) further for each j. Stepping by the estimate's beat lands
+    // between resolved beats at 3:2 and only ever offers offbeats.
+#if defined (HSLINK_TEETH_REPHASE_EST) // teeth only: the old step by the estimate's beat, 3 candidates
+    const double period = 60.0 / measured.bpm, bar = 4.0 * 60.0 / r.bpm;
+    const int nCand = 3;
+#else
+    const double period = 60.0 / r.bpm, bar = 4.0 * period;
+    const int nCand = 4;
+#endif
+    const double base = measured.downbeatSec;
+    int bestK = 0;
+    double bestScore = -1.0, bestSec = base;
+    for (int k = 0; k < nCand; ++k)
+    {
+        const double d = base + period * (double) k;
+        double score = 0.0;
+        for (const auto& on : onsets)
+        {
+            double pos = std::fmod (on.sec - d, bar);
+            if (pos < 0.0)
+                pos += bar;
+            if (std::min (pos, bar - pos) <= kRephaseTolSec)
+                score += on.strength;
+        }
+        if (score > bestScore) // strictly more: a tie keeps the lower k
+        {
+            bestScore = score;
+            bestK = k;
+            bestSec = d;
+        }
+    }
+    Resolved out = r;
+    // k = 0 is the estimate's downbeat as it was; another k is folded to the first bar
+    // start at or after 0, as the measured downbeat is.
+    out.downbeatSec = bestK == 0 ? base : bestSec - bar * std::floor (bestSec / bar);
+    return out;
 }
 
 const char* TempoResolve::sourceName (Source source)
@@ -135,6 +217,7 @@ const char* TempoResolve::sourceName (Source source)
         case Source::measured: return "measured";
         case Source::fileName: return "file_name";
         case Source::host:     return "host";
+        case Source::fitBars:  return "fit_bars";
         case Source::none:     break;
     }
     return "none";
@@ -142,16 +225,14 @@ const char* TempoResolve::sourceName (Source source)
 
 TempoResolve::Source TempoResolve::sourceFromName (const juce::String& name)
 {
-    return name == "measured" ? Source::measured : name == "file_name" ? Source::fileName : name == "host" ? Source::host : Source::none;
+    return name == "measured" ? Source::measured : name == "file_name" ? Source::fileName : name == "host" ? Source::host : name == "fit_bars" ? Source::fitBars : Source::none;
 }
 
 juce::String TempoResolve::fallbackText (const Resolved& r)
 {
     if (! r.isFallback() || ! (r.bpm > 0.0))
         return {};
-    const double cents = std::round (r.bpm * 100.0) / 100.0;
-    const auto number = cents == std::floor (cents) ? juce::String ((juce::int64) cents) : juce::String (cents, 2);
-    return number + " bpm (" + (r.source == Source::fileName ? "file name" : "host") + ")";
+    return juce::String (r.bpm, 2) + " bpm (" + (r.source == Source::fileName ? "file" : r.source == Source::fitBars ? "bars" : "host") + ")";
 }
 
 namespace
@@ -238,6 +319,16 @@ juce::String CollectionStore::toJson (const CollectionItem& item)
         o->setProperty ("drift_end_ms", item.tempo.driftEndMs);
         o->setProperty ("beats", item.tempo.beats);
         o->setProperty ("hint_octave", item.tempo.hintOctave);
+        if (! item.tempo.topOnsets.empty())
+        {
+            juce::Array<juce::var> on;
+            for (const auto& x : item.tempo.topOnsets)
+            {
+                on.add (x.sec);
+                on.add (x.strength);
+            }
+            o->setProperty ("top_onsets", on);
+        }
         // Where the tempo of the grid comes from. A file name or host tempo is kept
         // as its own number; measured_bpm stays the measurement.
         o->setProperty ("tempo_source", juce::String (TempoResolve::sourceName (item.resolvedTempo.source)));
@@ -304,6 +395,14 @@ bool CollectionStore::fromJson (const juce::String& json, CollectionItem& item)
         item.tempo.driftEndMs = (double) v.getProperty ("drift_end_ms", 0.0);
         item.tempo.beats = (int) v.getProperty ("beats", 0);
         item.tempo.hintOctave = (int) v.getProperty ("hint_octave", 0); // no key in older sidecars: 0
+        // The strongest onsets as t0, w0, t1, w1 ... No key (older sidecars): empty.
+        if (const auto* arr = v.getProperty ("top_onsets", {}).getArray())
+            for (int i = 0; i + 1 < arr->size() && (std::size_t) (i / 2) < TempoMeasure::kTopOnsets; i += 2)
+            {
+                const double t = (double) (*arr)[i], w = (double) (*arr)[i + 1];
+                if (std::isfinite (t) && std::isfinite (w) && t >= 0.0 && w > 0.0)
+                    item.tempo.topOnsets.push_back ({ t, w });
+            }
         // A tempo or a downbeat that no measurement writes (not finite, or a downbeat
         // further out than any take is long) is not a grid: no number, downbeat 0.
         if (! std::isfinite (item.tempo.bpm) || ! std::isfinite (item.tempo.downbeatSec)
@@ -336,6 +435,10 @@ bool CollectionStore::fromJson (const juce::String& json, CollectionItem& item)
             source = TempoResolve::Source::none;
         item.resolvedTempo.source = source;
         item.resolvedTempo.snapEnabled = source != TempoResolve::Source::none;
+        // A sidecar written before the file name won over the estimate: resolve again
+        // (no host here; a host fallback stays as stored).
+        if (source == TempoResolve::Source::measured && TempoResolve::parseTempoFromFileName (item.name) > 0.0)
+            item.resolvedTempo = TempoResolve::resolve (item.tempo, item.name, 0.0);
     }
     // Missing, not a number, negative or absurdly large: not set. The pairs are then
     // checked as a whole (EditData::sanitized); the file length is checked at render.

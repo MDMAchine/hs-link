@@ -7,10 +7,12 @@
 // HOT-STEP LINK -- console tests (host sync R1b, capture R2a, source capture + region, DAW worker R3, audition R5b, stable takes R6)
 // Copyright (C) 2026 A&E Concepts. SPDX-License-Identifier: AGPL-3.0-or-later
 #include "PluginProcessor.h"
+#include "TakeStretch.h"
 #include "FactoryPresets.h"
 #include "PluginEditor.h" // round 6 (N): the editor is constructed, never shown
 #include "ExclusiveFile.h"
 #include "DeletedFolder.h"
+#include "MidiExport.h"
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -11750,6 +11752,108 @@ static void testR4Reach()
     w.stop();
 }
 
+// The main editor at the sizes the window really opens at: the last left-column button is
+// whole and inside its plate, the PREVIEW header (when there is one) clears GENERATE and the
+// Export row, and the empty queue hint fits the lines paint() wraps it to.
+static void testMainLayoutFit()
+{
+    std::printf ("Main editor layout fit%c", 10);
+    HotStepLinkProcessor p;
+    HotStepLinkEditor ed (p);
+    juce::GlyphArrangement ga;
+    ga.addLineOfText (juce::Font (juce::FontOptions (QueueListComponent::kEmptyHintFontH)), QueueListComponent::kEmptyHint, 0.0f, 0.0f);
+    const float hintW = ga.getBoundingBox (0, -1, true).getWidth();
+    const struct { int w, h; } sizes[] = { { 980, 640 }, { 1080, 760 }, { 1400, 640 }, { 1400, 900 } };
+    for (const auto& z : sizes)
+    {
+        ed.setSize (z.w, z.h);
+        const auto tag = juce::String (z.w) + "x" + juce::String (z.h) + ": ";
+        const auto re = ed.reanalyzeBoundsForTest(), plate = ed.setupPlateForTest();
+        std::printf ("  %d x %d re-analyze y=%d h=%d (want 28) bottom=%d, plate bottom=%d%c", z.w, z.h, re.getY(), re.getHeight(), re.getBottom(), plate.getBottom(), 10);
+        check (re.getHeight() == 28 && re.getBottom() <= plate.getBottom() - 8, (tag + "RE-ANALYZE is whole and inside its plate").toRawUTF8());
+        const auto hd = ed.previewHeaderForTest(), gen = ed.generateBoundsForTest(), ex = ed.exportWavBoundsForTest();
+        std::printf ("  preview header y=%d h=%d; generate y=%d..%d; export y=%d..%d%c", hd.getY(), hd.getHeight(), gen.getY(), gen.getBottom(), ex.getY(), ex.getBottom(), 10);
+        check (hd.isEmpty() || (! hd.intersects (gen) && ! hd.intersects (ex)), (tag + "PREVIEW header clear of GENERATE and Export").toRawUTF8());
+        const auto q = ed.queueListBoundsForTest();
+        const int lineW = q.getWidth() - 2 * QueueListComponent::kEmptyHintInsetX;
+        const int room = lineW * QueueListComponent::kEmptyHintLines;
+        // 0.85: wrapping at word ends leaves part of a line unused.
+        std::printf ("  queue hint width %.0f px, %d line(s) of %d px, queue list h=%d%c", hintW, QueueListComponent::kEmptyHintLines, lineW, q.getHeight(), 10);
+        check (hintW <= (float) room * 0.85f && q.getHeight() >= QueueListComponent::kEmptyHintLines * 14, (tag + "empty queue hint fits").toRawUTF8());
+    }
+
+    // The Preview section at the smallest allowed window, the default and a large one: every
+    // part is whole, inside the middle plate, and nothing in it overlaps.
+    const auto* cs = ed.getConstrainer();
+    const int minW = cs->getMinimumWidth(), minH = cs->getMinimumHeight();
+    std::printf ("  minimum window %d x %d (want 1080 x 760)%c", minW, minH, 10);
+    check (minW == 1080 && minH == 760, "minimum window is 1080 x 760");
+    const auto previewFits = [&ed] (int w, int h, const juce::String& what)
+    {
+        ed.setSize (w, h);
+        const auto plate = ed.genPlateForTest(), gen = ed.generateBoundsForTest();
+        const auto card = ed.previewCardForTest(), wave = ed.previewWaveForTest(), head = ed.previewHeaderForTest();
+        const struct { const char* name; juce::Rectangle<int> r; } parts[] = {
+            { "header", head }, { "card", card }, { "play", ed.playBoundsForTest() },
+            { "follow", ed.followHostBoundsForTest() }, { "level", ed.levelMatchBoundsForTest() }, { "gain", ed.gainLabelBoundsForTest() },
+            { "exportWav", ed.exportWavBoundsForTest() }, { "exportMidi", ed.exportMidiBoundsForTest() } };
+        bool inside = true, clear = ! wave.isEmpty() && card.contains (wave);
+        std::printf ("  %s %d x %d, middle plate bottom=%d, generate bottom=%d, wave h=%d%c", what.toRawUTF8(), ed.getWidth(), ed.getHeight(), plate.getBottom(), gen.getBottom(), wave.getHeight(), 10);
+        for (const auto& a : parts)
+        {
+            std::printf ("    %s x=%d y=%d w=%d h=%d bottom=%d%c", a.name, a.r.getX(), a.r.getY(), a.r.getWidth(), a.r.getHeight(), a.r.getBottom(), 10);
+            inside = inside && ! a.r.isEmpty() && plate.contains (a.r);
+            clear = clear && ! a.r.intersects (gen);
+            for (const auto& b : parts)
+                if (&a != &b && a.r.intersects (b.r))
+                    clear = false;
+        }
+        const auto tag = what + ": ";
+        check (inside, (tag + "Preview header, card and all controls are whole and inside the plate").toRawUTF8());
+        check (clear, (tag + "Preview parts overlap nothing, the waveform is inside the card").toRawUTF8());
+        check (card.getHeight() >= 60 && wave.getHeight() >= 10, (tag + "card at least 60 px, waveform at least 10 px").toRawUTF8());
+        check (ed.playBoundsForTest().getHeight() == 26 && ed.exportWavBoundsForTest().getHeight() == 26 && ed.followHostBoundsForTest().getWidth() >= 110
+                   && ed.levelMatchBoundsForTest().getWidth() >= 110, (tag + "transport and export rows at full height, toggles at least 110 px wide").toRawUTF8());
+    };
+    previewFits (minW, minH, "minimum");
+    // 760 is the smallest height, not just a safe one: a pixel less and the waveform is gone.
+    ed.setSize (minW, minH - 1);
+    std::printf ("  one pixel shorter: card h=%d, wave h=%d (want 59, 0)%c", ed.previewCardForTest().getHeight(), ed.previewWaveForTest().getHeight(), 10);
+    check (ed.previewCardForTest().getHeight() == minH - 701 && ed.previewWaveForTest().isEmpty(), "one pixel under the minimum height loses the waveform");
+    previewFits (1180, 760, "default");
+    previewFits (1400, 900, "large");
+
+    // An old session: the host offers the old size, the wrappers clamp it with this constrainer.
+    const struct { int w, h; } old[] = { { 980, 640 }, { 800, 500 }, { 1079, 900 }, { 1300, 700 } };
+    for (const auto& z : old)
+    {
+        ed.setSize (1180, 760);
+        ed.getConstrainer()->setBoundsForComponent (&ed, { 0, 0, z.w, z.h }, false, false, false, false);
+        const int wantW = juce::jmax (z.w, 1080), wantH = juce::jmax (z.h, 760);
+        std::printf ("  old size %d x %d reopens at %d x %d (want %d x %d)%c", z.w, z.h, ed.getWidth(), ed.getHeight(), wantW, wantH, 10);
+        check (ed.getWidth() == wantW && ed.getHeight() == wantH, "old window size is raised to the minimum");
+        previewFits (ed.getWidth(), ed.getHeight(), "reopened " + juce::String (z.w) + "x" + juce::String (z.h));
+    }
+
+    // The window size is not in the saved state: restoring one keeps the rest of it.
+    {
+        HotStepLinkProcessor saved;
+        saved.apvts.state.setProperty ("serverUrl", "http://127.0.0.1:18999", nullptr);
+        saved.apvts.getParameter ("levelMatch")->setValueNotifyingHost (1.0f);
+        juce::MemoryBlock blob;
+        saved.getStateInformation (blob);
+        HotStepLinkProcessor loaded;
+        loaded.setStateInformation (blob.getData(), (int) blob.getSize());
+        HotStepLinkEditor reopened (loaded);
+        const auto url = loaded.getSavedServerUrl();
+        const float lm = loaded.apvts.getRawParameterValue ("levelMatch")->load();
+        const bool sizeInState = blob.toString().contains ("editorWidth");
+        std::printf ("  restored url='%s' levelMatch=%.1f, new editor %d x %d (want 1180 x 760)%c", url.toRawUTF8(), lm, reopened.getWidth(), reopened.getHeight(), 10);
+        check (url == "http://127.0.0.1:18999" && lm > 0.5f && ! sizeInState, "restored state keeps server URL and Level match");
+        check (reopened.getWidth() == 1180 && reopened.getHeight() == 760, "restored state opens at the default size");
+    }
+}
+
 static bool lvOnlyLa = false; // "liveness_la" mode: L-a only (flake reps)
 
 void testLiveness (const juce::File& tmpDir)
@@ -13635,6 +13739,69 @@ static float labelTextWidth (const juce::Label& l)
 }
 
 // Tempo fallback cascade (commit 558d310): measured, then the file name, then the host.
+// W2 downbeat rephase (TempoResolve::rephase). Synthetic 88 bpm clicks, beat 1 accented,
+// true downbeat 0.25 s. The estimate is forced to 176 (2:1) and 132 (3:2) with its
+// downbeat on a beat of the estimate that is not beat 1 of the 88 bar. The file name
+// (88bpm), and Fit to bars 88 on an unnamed take, must land within 5 ms of the true
+// downbeat. Teeth: build with HSLINK_TEETH=REPHASE (rephase returns its input).
+// Nothing is written to disk.
+[[maybe_unused]] static void testRephase()
+{
+    std::printf ("Rephase: a related estimate's downbeat moved to beat 1 of the known tempo%c", 10);
+    const double sr = 44100.0, bpm = 88.0, trueDb = 0.25, beat = 60.0 / bpm, bar = 4.0 * beat;
+    const int n = (int) (sr * 16.0);
+    std::vector<float> mono ((std::size_t) n, 0.0f);
+    for (int k = 0;; ++k)
+    {
+        const double t = trueDb + beat * (double) k;
+        const int s0 = (int) std::llround (t * sr);
+        if (s0 >= n)
+            break;
+        const float amp = (k % 4) == 0 ? 1.0f : 0.35f;
+        for (int i = 0; i < 600 && s0 + i < n; ++i)
+            mono[(std::size_t) (s0 + i)] += amp * (float) (std::exp (-(double) i / 90.0) * std::sin (2.0 * 3.14159265358979 * 1500.0 * (double) i / sr));
+    }
+    const auto base = TempoMeasure::analyse (mono.data(), mono.size(), sr);
+    std::printf ("  analyse: bpm=%.3f level=%s downbeat=%.4f topOnsets=%d (want 88, about 0.25, 1..256)%c",
+                 base.bpm, TempoMeasure::levelName (base.level), base.downbeatSec, (int) base.topOnsets.size(), 10);
+    check (! base.topOnsets.empty() && base.topOnsets.size() <= TempoMeasure::kTopOnsets, "rephase setup: analyse fills topOnsets (1..256)");
+    auto errMs = [&] (double d)
+    {
+        double e = std::fmod (d - trueDb, bar);
+        if (e < 0.0)
+            e += bar;
+        return 1000.0 * std::min (e, bar - e);
+    };
+    for (const double est : { 176.0, 132.0 })
+    {
+        TempoMeasure::Result m = base;
+        m.valid = true;
+        m.level = TempoMeasure::Level::high;
+        m.bpm = est;
+        m.driftMs = 2.0;
+        const double p = 60.0 / est;
+        // Off beat 1 by one (2:1) or two (3:2) estimate beats, so k = 1 or 2 is the answer.
+        const int back = est > 150.0 ? 1 : 2;
+        m.downbeatSec = trueDb - p * (double) back;
+        while (m.downbeatSec < 0.0)
+            m.downbeatSec += bar;
+        const double before = errMs (m.downbeatSec);
+        const auto named = TempoResolve::resolve (m, "take_88bpm.wav", 0.0);
+        const auto fit = TempoResolve::applyFitBars (TempoResolve::resolve (m, "take_no_tempo.wav", 0.0), 88.0, &m);
+        const auto host = TempoResolve::resolve (m, "take_no_tempo.wav", 88.0);
+        std::printf ("  estimate %.0f, downbeat %.4f: before %.1f ms; file name %.1f ms, fit to bars %.1f ms, host %.1f ms (want each under 5)%c",
+                     est, m.downbeatSec, before, errMs (named.downbeatSec), errMs (fit.downbeatSec), errMs (host.downbeatSec), 10);
+        check (before > 100.0, "rephase setup: the forced downbeat is off beat 1");
+        check (errMs (named.downbeatSec) < 5.0 && errMs (fit.downbeatSec) < 5.0 && errMs (host.downbeatSec) < 5.0,
+               (juce::String ("rephase: estimate ") + juce::String (est, 0) + " gives beat 1 of 88 within 5 ms (file name, fit to bars, host)").toRawUTF8());
+        // No onsets (an older sidecar): unchanged.
+        TempoMeasure::Result old = m;
+        old.topOnsets.clear();
+        const auto oldR = TempoResolve::resolve (old, "take_88bpm.wav", 0.0);
+        guardCheck (oldR.downbeatSec == m.downbeatSec, "[guard] rephase: no onsets keeps the estimate's downbeat");
+    }
+}
+
 // C1 to C4 TempoResolve::resolve and the tag (TakeGrid::tempoTagOf, 3 arguments), C5 the
 // Collection sidecar through CollectionStore::add and list, C6 the file name parser as
 // a table, C7 a take registered under "loop_120bpm_x.wav" in the real editor. Files only
@@ -13683,17 +13850,33 @@ static void testTempoFallback (const juce::File& tmp)
                  (int) TempoResolve::measuredCertain (unsure), (int) TempoResolve::measuredCertain (certain), 10);
     guard (! TempoResolve::measuredCertain (unsure) && TempoResolve::measuredCertain (certain), "setup: the two measurements are uncertain and certain");
 
+    // C0. Fit to bars set by the user outranks the estimate (no tempo in the name): 88 "(bars)".
+    {
+        TempoMeasure::Result est = certain;
+        est.bpm = 130.1;
+        const auto r = TempoResolve::applyFitBars (TempoResolve::resolve (est, "take_no_tempo.wav", 0.0), 88.0);
+        const auto tag = TakeGrid::tempoTagOf (measuredState, est, r);
+        const auto named = TempoResolve::applyFitBars (TempoResolve::resolve (est, loopName, 0.0), 88.0);
+        const auto unset = TempoResolve::applyFitBars (TempoResolve::resolve (est, "take_no_tempo.wav", 0.0), 0.0);
+        std::printf ("  C0 estimate 130.1 + Fit to bars 88: bpm=%.4f source=%s tag='%s' (want 88.0000 fit_bars '88.00 bpm (bars)'); named=%.4f %s (want 120 file_name); unset=%.4f %s (want 130.1 measured)%c",
+                     r.bpm, sn (r.source), tag.text.toRawUTF8(), named.bpm, sn (named.source), unset.bpm, sn (unset.source), 10);
+        ck (r.bpm == 88.0 && r.source == Source::fitBars && tag.text == "88.00 bpm (bars)",
+            "C0: a user-set Fit to bars 88 beats the estimate 130.1, tag '88.00 bpm (bars)'");
+        guard (named.bpm == 120.0 && named.source == Source::fileName && unset.bpm == 130.1 && unset.source == Source::measured,
+               "C0: the file name still wins; an unset field changes nothing");
+    }
+
     // C1. Uncertain + a file name token.
     {
         const auto r = TempoResolve::resolve (unsure, loopName, 0.0);
         const auto text = TempoResolve::fallbackText (r);
         const auto tag = TakeGrid::tempoTagOf (measuredState, unsure, r);
-        std::printf ("  C1 unsure + '%s' + host 0: bpm=%.4f source=%s snap=%d fallback=%d downbeat=%.4f text='%s' tag='%s' colour=%d (want 120.0000 file_name 1 1 0.0000 '120 bpm (file name)' twice, colour 3)%c",
+        std::printf ("  C1 unsure + '%s' + host 0: bpm=%.4f source=%s snap=%d fallback=%d downbeat=%.4f text='%s' tag='%s' colour=%d (want 120.0000 file_name 1 1 0.0000 '120.00 bpm (file)' twice, colour 3)%c",
                      loopName.toRawUTF8(), r.bpm, sn (r.source), (int) r.snapEnabled, (int) r.isFallback(), r.downbeatSec, text.toRawUTF8(), tag.text.toRawUTF8(), tag.colour, 10);
         ck (r.bpm == 120.0 && r.source == Source::fileName && r.snapEnabled && r.isFallback() && r.downbeatSec == 0.0,
             "C1: an uncertain measurement and 'loop_120bpm_x.wav' give exactly 120 from the file name, snap on");
-        ck (text == "120 bpm (file name)" && tag.text == "120 bpm (file name)" && tag.colour == TakeGrid::TempoTag::amber,
-            "C1: the text and the cell tag read '120 bpm (file name)', amber");
+        ck (text == "120.00 bpm (file)" && tag.text == "120.00 bpm (file)" && tag.colour == TakeGrid::TempoTag::amber,
+            "C1: the text and the cell tag read '120.00 bpm (file)', amber");
         const auto both = TempoResolve::resolve (unsure, loopName, 98.0);
         std::printf ("  C1 the same with host 98: bpm=%.4f source=%s (want 120.0000 file_name: the name comes before the host)%c", both.bpm, sn (both.source), 10);
         ck (both.bpm == 120.0 && both.source == Source::fileName, "C1: with a host of 98 as well the file name still gives 120");
@@ -13704,11 +13887,11 @@ static void testTempoFallback (const juce::File& tmp)
         const auto r = TempoResolve::resolve (unsure, "loop_x.wav", 98.0);
         const auto text = TempoResolve::fallbackText (r);
         const auto tag = TakeGrid::tempoTagOf (measuredState, unsure, r);
-        std::printf ("  C2 unsure + 'loop_x.wav' + host 98: bpm=%.4f source=%s snap=%d fallback=%d downbeat=%.4f text='%s' tag='%s' colour=%d (want 98.0000 host 1 1 0.0000 '98 bpm (host)' twice, colour 3)%c",
+        std::printf ("  C2 unsure + 'loop_x.wav' + host 98: bpm=%.4f source=%s snap=%d fallback=%d downbeat=%.4f text='%s' tag='%s' colour=%d (want 98.0000 host 1 1 0.0000 '98.00 bpm (host)' twice, colour 3)%c",
                      r.bpm, sn (r.source), (int) r.snapEnabled, (int) r.isFallback(), r.downbeatSec, text.toRawUTF8(), tag.text.toRawUTF8(), tag.colour, 10);
         ck (r.bpm == 98.0 && r.source == Source::host && r.snapEnabled && r.isFallback() && r.downbeatSec == 0.0,
             "C2: an uncertain measurement, no token and a host of 98 give exactly 98 from the host, snap on");
-        ck (text == "98 bpm (host)" && tag.text == "98 bpm (host)" && tag.colour == TakeGrid::TempoTag::amber, "C2: the text and the cell tag read '98 bpm (host)', amber");
+        ck (text == "98.00 bpm (host)" && tag.text == "98.00 bpm (host)" && tag.colour == TakeGrid::TempoTag::amber, "C2: the text and the cell tag read '98.00 bpm (host)', amber");
         const auto lo = TempoResolve::resolve (unsure, "loop_x.wav", 40.0), hi = TempoResolve::resolve (unsure, "loop_x.wav", 300.0);
         std::printf ("  C2 host at the ends of the range: 40 -> bpm=%.4f source=%s; 300 -> bpm=%.4f source=%s (want 40.0000 host, 300.0000 host)%c",
                      lo.bpm, sn (lo.source), hi.bpm, sn (hi.source), 10);
@@ -13717,17 +13900,39 @@ static void testTempoFallback (const juce::File& tmp)
         std::printf ("  C2 host 120.5 (printed, not a check): bpm=%.4f source=%s text='%s'%c", frac.bpm, sn (frac.source), TempoResolve::fallbackText (frac).toRawUTF8(), 10);
     }
 
-    // C3. A certain measurement beats both.
+    // C3. A stated tempo beats the estimate: the file name wins over a certain 133 and a
+    // host of 98; 133 is no relation of 120, so the downbeat is the file start.
     {
         const auto r = TempoResolve::resolve (certain, loopName, 98.0);
-        const auto tag3 = TakeGrid::tempoTagOf (measuredState, certain, r), tag2 = TakeGrid::tempoTagOf (measuredState, certain);
-        std::printf ("  C3 certain 133 + '%s' + host 98: bpm=%.4f source=%s snap=%d fallback=%d downbeat=%.4f fallback text='%s' tag='%s' colour=%d (want 133.0000 measured 1 0 0.2500 '' '133.00 bpm  3 ms' 2)%c",
-                     loopName.toRawUTF8(), r.bpm, sn (r.source), (int) r.snapEnabled, (int) r.isFallback(), r.downbeatSec, TempoResolve::fallbackText (r).toRawUTF8(),
-                     tag3.text.toRawUTF8(), tag3.colour, 10);
-        guard (r.bpm == 133.0 && r.source == Source::measured && ! r.isFallback() && r.snapEnabled && r.downbeatSec == 0.25,
-               "C3: a certain measurement of 133 beats a file name of 120 and a host of 98, with its own downbeat");
-        guard (TempoResolve::fallbackText (r).isEmpty() && tag3.text == "133.00 bpm  3 ms" && tag3.text == tag2.text && tag3.colour == TakeGrid::TempoTag::green,
-               "C3: the tag is the measured one, '133.00 bpm  3 ms', green, no source words");
+        const auto tag3 = TakeGrid::tempoTagOf (measuredState, certain, r);
+        std::printf ("  C3 certain 133 + '%s' + host 98: bpm=%.4f source=%s snap=%d downbeat=%.4f tag='%s' (want 120.0000 file_name 1 0.0000 '120.00 bpm (file)')%c",
+                     loopName.toRawUTF8(), r.bpm, sn (r.source), (int) r.snapEnabled, r.downbeatSec, tag3.text.toRawUTF8(), 10);
+        guard (r.bpm == 120.0 && r.source == Source::fileName && r.snapEnabled && r.downbeatSec == 0.0 && tag3.text == "120.00 bpm (file)",
+               "C3: the file name 120 beats a certain estimate of 133 and a host of 98");
+        const auto h = TempoResolve::resolve (certain, "loop_x.wav", 98.0);
+        const auto e = TempoResolve::resolve (certain, "loop_x.wav", 0.0);
+        std::printf ("  C3 certain 133 + host 98 -> %.4f %s; no host -> %.4f %s downbeat %.4f (want 98 host; 133 measured 0.25)%c",
+                     h.bpm, sn (h.source), e.bpm, sn (e.source), e.downbeatSec, 10);
+        guard (h.bpm == 98.0 && h.source == Source::host && e.bpm == 133.0 && e.source == Source::measured && e.downbeatSec == 0.25,
+               "C3: the host beats the estimate; the estimate is used only with neither");
+    }
+
+    // C3b. The 88 bpm take the estimate read as 130.1 (3:2): the file name's 88 is the
+    // grid and the export tempo, the estimate's downbeat is kept (a related pulse).
+    {
+        TempoMeasure::Result est = certain;
+        est.bpm = 130.1;
+        est.downbeatSec = 0.3;
+        const juce::String name ("laid_back_drums_horns_sa3_t1_88bpm_3b1802.wav");
+        const auto r = TempoResolve::resolve (est, name, 0.0);
+        // Export tick math: one bar of audio time at the true 88 is 4 quarter notes.
+        const double barSec = 4.0 * 60.0 / 88.0;
+        const double barTicks = barSec * r.bpm / 60.0 * 960.0;
+        std::printf ("  C3b est 130.1 + '%s': bpm=%.4f source=%s downbeat=%.4f relation=%.4f text='%s' bar-1 ticks=%.1f (want 88 file_name 0.3 1.5 '88.00 bpm (file)' 3840.0)%c",
+                     name.toRawUTF8(), r.bpm, sn (r.source), r.downbeatSec, TempoResolve::relationTo (130.1, 88.0), TempoResolve::fallbackText (r).toRawUTF8(), barTicks, 10);
+        guard (r.bpm == 88.0 && r.source == Source::fileName && r.downbeatSec == 0.3 && TempoResolve::relationTo (130.1, 88.0) == 1.5
+                   && TempoResolve::fallbackText (r) == "88.00 bpm (file)" && std::abs (barTicks - 3840.0) < 0.5,
+               "C3b: a take named _88bpm_ uses 88 for grid and export although the estimate says 130.1");
     }
 
     // C4. All three missing.
@@ -13941,15 +14146,15 @@ static void testTempoFallback (const juce::File& tmp)
             const auto snapped = (long long) panel.getCropStartForTest();
             const auto* info = takeEditorInfoLabel (panel);
             const auto infoText = info != nullptr ? info->getText() : juce::String ("(no info label)");
-            std::printf ("  C7 editor: cell found=%d tag='%s' colour=%d (want 1 '120 bpm (file name)' 3); panel opened=%d grid bpm=%.4f downbeat=%.4f measured=%d fallback=%d usable=%d (want 1 120.0000 0.0000 0 1 1); snap on: active=%d amber note=%d beat lines=%d (want 1 0, over 10); start handle dragged to 100000 -> %lld (want 96000, beat 4 at 120 bpm from the file start)%c",
+            std::printf ("  C7 editor: cell found=%d tag='%s' colour=%d (want 1 '120.00 bpm (file)' 3); panel opened=%d grid bpm=%.4f downbeat=%.4f measured=%d fallback=%d usable=%d (want 1 120.0000 0.0000 0 1 1); snap on: active=%d amber note=%d beat lines=%d (want 1 0, over 10); start handle dragged to 100000 -> %lld (want 96000, beat 4 at 120 bpm from the file start)%c",
                          (int) (cell != nullptr), cellTag.text.toRawUTF8(), cellTag.colour, (int) opened, grid.bpm, grid.downbeatSec, (int) grid.measured, (int) grid.fallback, (int) usable,
                          (int) active, (int) amber, lines, snapped, 10);
-            std::printf ("  C7 editor info line: '%s' (want it to start with '120 bpm (file name)')%c", infoText.toRawUTF8(), 10);
-            ck (cell != nullptr && cellTag.text == "120 bpm (file name)" && cellTag.colour == TakeGrid::TempoTag::amber, "C7: the take cell's tag reads '120 bpm (file name)', amber");
+            std::printf ("  C7 editor info line: '%s' (want it to start with '120.00 bpm (file)')%c", infoText.toRawUTF8(), 10);
+            ck (cell != nullptr && cellTag.text == "120.00 bpm (file)" && cellTag.colour == TakeGrid::TempoTag::amber, "C7: the take cell's tag reads '120.00 bpm (file)', amber");
             ck (opened && grid.bpm == 120.0 && grid.downbeatSec == 0.0 && grid.fallback && ! grid.measured && usable,
                 "C7: the take editor's grid is the file name tempo, 120 from the file start, marked fallback, usable");
             ck (active && ! amber && lines > 10 && snapped == 96000, "C7: Snap to grid is active on it, the ruler has beat lines and a dragged handle lands on beat 4 (frame 96000)");
-            ck (infoText.startsWith ("120 bpm (file name)"), "C7: the take editor's info line starts with '120 bpm (file name)'");
+            ck (infoText.startsWith ("120.00 bpm (file)"), "C7: the take editor's info line starts with '120.00 bpm (file)'");
             ed.reset();
         }
         p.reset();
@@ -14025,7 +14230,7 @@ static void testTempoHostAndStretchToken (const juce::File& tmp)
         struct Case { const char* id; const char* what; double firstBpm; bool thenNoTempo; bool wantKnown; double wantStateBpm, wantCascade, wantBpm; Source wantSource; const char* wantTag; bool teethState, teethTake; };
         const Case cases[] = {
             { "H1", "a position, never a tempo", 0.0, false, false, 120.0, 0.0, 0.0, Source::none, "tempo ?", false, true },
-            { "H2", "a tempo of 98", 98.0, false, true, 98.0, 98.0, 98.0, Source::host, "98 bpm (host)", true, false },
+            { "H2", "a tempo of 98", 98.0, false, true, 98.0, 98.0, 98.0, Source::host, "98.00 bpm (host)", true, false },
             { "H3", "a tempo of 98, then a position without a tempo", 98.0, true, false, 98.0, 0.0, 0.0, Source::none, "tempo ?", false, true } };
         for (const auto& c : cases)
         {
@@ -16793,6 +16998,71 @@ static void testTakeDelete (const juce::File& tmp)
         ck (p->takeDeleteMoves.load() == 1 && DeletedFolder::renameCalls.load() - calls0 == 1 && tdTrashCalls.load() == 0, "R-1: one move, one real rename call, the hook was not used");
         ck (after.size() == 2 && indexOf (after, key) == -1 && p->takeDeleteFailures.load() == 0 && msg.isEmpty(), "R-1: the entry stays removed, no failure, no message");
     }
+    // R-W1 a shot-loaded take (--shot-load, addShotTake) points at the user's own WAV.
+    // Deleting it only takes it out of the list: the file stays where it is, same size,
+    // and no Deleted folder is made beside it.
+    {
+        juce::File dir;
+        auto p = make ("rw1", 1, dir);
+        const auto shot = dir.getChildFile ("shot").getChildFile ("user_loop_120bpm.wav");
+        collWriteWav (shot, 0.5);
+        const auto size = shot.getSize();
+        const bool added = p->addShotTake (shot);
+        const int calls0 = DeletedFolder::renameCalls.load();
+        const auto r = added ? p->deleteTake (shot.getFullPathName()) : TD::notFound;
+        p->commitTakeDelete();
+        const bool idle = lapse (*p);
+        const auto after = p->getTakes();
+        bool listed = false;
+        for (const auto& t : after)
+            listed = listed || t.temp == shot;
+        std::printf ("  R-W1 shot take delete: added=%d result=%d idle=%d file exists=%d (want 1) size %lld (want %lld) Deleted folder=%d (want 0) rename calls=%d (want 0) still listed=%d (want 0)%c",
+                     (int) added, (int) r, (int) idle, (int) shot.existsAsFile(), (long long) shot.getSize(), (long long) size,
+                     (int) DeletedFolder::folderFor (shot).exists(), DeletedFolder::renameCalls.load() - calls0, (int) listed, 10);
+        ck (added && r == TD::deleted && idle, "R-W1: the shot take is added and deleted");
+        ck (shot.existsAsFile() && size > 44 && shot.getSize() == size && ! DeletedFolder::folderFor (shot).exists() && DeletedFolder::renameCalls.load() == calls0,
+            "R-W1: the external WAV is never moved: same path, same size, no Deleted folder");
+        ck (! listed, "R-W1: the shot take is out of the list");
+    }
+    // R-W1b a stretched copy of a shot-loaded take is the plugin's own file: deleting
+    // it moves its file to the Deleted folder; the external source stays put.
+    {
+        juce::File dir;
+        auto p = make ("rw1b", 1, dir);
+        const auto shot = dir.getChildFile ("shot").getChildFile ("user_loop_120bpm.wav");
+        collWriteWav (shot, 2.0);
+        const auto size = shot.getSize();
+        const bool added = p->addShotTake (shot);
+        const bool asked = added && p->requestTakeStretch (shot, 120.0, 130.0);
+        const bool done = asked && p->waitTakeStretchIdle();
+        // The saver gives the copy a lasting WAV; a saved take's delete moves that file
+        // (finishTakeDelete) and leaves its temp to the temp-folder cleanup, so the
+        // checked file is the lasting copy when there is one.
+        if (done)
+            p->waitSaverIdle();
+        juce::File copy;
+        bool copyExternal = true;
+        for (const auto& t : p->getTakes())
+            if (t.temp != shot)
+            {
+                copy = t.stable != juce::File() ? t.stable : t.temp;
+                copyExternal = t.external;
+            }
+        juce::File copyTemp;
+        for (const auto& t : p->getTakes())
+            if (t.temp != shot)
+                copyTemp = t.temp;
+        const auto r = copy != juce::File() ? p->deleteTake (copyTemp.getFullPathName()) : TD::notFound;
+        p->commitTakeDelete();
+        const bool idle = lapse (*p);
+        std::printf ("  R-W1b copy of a shot take: added=%d asked=%d done=%d copy='%s' external=%d (want 0) result=%d idle=%d copy at old place=%d (want 0) Deleted entries=%d (want 1) shot exists=%d (want 1) size %lld (want %lld) shot Deleted folder=%d (want 0)%c",
+                     (int) added, (int) asked, (int) done, copy.getFileName().toRawUTF8(), (int) copyExternal, (int) r, (int) idle,
+                     (int) copy.existsAsFile(), copy != juce::File() ? delEntries (copy) : -1, (int) shot.existsAsFile(), (long long) shot.getSize(), (long long) size,
+                     (int) DeletedFolder::folderFor (shot).exists(), 10);
+        ck (added && asked && done && copy != juce::File() && ! copyExternal, "R-W1b: the stretched copy of a shot take is not external");
+        ck (r == TD::deleted && idle && ! copy.existsAsFile() && delEntries (copy) == 1, "R-W1b: the copy is deleted through the normal path, its file in Deleted");
+        ck (shot.existsAsFile() && shot.getSize() == size && ! DeletedFolder::folderFor (shot).exists(), "R-W1b: the external source stays put");
+    }
     // R-5 kept: the real rename fails.
     {
         juce::File dir;
@@ -17431,7 +17701,7 @@ static int runLoopCheck (int argc, char** argv)
     return res.outSamples == expected ? 0 : 1;
 }
 
-// editor-shot [--closed] [--loop] [--seam] [--playhead] [--warp] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]: the whole editor with the take editor
+// editor-shot [--closed] [--select N] [--loop] [--seam] [--playhead] [--warp] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]: the whole editor with the take editor
 // open on one take, painted off screen into <out.png>, and the panel alone into
 // <out>_panel.png. The take is a generated kick and hat pattern (real level) or a copy
 // of in.wav. No window, no audio device; an existing output is refused. It also prints
@@ -17447,11 +17717,13 @@ static int runLoopCheck (int argc, char** argv)
 // --takename <name.wav>: the take is registered under that file name (default
 // take_kick_hat_120.wav) and, when no in.wav is given, is steady noise, so its
 // measurement is uncertain and a tempo in the name shows as the fallback label
-// ("loop_120bpm_x.wav" gives "120 bpm (file name)"). Test code only.
+// ("loop_120bpm_x.wav" gives "120.00 bpm (file)"). Test code only.
 static int runEditorShot (int argc, char** argv, const juce::File& tmp)
 {
     juce::StringArray rest;
-    bool closedList = false, withLoop = false, withSeam = false, withSnap = false, withZero = false, noTempo = false, withFit = false, withPlayhead = false, withWarp = false, badName = false;
+    bool closedList = false, withLoop = false, withSeam = false, withSnap = false, withZero = false, noTempo = false, withFit = false, withPlayhead = false, withWarp = false, addMarker = false, removeMarker = false, badName = false;
+    double zoomShot = 1.0;
+    int selectShot = 0;
     juce::String takeName ("take_kick_hat_120.wav");
     for (int i = 2; i < argc; ++i)
     {
@@ -17479,6 +17751,14 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             withPlayhead = true;
         else if (arg == "--warp")
             withWarp = true;
+        else if (arg == "--addmarker")
+            withWarp = addMarker = true;
+        else if (arg == "--removemarker")
+            withWarp = addMarker = removeMarker = true;
+        else if (arg == "--zoom")
+            zoomShot = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]).getDoubleValue() : 1.0;
+        else if (arg == "--select")
+            selectShot = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]).getIntValue() : 0;
         else if (arg == "--closed")
             closedList = true;
         else
@@ -17592,6 +17872,16 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             ed->runRefreshForTest();
             juce::Thread::sleep (300);
             ed->runRefreshForTest();
+            if (selectShot > 0 && selectShot <= (int) p->getTakes().size())
+            {
+                // --select N: take N selected and one MIDI export done, so Export MIDI and the chip are live.
+                ed->midiSyncForTest = true;
+                ed->selectTakeForTest (p->getTakes()[(std::size_t) (selectShot - 1)].name);
+                ed->runRefreshForTest();
+                ed->exportMidiForTest();
+                ed->runRefreshForTest();
+                std::printf ("editor-shot: selected take %d, MIDI tempo file '%s'%c", selectShot, ed->lastMidiTempoForTest().getFileName().toRawUTF8(), 10);
+            }
             for (auto* c : ed->getChildren())
                 if (auto* o = dynamic_cast<OfflineOverlay*> (c))
                     o->setVisible (false);
@@ -17683,6 +17973,24 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             panel.setPlayheadForTest ((juce::int64) (0.45 * (double) panel.getLengthForTest()));
             std::printf ("editor-shot: playhead frame=%lld text=\"%s\"%c", (long long) panel.playheadFrameForTest(), panel.playheadTextForTest().toRawUTF8(), 10);
         }
+        if (zoomShot > 1.0)
+        {
+            // Horizontal zoom about x = 0 of the waveform (the view starts at the take start).
+            panel.zoomByForTest (zoomShot, 0.0);
+            std::printf ("editor-shot: zoom=%.3f viewStart=%lld%c", panel.getZoomForTest(), (long long) panel.getViewStartForTest(), 10);
+            const auto sr = panel.scrollRangeForTest();
+            const double total = panel.scrollTotalForTest(), trackPx = (double) panel.scrollAreaForTest().getWidth();
+            std::printf ("editor-shot: scroll track=%dpx wave=%dpx visible/total=%.4f thumb=%.1fpx (%.1f %% of track)%c", panel.scrollAreaForTest().getWidth(),
+                         panel.waveAreaForTest().getWidth(), total > 0.0 ? sr.getLength() / total : 0.0, total > 0.0 ? trackPx * sr.getLength() / total : 0.0,
+                         total > 0.0 ? 100.0 * sr.getLength() / total : 0.0, 10);
+            int tags = 0, bars = 0;
+            for (const auto& b : panel.beatLinesForTest())
+            {
+                tags += b.tagBar > 0 ? 1 : 0;
+                bars += b.label > 0 ? 1 : 0;
+            }
+            std::printf ("editor-shot: ruler bar labels=%d beat labels=%d%c", bars, tags, 10);
+        }
         if (withWarp)
         {
             // Round 3: Warp to host first (every region to the host or Fit tempo), then
@@ -17694,6 +18002,22 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             const auto& wm = panel.warpMarkersForTest();
             if (wm.size() > 2)
                 panel.dragWarpForTest (2, wm[2].dstFrame + (juce::int64) (0.050 * panel.sampleRateForTest()));
+            if (addMarker && wm.size() > 3)
+            {
+                // Round 4: a marker added half way between markers 2 and 3 (the double-click path).
+                const auto v = panel.viewForTest();
+                const double x = TakeEditorMath::xOfFrame (v, (wm[2].dstFrame + wm[3].dstFrame) / 2);
+                const int at = panel.addWarpMarkerAtXForTest (x);
+                std::printf ("editor-shot: added marker index=%d src=%lld dst=%lld%c", at, at >= 0 ? (long long) wm[(std::size_t) at].srcFrame : -1LL,
+                             at >= 0 ? (long long) wm[(std::size_t) at].dstFrame : -1LL, 10);
+                std::printf ("editor-shot: after add reset enabled=%d%c", panel.warpResetEnabledForTest() ? 1 : 0, 10);
+                if (removeMarker && at >= 0)
+                {
+                    // Round 5: Alt+click removes the added marker, then the auto marker at index 1.
+                    const bool r1 = panel.removeWarpMarkerForTest (at), r2 = panel.removeWarpMarkerForTest (1);
+                    std::printf ("editor-shot: removed added=%d auto1=%d reset enabled=%d%c", r1 ? 1 : 0, r2 ? 1 : 0, panel.warpResetEnabledForTest() ? 1 : 0, 10);
+                }
+            }
             std::printf ("editor-shot: warp markers=%d moved=%d%c", (int) wm.size(), WarpMarkers::movedCount (wm), 10);
             // Round 2b: Play hands the moved markers to the audition (the preview render).
             int handed = -1;
@@ -18839,6 +19163,1301 @@ static void testTakeEditor (const juce::File& tmp)
     std::printf ("  takeeditor: %d checks, %d failed%c", checks, failures - failuresBefore, 10);
 }
 
+// Take editor horizontal zoom: the frame under the pointer stays across a zoom in and
+// out, frames per pixel at 4x is a quarter of the whole take, the view never leaves the
+// take, the zoom stops at 64 frames per pixel, a warp marker dragged with real mouse
+// events at 4x lands on the frame of the pointer, bar lines spread with the zoom, and an
+// off-view crop grip or loop flag is not drawn. No window, no sound.
+// Teeth (HSLINK_TEETH): TZ_WHOLE, TZ_NO_ANCHOR, TZ_NO_CAP, TZ_NO_CLAMP, TZ_EDGE_CLAMP.
+static void testTakeZoom (const juce::File& tmp)
+{
+    std::printf ("Take zoom: anchor, 4x scale, clamp, cap, marker drag, bar spacing, off-view grips%c", 10);
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&checks] (bool ok, const char* what) { ++checks; check (ok, what); };
+    using namespace TakeEditorMath;
+    using P = HotStepLinkProcessor;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    testMutant = teethVar == "TZ_WHOLE" ? mutZoomWhole : teethVar == "TZ_NO_ANCHOR" ? mutZoomNoAnchor
+               : teethVar == "TZ_NO_CAP" ? mutZoomNoCap : teethVar == "TZ_NO_CLAMP" ? mutZoomNoClamp
+               : teethVar == "TZ_EDGE_CLAMP" ? mutHandleEdgeClamp : mutNone;
+    std::printf ("  mutant=%d (0 = none)%c", testMutant.load(), 10);
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("takezoom_test");
+    d.createDirectory();
+    const int kFrames = 16 * 48000; // 16 s: 8 bars at 120 bpm
+    juce::AudioBuffer<float> audio (2, kFrames);
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < kFrames; ++i)
+            audio.setSample (c, i, 0.25f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / 48000.0));
+    const auto file = writeWav (d.getChildFile ("zoom.wav"), audio, 48000.0);
+
+    TakeEditorPanel panel;
+    juce::uint32 clock = 1000;
+    panel.setSize (490, 566);
+    panel.clockForTest = [&clock] { return clock; };
+    panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+    TakeEditorPanel::Take take;
+    take.temp = file;
+    take.name = "zoom.wav";
+    take.edit = withLoop (TakeEdit::EditData {}, 480000, 600000); // a loop at 10 s to 12.5 s
+    take.grid.bpm = 120.0;
+    take.grid.downbeatSec = 0.0;
+    take.grid.measured = true;
+    panel.open (take);
+    for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+    {
+        juce::Thread::sleep (10);
+        panel.tick();
+    }
+    {
+        // The dead-button bug: open() disabled -, + and Fit with length 0 and the header
+        // never re-enabled them. Checked before any resize can refresh them.
+        const bool inOn = panel.zoomInEnabledForTest();
+        std::printf ("  0b: after the header: zoom in enabled=%d (want 1)%c", inOn ? 1 : 0, 10);
+        ck (inOn, "0b: the + button is enabled once the take is read");
+    }
+    panel.setWarpForTest (true);
+    panel.resized();
+    const auto len = panel.getLengthForTest();
+    const int w = panel.waveAreaForTest().getWidth();
+    ck (len == kFrames && w > 100, "0: the 16 s take opens and the waveform has a width");
+    std::printf ("  length=%lld waveform width=%d px%c", (long long) len, w, 10);
+    const double whole = (double) len / (double) w;
+
+    auto barSpacing = [&panel]
+    {
+        double prev = -1.0, minGap = 1.0e9;
+        int bars = 0;
+        for (const auto& l : panel.beatLinesForTest())
+            if (l.bar)
+            {
+                if (prev >= 0.0)
+                    minGap = juce::jmin (minGap, l.x - prev);
+                prev = l.x;
+                ++bars;
+            }
+        return bars >= 2 ? minGap : 0.0;
+    };
+    const double bar1 = barSpacing();
+
+    // 1. The frame under the pointer stays: in by 4 then out by 2 about x = 0.3 w.
+    {
+        const double ax = 0.3 * w;
+        auto under = [&panel, ax] { const auto v = panel.viewForTest(); return (double) v.firstFrame + ax * v.framesPerPixel; };
+        const double f0 = under();
+        panel.zoomByForTest (4.0, ax);
+        const double f1 = under();
+        panel.zoomByForTest (0.5, ax);
+        const double f2 = under();
+        std::printf ("  1: frame under x=%.1f: %.1f, after 4x %.1f, after 0.5x %.1f (want within 1)%c", ax, f0, f1, f2, 10);
+        ck (std::abs (f1 - f0) <= 1.0 && std::abs (f2 - f0) <= 1.0, "1: the frame under the pointer stays within 1 frame across zoom in and out");
+        panel.zoomByForTest (0.01, 0.0); // back to the whole take
+    }
+
+    // 2. Frames per pixel at 4x are a quarter of the whole take.
+    const double fppWhole = panel.viewForTest().framesPerPixel;
+    panel.zoomByForTest (4.0, 0.0);
+    const auto v4 = panel.viewForTest();
+    std::printf ("  2: fpp whole=%.3f (want %.3f) at 4x=%.3f (want %.3f) zoom=%.3f%c", fppWhole, whole, v4.framesPerPixel, whole / 4.0, panel.getZoomForTest(), 10);
+    ck (std::abs (fppWhole - whole) < 1.0e-6 * whole && std::abs (v4.framesPerPixel - whole / 4.0) < 1.0e-6 * whole,
+        "2: frames per pixel at 4x are a quarter of the whole take");
+
+    // 3. Bar lines spread with the zoom (bar to bar, not beat to beat).
+    const double bar4 = barSpacing();
+    std::printf ("  3: bar spacing 1x=%.2f px 4x=%.2f px ratio=%.3f (want >= 3.99)%c", bar1, bar4, bar1 > 0.0 ? bar4 / bar1 : 0.0, 10);
+    ck (bar1 > 10.0 && bar4 >= 3.99 * bar1, "3: bar-line spacing at 4x is at least 4 times the unzoomed spacing");
+
+    // 4. Off-view grips and flags (view 0 .. 4 s): the S grip shows, the E grip and both flags do not.
+    {
+        const bool s = panel.cropGripDrawnForTest (false), e = panel.cropGripDrawnForTest (true);
+        const bool ls = panel.loopFlagDrawnForTest (false), le = panel.loopFlagDrawnForTest (true);
+        std::printf ("  4: view %lld..%lld S drawn=%d (want 1) E drawn=%d (want 0) loop flags drawn=%d %d (want 0 0) loop=%d%c",
+                     (long long) v4.firstFrame, (long long) (v4.firstFrame + (juce::int64) std::llround (v4.framesPerPixel * w)),
+                     (int) s, (int) e, (int) ls, (int) le, (int) panel.hasLoopForTest(), 10);
+        ck (panel.hasLoopForTest() && s && ! e && ! ls && ! le, "4: an off-view crop grip and loop flags are not drawn, the one in view is");
+    }
+
+    // 5. A real mouse drag of warp marker 1 (bar 2, frame 96000) at 4x.
+    {
+        const auto& wm = panel.warpMarkersForTest();
+        const bool have = wm.size() > 2 && wm[1].dstFrame == 96000;
+        std::printf ("  5: warp markers=%d marker1=%lld (want 96000)%c", (int) wm.size(), wm.size() > 1 ? (long long) wm[1].dstFrame : -1LL, 10);
+        ck (have, "5: warp marker 1 sits on bar 2 at frame 96000");
+        if (have)
+        {
+            const auto L = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
+            auto mev = [&panel] (juce::Point<int> pos, juce::Point<int> down, juce::ModifierKeys mods, bool dragged)
+            {
+                const auto t = juce::Time::getCurrentTime();
+                return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos.toFloat(), mods, juce::MouseInputSource::defaultPressure,
+                                         juce::MouseInputSource::defaultOrientation, juce::MouseInputSource::defaultRotation, juce::MouseInputSource::defaultTiltX,
+                                         juce::MouseInputSource::defaultTiltY, &panel, &panel, t, down.toFloat(), t, 1, dragged);
+            };
+            const auto lane = panel.warpLaneForTest();
+            const auto wa = panel.waveAreaForTest();
+            // Where marker 1 is drawn, worked out from the 4x view (not the panel's view()).
+            const double fpp4 = (double) len / ((double) w * 4.0);
+            const juce::int64 vs = panel.getViewStartForTest();
+            const juce::Point<int> down (lane.getX() + (int) std::floor ((96000.0 - (double) vs) / fpp4), lane.getCentreY());
+            const juce::Point<int> to (down.x + 40, down.y);
+            static_cast<juce::Component&> (panel).mouseDown (mev (down, down, L, false));
+            clock += 1000;
+            // Shift held: the drag follows the pointer freely (no beat snap, 4eed68e).
+            const auto LS = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier | juce::ModifierKeys::shiftModifier);
+            static_cast<juce::Component&> (panel).mouseDrag (mev (to, down, LS, true));
+            static_cast<juce::Component&> (panel).mouseUp (mev (to, down, L, true));
+            const double expect = (double) vs + (double) (to.x - wa.getX()) * fpp4;
+            const double got = (double) panel.warpMarkersForTest()[1].dstFrame;
+            std::printf ("  5: press x=%d drag to x=%d; marker1 now %.0f, expected %.0f, diff %.1f frames (want <= %.1f, 1 px)%c",
+                         down.x, to.x, got, expect, got - expect, fpp4, 10);
+            ck (std::abs (got - expect) <= fpp4, "5: a marker dragged at 4x lands within 1 px worth of frames of the pointer");
+        }
+    }
+
+    // 6. Pan and clamp: the view never leaves the take at either end.
+    {
+        panel.setViewStartForTest (-50000);
+        const auto a = panel.viewForTest();
+        panel.setViewStartForTest (len + 100000);
+        const auto b = panel.viewForTest();
+        const double bEnd = (double) b.firstFrame + b.framesPerPixel * b.widthPx;
+        std::printf ("  6: pan to -50000: first=%lld (want 0); pan past the end: first=%lld view end=%.0f (want %lld)%c",
+                     (long long) a.firstFrame, (long long) b.firstFrame, bEnd, (long long) len, 10);
+        ck (a.firstFrame == 0, "6: a pan before the take start stops at frame 0");
+        ck (b.firstFrame >= 0 && bEnd <= (double) len + 1.0 && bEnd >= (double) len - b.framesPerPixel, "6: a pan past the take end stops with the view end on the take end");
+    }
+
+    // 7. The zoom stops at kMinFramesPerPixel and never goes below 1.
+    {
+        for (int i = 0; i < 30; ++i)
+            panel.zoomByForTest (2.0, 0.5 * w);
+        const auto v = panel.viewForTest();
+        std::printf ("  7: after 30 x2 zooms: zoom=%.3f fpp=%.3f (want %.3f, cap zoom %.3f)%c", panel.getZoomForTest(), v.framesPerPixel, kMinFramesPerPixel, maxZoom (len, w), 10);
+        ck (v.framesPerPixel >= kMinFramesPerPixel - 1.0e-6 && v.framesPerPixel <= kMinFramesPerPixel + 0.5 && v.framesPerPixel >= 1.0, "7: the deepest zoom is kMinFramesPerPixel, never below 1");
+        for (int i = 0; i < 30; ++i)
+            panel.zoomByForTest (0.5, 0.5 * w);
+        const auto o = panel.viewForTest();
+        std::printf ("  7: after 30 x0.5 zooms: zoom=%.3f fpp=%.3f first=%lld (want %.3f, 0)%c", panel.getZoomForTest(), o.framesPerPixel, (long long) o.firstFrame, whole, 10);
+        ck (std::abs (o.framesPerPixel - whole) < 1.0e-6 * whole && o.firstFrame == 0, "7: zooming out stops at the whole take");
+    }
+
+    // 8. One time-to-x mapping at a deep zoom: a 50 ms window at 13.7 s fills the view.
+    {
+        panel.zoomToSecondsForTest (13.7, 0.05);
+        const double x0 = panel.xOfSecondsForTest (13.7), x1 = panel.xOfSecondsForTest (13.75);
+        std::printf ("  8: 50 ms at 13.7 s: x(13.7)=%.2f (want 0) x(13.75)=%.2f (want %d) fpp=%.3f%c", x0, x1, w, panel.viewForTest().framesPerPixel, 10);
+        ck (std::abs (x0) <= 1.0 && std::abs (x1 - (double) w) <= 1.0, "8: 13.7 s and 13.75 s map to the view edges within 1 px");
+        panel.zoomToLoopForTest();
+        const auto lv = panel.viewForTest();
+        const double lx0 = xOfFrame (lv, 480000), lx1 = xOfFrame (lv, 600000);
+        std::printf ("  8: zoom to loop: loop x %.1f..%.1f of %d px%c", lx0, lx1, w, 10);
+        ck (lx0 >= 0.0 && lx1 <= (double) w && lx1 - lx0 >= 0.8 * w, "8: Zoom to loop fills most of the view with the loop");
+    }
+
+    panel.close (false);
+    testMutant = mutNone;
+    P::tempoMeasureEnabled = savedMeasure;
+    std::printf ("  take zoom: %d checks, %d failed%c", checks, failures - failuresBefore, 10);
+}
+
+// Warp redraw (4eed68e): the wave column reads the warped source, marker drag snaps
+// (Shift free), double-click removes a middle marker and resets an end anchor.
+static void testTakeWarpDraw (const juce::File& tmp)
+{
+    std::printf ("Take warp draw: column map, drag snap, double-click%c", 10);
+    const int failuresBefore = failures;
+    using P = HotStepLinkProcessor;
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("takewarpdraw_test");
+    d.createDirectory();
+    const int kFrames = 16 * 48000;
+    juce::AudioBuffer<float> audio (2, kFrames);
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < kFrames; ++i)
+            audio.setSample (c, i, 0.25f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / 48000.0));
+    const auto file = writeWav (d.getChildFile ("warp.wav"), audio, 48000.0);
+    TakeEditorPanel panel;
+    juce::uint32 clock = 1000;
+    panel.setSize (490, 566);
+    panel.clockForTest = [&clock] { return clock; };
+    panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+    TakeEditorPanel::Take take;
+    take.temp = file;
+    take.name = "warp.wav";
+    take.grid.bpm = 120.0;
+    take.grid.downbeatSec = 0.0;
+    take.grid.measured = true;
+    panel.open (take);
+    for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+    {
+        juce::Thread::sleep (10);
+        panel.tick();
+    }
+    panel.setWarpForTest (true);
+    panel.resized();
+    const auto& m = panel.warpMarkersForTest();
+    std::printf ("  length=%lld markers=%d%c", (long long) panel.getLengthForTest(), (int) m.size(), 10);
+    check (m.size() >= 4 && m[1].srcFrame == 96000 && m[2].srcFrame == 192000, "WD0: bar markers at 96000 and 192000");
+    if (m.size() >= 4)
+    {
+        const auto unwarped = panel.columnSourceForTest (48000);
+        // 3. Double-click the middle marker at 96000: removed.
+        const int n0 = (int) m.size();
+        panel.doubleClickWarpMarkerForTest (1);
+        const int n1 = (int) m.size();
+        std::printf ("  3: double-click middle: count %d -> %d (want %d), [1].src=%lld%c", n0, n1, n0 - 1, (long long) m[1].srcFrame, 10);
+        check (n1 == n0 - 1 && m[1].srcFrame == 192000, "WD3: double-click removes a middle marker");
+        // 2. Snap: 100000 snaps to the beat 96000; Shift leaves it.
+        const auto snapped = panel.warpDragTargetForTest (100000, false), freeDst = panel.warpDragTargetForTest (100000, true);
+        std::printf ("  2: drag to 100000: no Shift=%lld (want 96000) Shift=%lld (want 100000)%c", (long long) snapped, (long long) freeDst, 10);
+        check (snapped == 96000, "WD2: marker drag snaps to the beat");
+        check (freeDst == 100000, "WD2: Shift drag stays free");
+        // 1. Drag the 192000 marker to dst 96000: column at 48000 reads source 96000.
+        panel.dragWarpForTest (1, panel.warpDragTargetForTest (96000, false));
+        const auto warped = panel.columnSourceForTest (48000);
+        std::printf ("  1: [1] dst=%lld; column 48000 reads src unwarped=%lld (want 48000) warped=%lld (want 96000)%c",
+                     (long long) m[1].dstFrame, (long long) unwarped, (long long) warped, 10);
+        check (unwarped == 48000, "WD1: unwarped column reads its own frame");
+        check (warped == 96000, "WD1: warped column reads source 2x");
+        // 3b. Double-click the end anchor: count stays, the anchor resets.
+        const int last = (int) m.size() - 1;
+        panel.dragWarpForTest (last, m[(std::size_t) last].srcFrame - 48000);
+        const auto moved = m[(std::size_t) last].dstFrame;
+        panel.doubleClickWarpMarkerForTest (last);
+        std::printf ("  3: end anchor: count %d -> %d, dst %lld -> %lld (want %lld)%c", last + 1, (int) m.size(), (long long) moved,
+                     (long long) m.back().dstFrame, (long long) m.back().srcFrame, 10);
+        check ((int) m.size() == last + 1 && moved != m.back().srcFrame && m.back().dstFrame == m.back().srcFrame, "WD3: end anchor resets, not removed");
+    }
+    panel.close (false);
+    P::tempoMeasureEnabled = savedMeasure;
+    std::printf ("  take warp draw: %d failed%c", failures - failuresBefore, 10);
+}
+
+// MIDI time signature denominator and key signature (slice 1, 3a3cfee): bar length
+// from num/den at kPpq, invalid den falls back to 4, FF 58 carries log2(den), FF 59 only
+// when a KeySig is given. Teeth: HSLINK_TEETH=MIDI_DEN4 (writer always at den 4 and no
+// validation, as before the slice), MIDI_NO_KEY (key signature dropped).
+static void testMidiTimeSig (const juce::File& tmp)
+{
+    const auto mut = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    const bool den4 = mut == "MIDI_DEN4", noKey = mut == "MIDI_NO_KEY";
+    std::printf ("  midi timesig mutant '%s'%c", mut.toRawUTF8(), 10);
+    auto vden = [den4] (int d) { return den4 ? d : MidiExport::validDen (d); };
+    auto build = [den4, noKey] (int num, int den, std::optional<MidiExport::KeySig> k)
+    {
+        return MidiExport::buildTempoFile (120.0, 0.0, num, 20.0, den4 ? 4 : den, noKey ? std::nullopt : k);
+    };
+    auto roundTrip = [&tmp] (const juce::MidiFile& f, const char* name)
+    {
+        const auto file = tmp.getChildFile (name);
+        file.deleteFile();
+        { juce::FileOutputStream o (file); f.writeTo (o); }
+        juce::MidiFile m;
+        juce::FileInputStream in (file);
+        if (! in.openedOk() || ! m.readFrom (in))
+            m = juce::MidiFile();
+        return m;
+    };
+    struct Meta { int tsNum = -1, tsLog = -1, keyCount = 0, keySf = 99, keyMi = -1; std::vector<double> bars; };
+    auto scan = [] (const juce::MidiFile& m)
+    {
+        Meta r;
+        for (int t = 0; t < m.getNumTracks(); ++t)
+            for (const auto* e : *m.getTrack (t))
+            {
+                const auto& msg = e->message;
+                if (! msg.isMetaEvent())
+                    continue;
+                const auto* d = msg.getMetaEventData();
+                if (msg.getMetaEventType() == 0x58 && msg.getMetaEventLength() >= 2)
+                { r.tsNum = d[0]; r.tsLog = d[1]; }
+                else if (msg.getMetaEventType() == 0x59 && msg.getMetaEventLength() >= 2)
+                { ++r.keyCount; r.keySf = (int) (juce::int8) d[0]; r.keyMi = d[1]; }
+                else if (msg.isTextMetaEvent() && msg.getMetaEventType() == 6)
+                    r.bars.push_back (msg.getTimeStamp());
+            }
+        return r;
+    };
+    struct Case { int num, den, ticks, log2; };
+    const Case cases[] = { { 7, 8, 3360, 3 }, { 6, 8, 2880, 3 }, { 3, 4, 2880, 2 }, { 4, 4, 3840, 2 } };
+    for (const auto& c : cases)
+    {
+        const auto m = roundTrip (build (c.num, c.den, std::nullopt), "ts.mid");
+        const auto r = scan (m);
+        bool grid = r.bars.size() >= 3;
+        for (size_t i = 0; i < r.bars.size(); ++i)
+            grid = grid && std::abs (r.bars[i] - (double) (i * (size_t) c.ticks)) < 0.5;
+        const double bar2 = r.bars.size() >= 2 ? r.bars[1] : -1.0;
+        std::printf ("  %d/%d: ppq %d, bar 2 at %.0f (want %d), %d bars, FF58 num %d log2 %d (want %d), key metas %d%c",
+                     c.num, c.den, m.getTimeFormat(), bar2, c.ticks, (int) r.bars.size(), r.tsNum, r.tsLog, c.log2, r.keyCount, 10);
+        const auto lbl = juce::String (c.num) + "/" + juce::String (c.den);
+        check (m.getTimeFormat() == MidiExport::kPpq && std::abs (bar2 - c.ticks) < 0.5, (lbl + ": bar 2 at the right tick").toRawUTF8());
+        check (grid, (lbl + ": every bar marker on a bar multiple").toRawUTF8());
+        check (r.tsNum == c.num && r.tsLog == c.log2, (lbl + ": FF 58 carries num and log2(den)").toRawUTF8());
+        check (r.keyCount == 0, (lbl + ": no key meta when no KeySig is given").toRawUTF8());
+    }
+    for (int bad : { 0, 3, 12, 128 })
+    {
+        const int v = vden (bad);
+        const double q = den4 ? (double) 4 * 4.0 / (double) std::max (1, bad) : MidiExport::quartersPerBar (4, bad);
+        std::printf ("  invalid den %d -> %d, quarters per 4-beat bar %.3f%c", bad, v, q, 10);
+        check (v == 4 && std::abs (q - 4.0) < 1.0e-9, ("invalid den " + juce::String (bad) + " falls back to 4").toRawUTF8());
+    }
+    {
+        const auto m = roundTrip (build (6, 8, MidiExport::KeySig { -3, true }), "key.mid");
+        const auto r = scan (m);
+        std::printf ("  key C minor (-3, minor): FF59 count %d, sf %d, mi %d%c", r.keyCount, r.keySf, r.keyMi, 10);
+        check (r.keyCount == 1 && r.keySf == -3 && r.keyMi == 1, "KeySig given: one FF 59 with sf -3, mi 1");
+        const auto m2 = roundTrip (build (4, 4, MidiExport::KeySig { 2, false }), "key2.mid");
+        const auto r2 = scan (m2);
+        std::printf ("  key D major (2, major): FF59 count %d, sf %d, mi %d%c", r2.keyCount, r2.keySf, r2.keyMi, 10);
+        check (r2.keyCount == 1 && r2.keySf == 2 && r2.keyMi == 0, "KeySig given: one FF 59 with sf 2, mi 0");
+    }
+}
+
+// Tempo map from warp markers (slice 2): one tempo event per warp segment, the boundary
+// on the right tick, rounding-only neighbours merged (kMergeFrames = 1.5 frames per span),
+// map averaging to the tagged BPM, hits through the map within 1 ms.
+// Teeth: HSLINK_TEETH=MIDI_SINGLE_TEMPO (the map is always empty).
+// MIDI drag: the chip's own build writes real MIDI files, and the start-up cleanup
+// clears only temp/HOTSTEP_LINK_midi. Mutants: MIDI_TRACKS, MIDI_CLEAN_PARENT.
+static void testMidiDrag (const juce::File& tmp)
+{
+    const auto base = tmp.getChildFile ("mididrag");
+    base.deleteRecursively();
+    base.createDirectory();
+    // a) build into a test dir and read back each header
+    MidiBuildInputs in;
+    in.src = base.getChildFile ("take.wav");
+    check (collWriteWav (in.src, 4.0), "mididrag: source WAV written");
+    in.grid.bpm = 120.0;
+    in.grid.downbeatSec = 0.0;
+    in.srcBpm = 120.0;
+    in.hasTempo = true;
+    const auto dest = base.getChildFile ("out");
+    const auto files = buildMidiFilesForDrag (in, dest);
+    std::printf ("  build returned %d files (want 2)%c", files.size(), 10);
+    check (files.size() == 2, "mididrag: hits and tempo files returned");
+    for (const auto& path : files)
+    {
+        const juce::File f (path);
+        juce::MemoryBlock mb;
+        const bool read = f.existsAsFile() && f.loadFileAsData (mb) && mb.getSize() >= 14;
+        const auto* b = static_cast<const unsigned char*> (mb.getData());
+        const bool magic = read && b[0] == 'M' && b[1] == 'T' && b[2] == 'h' && b[3] == 'd';
+        const int tracks = read ? ((int) b[10] << 8) | (int) b[11] : -1;
+        const int want = f.getFileName().endsWith ("_hits.mid") ? 2 : 1;
+        std::printf ("  %s: exists %d, %d bytes, MThd %d, tracks %d (want %d)%c", f.getFileName().toRawUTF8(),
+                     (int) f.existsAsFile(), (int) mb.getSize(), (int) magic, tracks, want, 10);
+        check (f.existsAsFile() && magic, "mididrag: returned file exists and starts with MThd");
+        check (tracks == want, "mididrag: header track count (hits 2, tempo 1)");
+    }
+    // b) cleanup: fake root with children, a foreign file beside it
+    const auto parent = base.getChildFile ("fakeTemp");
+    const auto root = parent.getChildFile ("HOTSTEP_LINK_midi");
+    root.getChildFile ("drag_1").createDirectory();
+    root.getChildFile ("drag_1").getChildFile ("a_hits.mid").replaceWithText ("x");
+    root.getChildFile ("drag_2").getChildFile ("sub").createDirectory();
+    root.getChildFile ("loose.mid").replaceWithText ("y");
+    const auto foreign = parent.getChildFile ("foreign.txt");
+    foreign.replaceWithText ("keep me");
+    const auto other = parent.getChildFile ("OTHER_APP");
+    other.getChildFile ("x.bin").create();
+    // JUCE cannot set a folder's mod time on Windows, so age is driven by the injected "now":
+    // the cleanup runs 2 h after the old children were made, and the fresh file is stamped 5 min before that.
+    const auto fresh = root.getChildFile ("fresh_hits.mid");
+    fresh.replaceWithText ("z");
+    const auto nowT = juce::Time::getCurrentTime() + juce::RelativeTime::hours (2.0);
+    root.getChildFile ("loose.mid").setLastModificationTime (nowT - juce::RelativeTime::hours (2.0));
+    fresh.setLastModificationTime (nowT - juce::RelativeTime::minutes (5.0));
+    const double oldAgeMin = (nowT - root.getChildFile ("drag_1").getLastModificationTime()).inMinutes();
+    const double freshAgeMin = (nowT - fresh.getLastModificationTime()).inMinutes();
+    const int before = (int) root.getNumberOfChildFiles (juce::File::findFilesAndDirectories);
+    const int left = clearMidiDragTempRoot (root, juce::RelativeTime::hours (1.0), nowT);
+    const int after = root.isDirectory() ? (int) root.getNumberOfChildFiles (juce::File::findFilesAndDirectories) : -1;
+    std::printf ("  cleanup: old age %.1f min, fresh age %.1f min, root children %d -> %d, left %d, old gone %d, fresh kept %d, foreign %d, other dir %d%c",
+                 oldAgeMin, freshAgeMin, before, after, left, (int) ! root.getChildFile ("drag_1").exists(),
+                 (int) fresh.existsAsFile(), (int) foreign.existsAsFile(),
+                 (int) other.getChildFile ("x.bin").existsAsFile(), 10);
+    check (before == 4 && after == 1 && left == 0 && ! root.getChildFile ("drag_1").exists()
+               && ! root.getChildFile ("loose.mid").exists(), "mididrag: cleanup removes children over 1 h old");
+    check (fresh.existsAsFile(), "mididrag: cleanup keeps a child under 1 h old");
+    check (foreign.existsAsFile() && foreign.loadFileAsString() == "keep me", "mididrag: file beside the root survives");
+    check (other.getChildFile ("x.bin").existsAsFile(), "mididrag: folder beside the root survives");
+    // a root with another name is refused and left alone
+    const auto wrong = parent.getChildFile ("not_ours");
+    wrong.createDirectory();
+    wrong.getChildFile ("k.txt").replaceWithText ("k");
+    const int r = clearMidiDragTempRoot (wrong);
+    std::printf ("  wrong-name root: rc %d, file kept %d%c", r, (int) wrong.getChildFile ("k.txt").existsAsFile(), 10);
+    check (r == -1 && wrong.getChildFile ("k.txt").existsAsFile(), "mididrag: root with another name is refused");
+    base.deleteRecursively();
+}
+
+static void testMidiTempoMap (const juce::File& tmp)
+{
+    using WM = WarpMarkers::Marker;
+    constexpr double sr = 48000.0, tag = 120.0;
+    auto roundTrip = [&tmp] (const juce::MidiFile& f, const char* name)
+    {
+        const auto file = tmp.getChildFile (name);
+        file.deleteFile();
+        { juce::FileOutputStream o (file); f.writeTo (o); }
+        juce::MidiFile m;
+        juce::FileInputStream in (file);
+        if (! in.openedOk() || ! m.readFrom (in))
+            m = juce::MidiFile();
+        return m;
+    };
+    struct TE { double tick, bpm; };
+    auto tempos = [] (const juce::MidiFile& m)
+    {
+        std::vector<TE> r;
+        for (int t = 0; t < m.getNumTracks(); ++t)
+            for (const auto* e : *m.getTrack (t))
+                if (e->message.isTempoMetaEvent())
+                    r.push_back ({ e->message.getTimeStamp(), 60.0 / e->message.getTempoSecondsPerQuarterNote() });
+        return r;
+    };
+    // 1) 100 then 140 BPM from a 120 BPM source, one bar (96000 src frames) each.
+    const std::vector<WM> twoSeg { { 0, 0 }, { 96000, 115200 }, { 192000, 115200 + 82286 } };
+    const auto map = MidiExport::tempoMapFromWarp (twoSeg, tag, sr);
+    {
+        const auto m = roundTrip (MidiExport::buildTempoFile (tag, 0.0, 4, 6.0, 4, std::nullopt, map), "tmap.mid");
+        const auto te = tempos (m);
+        for (const auto& e : te)
+            std::printf ("  tempo event tick %.0f bpm %.4f%c", e.tick, e.bpm, 10);
+        const double want = 2.4 * 100.0 / 60.0 * MidiExport::kPpq; // 3840
+        const double got = te.size() >= 2 ? te[1].tick : -1.0;
+        std::printf ("  2 segs: %d tempo events (want 2), boundary tick want %.1f got %.0f%c", (int) te.size(), want, got, 10);
+        check (te.size() == 2 && std::abs (te[0].bpm - 100.0) < 0.01 && std::abs (te[1].bpm - 140.0) < 0.01,
+               "tempomap: 100 and 140 BPM segments give exactly two tempo events");
+        check (std::abs (got - want) <= 1.0, "tempomap: second tempo event within 1 tick of the boundary");
+    }
+    // 2) Merge tolerance: |d*accS - s*accD| <= 1.5*(accS+s) frames. For two 1-bar spans
+    // at 120 BPM / 48 kHz (96000 frames) that is 3 dst frames, ratio 3.1e-5, 0.0037 BPM.
+    {
+        const double tolBpm = tag * 1.5 * 192000.0 / (96000.0 * 96000.0);
+        std::printf ("  merge tolerance at 96000-frame spans: %.4f BPM (ratio %.2e)%c", tolBpm, tolBpm / tag, 10);
+        // One exact ratio 0.7 (171.4286 BPM), dst frames rounded: spans differ by a frame.
+        std::vector<WM> jitter;
+        for (int i = 0; i <= 6; ++i)
+            jitter.push_back ({ (std::int64_t) i * 33333, (std::int64_t) std::llround (i * 33333 * 0.7) });
+        const auto mj = MidiExport::tempoMapFromWarp (jitter, tag, sr);
+        std::printf ("  rounded dst spans (6 pairs): %d segments (want 1), bpm %.5f (want %.5f)%c",
+                     (int) mj.size(), mj.empty() ? 0.0 : mj[0].bpm, tag / 0.7, 10);
+        check (mj.size() == 1 && std::abs (mj[0].bpm - tag / 0.7) < 0.01, "tempomap: rounding-only neighbours merge to one segment");
+        const std::vector<WM> step { { 0, 0 }, { 96000, 96000 }, { 192000, 96000 + 95207 } };
+        const auto ms = MidiExport::tempoMapFromWarp (step, tag, sr);
+        const auto te = tempos (roundTrip (MidiExport::buildTempoFile (tag, 0.0, 4, 5.0, 4, std::nullopt, ms), "tstep.mid"));
+        std::printf ("  120 vs 121 step: %d segments, %d tempo events%c", (int) ms.size(), (int) te.size(), 10);
+        for (const auto& e : te)
+            std::printf ("    tick %.0f bpm %.4f%c", e.tick, e.bpm, 10);
+        check (ms.size() == 2 && te.size() == 2 && std::abs (te[1].bpm - 121.0) < 0.01,
+               "tempomap: a real 1 BPM step stays two tempo events");
+    }
+    // 3) Base tempo: ends pinned (total src == total dst), so the map averages to the tag.
+    {
+        const std::vector<WM> pinned { { 0, 0 }, { 96000, 110000 }, { 192000, 170000 }, { 288000, 288000 } };
+        const auto mp = MidiExport::tempoMapFromWarp (pinned, tag, sr);
+        const double dur = 288000.0 / sr;
+        const auto st = MidiExport::segTicks (mp);
+        const double avg = mp.size() >= 2 ? MidiExport::secToTicks (mp, st, dur) / dur * 60.0 / MidiExport::kPpq : 0.0;
+        std::printf ("  pinned 3 segs: %d segs, average bpm %.6f, error %.2e (limit 1e-3)%c", (int) mp.size(), avg, avg - tag, 10);
+        check (mp.size() == 3 && std::abs (avg - tag) < 1.0e-3, "tempomap: map averages to the tagged BPM");
+    }
+    // 4) Hits through the map land within 1 ms of source time, also after the change.
+    {
+        const std::vector<MidiExport::Hit> hits { { 0.5, 0.5f }, { 2.0, 0.5f }, { 2.9, 0.5f }, { 3.7, 0.5f }, { 4.1, 0.5f } };
+        auto m = roundTrip (MidiExport::buildHitsFile (hits, tag, 4, 4, std::nullopt, map), "thits.mid");
+        // The 2.9 s hit is 0.5 s into the 140 BPM segment: 3840 + 0.5 * 140 / 60 * 960 = 4960.
+        double tick29 = -1.0;
+        for (int t = 0; t < m.getNumTracks(); ++t)
+            for (const auto* e : *m.getTrack (t))
+                if (e->message.isNoteOn() && tick29 < 0.0 && e->message.getTimeStamp() > 4000.0)
+                    tick29 = e->message.getTimeStamp();
+        std::printf ("  hit 2.9 s at tick %.0f (want 4960)%c", tick29, 10);
+        check (std::abs (tick29 - 4960.0) <= 1.0, "tempomap: hit after the change on the 140 BPM tick");
+        m.convertTimestampTicksToSeconds();
+        std::vector<double> on;
+        for (int t = 0; t < m.getNumTracks(); ++t)
+            for (const auto* e : *m.getTrack (t))
+                if (e->message.isNoteOn())
+                    on.push_back (e->message.getTimeStamp());
+        double worst = on.size() == hits.size() ? 0.0 : 1.0e9;
+        for (size_t i = 0; i < on.size() && i < hits.size(); ++i)
+        {
+            std::printf ("  hit %.3f s -> %.5f s (err %.3f ms)%c", hits[i].sec, on[i], (on[i] - hits[i].sec) * 1000.0, 10);
+            worst = std::max (worst, std::abs (on[i] - hits[i].sec));
+        }
+        std::printf ("  worst hit error %.3f ms (limit 1 ms)%c", worst * 1000.0, 10);
+        check (worst <= 0.001, "tempomap: hits within 1 ms of source time through the map");
+    }
+}
+
+// Export WAV and drag to DAW with a warp in effect (R3): while the take editor shows the
+// take with Warp on and a moved marker, dragFileFor and the Export source are a render of
+// the lasting file by TakeStretch::renderWarped (what Play hears), cached by take and
+// marker list; with no warp both stay the lasting file. 8 s and 30 s takes, render time
+// printed. Teeth: HSLINK_TEETH=NO_WARP_EXPORT (the editor ignores the warp, as before R3).
+// MIDI export, end to end through the editor: re-parse both files with juce::MidiFile.
+// HSLINK_TEETH=MIDI_FIXED_120 (writer at 120 BPM), MIDI_SHIFT_HITS (hits one onset hop
+// late), NO_WARP_TAG (the warped WAV keeps the source tempo tag).
+static void testMidiExport (const juce::File& tmp)
+{
+    using P = HotStepLinkProcessor;
+    const auto mut = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    const int midiMut = mut == "MIDI_FIXED_120" ? 1 : mut == "MIDI_SHIFT_HITS" ? 2 : 0;
+    std::printf ("  mutant '%s' (midi %d)%c", mut.toRawUTF8(), midiMut, 10);
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = true;
+    const auto d = tmp.getChildFile ("midiexport_test");
+    d.deleteRecursively();
+    d.createDirectory();
+    auto readMidi = [] (const juce::File& f, juce::MidiFile& m)
+    {
+        juce::FileInputStream in (f);
+        return in.openedOk() && m.readFrom (in);
+    };
+    struct Parsed { double bpm = 0.0; int num = 0, den = 0, ppq = 0, badNotes = 0; std::vector<double> barTicks, noteTicks; std::vector<int> vel; };
+    auto parse = [] (const juce::MidiFile& m)
+    {
+        Parsed r;
+        r.ppq = m.getTimeFormat();
+        for (int t = 0; t < m.getNumTracks(); ++t)
+        {
+            const auto* seq = m.getTrack (t);
+            for (int i = 0; i < seq->getNumEvents(); ++i)
+            {
+                const auto& msg = seq->getEventPointer (i)->message;
+                if (msg.isTempoMetaEvent() && r.bpm == 0.0)
+                    r.bpm = 60.0 / msg.getTempoSecondsPerQuarterNote();
+                else if (msg.isTimeSignatureMetaEvent())
+                    msg.getTimeSignatureInfo (r.num, r.den);
+                else if (msg.isTextMetaEvent() && msg.getMetaEventType() == 6 && msg.getTextFromTextMetaEvent().startsWith ("Bar "))
+                    r.barTicks.push_back (msg.getTimeStamp());
+                else if (msg.isNoteOn())
+                {
+                    r.noteTicks.push_back (msg.getTimeStamp());
+                    r.vel.push_back ((int) msg.getVelocity());
+                    if (msg.getNoteNumber() != 36 || msg.getChannel() != 10)
+                        ++r.badNotes;
+                }
+            }
+        }
+        return r;
+    };
+    auto readWav = [] (const juce::File& f, double& sr)
+    {
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatReader> rd (wav.createReaderFor (new juce::FileInputStream (f), true));
+        juce::AudioBuffer<float> b;
+        if (rd == nullptr)
+            return b;
+        sr = rd->sampleRate;
+        b.setSize ((int) rd->numChannels, (int) rd->lengthInSamples);
+        rd->read (&b, 0, b.getNumSamples(), 0, true, true);
+        return b;
+    };
+    auto acidTempo = [] (const juce::File& f, bool& has)
+    {
+        juce::MemoryBlock mb;
+        f.loadFileAsData (mb);
+        const auto* b = static_cast<const juce::uint8*> (mb.getData());
+        float tempo = 0.0f;
+        has = false;
+        for (size_t pos = 12; pos + 8 <= mb.getSize();)
+        {
+            const auto size = (size_t) juce::ByteOrder::littleEndianInt (b + pos + 4);
+            if (pos + 8 + size > mb.getSize())
+                break;
+            if (std::memcmp (b + pos, "acid", 4) == 0 && size >= 24)
+            {
+                has = true;
+                std::memcpy (&tempo, b + pos + 28, 4);
+            }
+            pos += 8 + size + (size & 1u);
+        }
+        return (double) tempo;
+    };
+    auto makeTake = [&] (P& p, const juce::String& name, const juce::AudioBuffer<float>& b, double bpm, double seconds, int k)
+    {
+        const auto take = d.getChildFile ("dl").getChildFile (name);
+        take.getParentDirectory().createDirectory();
+        writeWav (take, b, 48000.0);
+        p.setStableRoot (d.getChildFile ("stable" + juce::String (k)));
+        p.setCollectionRoot (d.getChildFile ("coll" + juce::String (k)));
+        DawJob j;
+        j.localId = 1;
+        j.request.caption = "midi export";
+        j.request.expectedBackend = "sa3";
+        j.request.bpm = bpm;
+        j.request.seed = 1;
+        j.request.durationS = seconds;
+        j.takeFiles.add (take);
+        j.takeSeeds.add (1);
+        p.registerTakeAndWait (j, 0);
+        p.waitTakeMeasureIdle();
+    };
+
+    // 1. Clicks at 123.45 BPM, 16 hits, four peak levels.
+    {
+        const double bpm = 123.45, offset = 0.30, sr = 48000.0;
+        const float gains[] = { 0.9f, 0.5f, 0.25f, 0.1f };
+        std::vector<TempoTest::Hit> hs;
+        std::vector<double> truth;
+        std::vector<float> truthGain;
+        for (int k = 0; k < 16; ++k)
+        {
+            const double t = offset + 60.0 * k / bpm;
+            const float g = gains[(k * 3) % 4];
+            hs.push_back ({ t, TempoTest::click, g });
+            truth.push_back (t);
+            truthGain.push_back (g);
+        }
+        const double seconds = truth.back() + 1.0;
+        const auto x = TempoTest::render (hs, sr, seconds);
+        juce::AudioBuffer<float> b (2, (int) x.size());
+        b.copyFrom (0, 0, x.data(), (int) x.size());
+        b.copyFrom (1, 0, x.data(), (int) x.size());
+        auto p = std::make_unique<P>();
+        makeTake (*p, "midi_clicks.wav", b, bpm, seconds, 0);
+        p->hostSync.timeSigNum.store (4);
+        const auto takes = p->getTakes();
+        check (! takes.empty(), "midiexport: clicks take listed");
+        if (! takes.empty())
+        {
+            auto ed = std::make_unique<HotStepLinkEditor> (*p);
+            ed->midiSyncForTest = true;
+            ed->midiMutantForTest = midiMut;
+            ed->runRefreshForTest();
+            ed->selectTakeForTest (takes[0].name);
+            ed->runRefreshForTest();
+            ed->exportMidiForTest();
+            ed->runRefreshForTest();
+            const auto tf = ed->lastMidiTempoForTest(), hf = ed->lastMidiHitsForTest();
+            juce::MidiFile tm, hm;
+            const bool okT = tf.existsAsFile() && readMidi (tf, tm);
+            const bool okH = hf.existsAsFile() && readMidi (hf, hm);
+            check (okT && okH, "midiexport: both files written and parsed");
+            const auto pt = parse (tm);
+            const auto ph = parse (hm);
+            std::printf ("  clicks: tempo file bpm=%.4f (true %.4f, diff %.4f) sig %d/%d ppq %d bars=%d; hits file bpm=%.4f notes=%d%c",
+                         pt.bpm, bpm, std::abs (pt.bpm - bpm), pt.num, pt.den, pt.ppq, (int) pt.barTicks.size(), ph.bpm, (int) ph.noteTicks.size(), 10);
+            check (std::abs (pt.bpm - bpm) <= 0.01 && std::abs (ph.bpm - bpm) <= 0.01, "midiexport: tempo within 0.01 bpm in both files");
+            check (pt.num == 4 && pt.den == 4, "midiexport: time signature 4/4 present");
+            // Bar markers: every bar inside the clicks starts on a true click, one bar apart.
+            const double tpsT = pt.bpm / 60.0 * pt.ppq;
+            const double barTicks = 4.0 * pt.ppq;
+            double worstBar = 0.0, worstStep = 0.0;
+            for (size_t i = 0; i < pt.barTicks.size(); ++i)
+            {
+                const double s = pt.barTicks[i] / tpsT;
+                double best = 1e9;
+                for (double t : truth)
+                    best = std::min (best, std::abs (t - s));
+                if (s <= truth.back() + 0.01)
+                    worstBar = std::max (worstBar, best);
+                if (i > 0 && pt.barTicks[i - 1] > 0.0)
+                    worstStep = std::max (worstStep, std::abs (pt.barTicks[i] - pt.barTicks[i - 1] - barTicks));
+            }
+            std::printf ("  clicks: bar markers worst distance to a click %.3f ms, worst step error %.1f ticks (bar %.0f ticks)%c", worstBar * 1000.0, worstStep, barTicks, 10);
+            check (pt.barTicks.size() >= 4 && worstBar <= 0.002 && worstStep <= 1.0, "midiexport: Bar markers on the bar ticks");
+            // Hits against the detected onsets of the same source file and the true clicks.
+            double osr = 0.0;
+            const auto srcWav = hf.getSiblingFile (hf.getFileNameWithoutExtension().dropLastCharacters (5) + ".wav");
+            const auto buf = readWav (srcWav, osr);
+            std::vector<float> mono ((size_t) buf.getNumSamples(), 0.0f);
+            for (int ch = 0; ch < buf.getNumChannels(); ++ch)
+                for (size_t i = 0; i < mono.size(); ++i)
+                    mono[i] += buf.getSample (ch, (int) i) / (float) juce::jmax (1, buf.getNumChannels());
+            const auto ons = TempoMeasure::onsets (mono.data(), mono.size(), osr);
+            const double tpsH = ph.bpm / 60.0 * ph.ppq;
+            double worstOn = 0.0, worstTrue = 0.0;
+            std::vector<float> noteGain;
+            for (size_t i = 0; i < ph.noteTicks.size(); ++i)
+            {
+                const double s = ph.noteTicks[i] / tpsH;
+                if (i < ons.size())
+                    worstOn = std::max (worstOn, std::abs (s - ons[i].sec));
+                double best = 1e9;
+                size_t bi = 0;
+                for (size_t k = 0; k < truth.size(); ++k)
+                    if (std::abs (truth[k] - s) < best)
+                    {
+                        best = std::abs (truth[k] - s);
+                        bi = k;
+                    }
+                worstTrue = std::max (worstTrue, best);
+                noteGain.push_back (truthGain[bi]);
+            }
+            std::printf ("  clicks: src %s, onsets=%d notes=%d; worst note vs onset %.3f ms, vs true click %.3f ms; bad note/channel=%d%c",
+                         srcWav.getFileName().toRawUTF8(), (int) ons.size(), (int) ph.noteTicks.size(), worstOn * 1000.0, worstTrue * 1000.0, ph.badNotes, 10);
+            check (ph.noteTicks.size() == 16 && ons.size() == 16, "midiexport: 16 hits for 16 clicks");
+            check (worstOn <= 0.001, "midiexport: hit notes within 1 ms of the detected onsets");
+            check (worstTrue <= 0.002, "midiexport: hit notes within 2 ms of the true clicks");
+            check (ph.badNotes == 0 && ! ph.noteTicks.empty(), "midiexport: note 36 on channel 10");
+            int inversions = 0, pairs = 0;
+            for (size_t i = 0; i < noteGain.size(); ++i)
+                for (size_t j = 0; j < noteGain.size(); ++j)
+                    if (noteGain[i] > noteGain[j])
+                    {
+                        ++pairs;
+                        inversions += ph.vel[i] > ph.vel[j] ? 0 : 1;
+                    }
+            juce::String vs;
+            for (size_t i = 0; i < ph.vel.size() && i < 4; ++i)
+                vs << "g" << juce::String (noteGain[i], 2) << "=v" << ph.vel[i] << " ";
+            std::printf ("  clicks: velocity %s; louder-quieter pairs=%d not strictly ordered=%d%c", vs.toRawUTF8(), pairs, inversions, 10);
+            check (pairs > 0 && inversions == 0, "midiexport: velocity follows the peak level");
+            ed.reset();
+        }
+        p.reset();
+    }
+
+    // 2. Warp: a 120 BPM take warped to a 128 BPM host. The tempo file and the warped
+    //    WAV's acid tag both say 128.
+    {
+        const double seconds = 8.0;
+        auto x = TempoTest::render (TempoTest::drums (TempoTest::steadyBeats (120.0, 0.0, seconds)), 48000.0, seconds);
+        juce::AudioBuffer<float> b (2, (int) x.size());
+        b.copyFrom (0, 0, x.data(), (int) x.size());
+        b.copyFrom (1, 0, x.data(), (int) x.size());
+        auto p = std::make_unique<P>();
+        makeTake (*p, "midi_warp.wav", b, 120.0, seconds, 1);
+        p->hostSync.bpm.store (128.0);
+        p->hostSync.timeSigNum.store (4);
+        p->hostSync.bpmKnown.store (true);
+        p->hostSync.hostSyncActive.store (true); // a real host session; else the manual tempo (120) wins
+        const auto takes = p->getTakes();
+        check (! takes.empty(), "midiexport: warp take listed");
+        if (! takes.empty())
+        {
+            auto ed = std::make_unique<HotStepLinkEditor> (*p);
+            ed->midiSyncForTest = true;
+            ed->midiMutantForTest = midiMut;
+            ed->noWarpTagForTest = mut == "NO_WARP_TAG";
+            ed->runRefreshForTest();
+            ed->selectTakeForTest (takes[0].name);
+            ed->runRefreshForTest();
+            const bool opened = ed->openTakeEditorForTest();
+            auto& panel = ed->getTakeEditorForTest();
+            for (int i = 0; i < 1000 && opened && ! panel.peaksReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+            {
+                juce::Thread::sleep (10);
+                ed->runRefreshForTest();
+            }
+            panel.setWarpForTest (true);
+            panel.clickWarpToHostForTest();
+            const auto warped = ed->dragFileForTest (takes[0].name);
+            ed->exportMidiForTest();
+            ed->runRefreshForTest();
+            const auto tf = ed->lastMidiTempoForTest();
+            juce::MidiFile tm;
+            const bool okT = tf.existsAsFile() && readMidi (tf, tm);
+            const auto pt = parse (tm);
+            bool hasAcid = false;
+            const double tag = acidTempo (warped, hasAcid);
+            std::printf ("  warp: opened=%d warped=%s (is source %d) tempo file %s bpm=%.4f diff=%.4f; acid=%d tag=%.4f diff=%.4f (target 128, panel %.4f)%c",
+                         opened ? 1 : 0, warped.getFileName().toRawUTF8(), warped == takes[0].stable ? 1 : 0, tf.getFileName().toRawUTF8(), pt.bpm,
+                         std::abs (pt.bpm - 128.0), hasAcid ? 1 : 0, tag, std::abs (tag - 128.0), panel.warpResultBpm(), 10);
+            check (okT && warped != takes[0].stable && tf.getParentDirectory() == warped.getParentDirectory(), "midiexport: warp, the MIDI comes from the warped file");
+            check (okT && std::abs (pt.bpm - 128.0) <= 0.01, "midiexport: warp, the tempo file says the target 128 within 0.01");
+            check (hasAcid && std::abs (tag - 128.0) <= 0.01, "midiexport: warp, the warped WAV's acid tag says 128 within 0.01");
+            ed.reset();
+        }
+        p.reset();
+    }
+    P::tempoMeasureEnabled = savedMeasure;
+    d.deleteRecursively();
+}
+
+static void testTakeExport (const juce::File& tmp)
+{
+    using P = HotStepLinkProcessor;
+    const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_WARP_EXPORT";
+    std::printf ("  mutant NO_WARP_EXPORT=%d%c", teeth ? 1 : 0, 10);
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = true; // the warp markers sit on the measured grid
+    const auto d = tmp.getChildFile ("takeexport_test");
+    d.createDirectory();
+    auto readAll = [] (const juce::File& f, double& sr)
+    {
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatReader> rd (wav.createReaderFor (new juce::FileInputStream (f), true));
+        juce::AudioBuffer<float> b;
+        if (rd == nullptr)
+            return b;
+        sr = rd->sampleRate;
+        b.setSize ((int) rd->numChannels, (int) rd->lengthInSamples);
+        rd->read (&b, 0, b.getNumSamples(), 0, true, true);
+        return b;
+    };
+    auto maxDiff = [] (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b)
+    {
+        double m = 0.0;
+        const int n = juce::jmin (a.getNumSamples(), b.getNumSamples());
+        for (int c = 0; c < juce::jmin (a.getNumChannels(), b.getNumChannels()); ++c)
+            for (int i = 0; i < n; ++i)
+                m = juce::jmax (m, (double) std::abs (a.getSample (c, i) - b.getSample (c, i)));
+        return m;
+    };
+    const double lens[] = { 8.0, 30.0 };
+    for (int k = 0; k < 2; ++k)
+    {
+        const double seconds = lens[k];
+        const auto take = d.getChildFile ("dl").getChildFile ("take_export_" + juce::String ((int) seconds) + "s.wav");
+        take.getParentDirectory().createDirectory();
+        auto x = TempoTest::render (TempoTest::drums (TempoTest::steadyBeats (120.0, 0.0, seconds)), 48000.0, seconds);
+        juce::AudioBuffer<float> b (2, (int) x.size());
+        b.copyFrom (0, 0, x.data(), (int) x.size());
+        b.copyFrom (1, 0, x.data(), (int) x.size());
+        writeWav (take, b, 48000.0);
+        auto p = std::make_unique<P>();
+        p->setStableRoot (d.getChildFile ("stable" + juce::String (k)));
+        p->setCollectionRoot (d.getChildFile ("coll" + juce::String (k)));
+        DawJob j;
+        j.localId = 1;
+        j.request.caption = "take export";
+        j.request.expectedBackend = "sa3";
+        j.request.bpm = 120.0;
+        j.request.seed = 1;
+        j.request.durationS = seconds;
+        j.takeFiles.add (take);
+        j.takeSeeds.add (1);
+        p->registerTakeAndWait (j, 0);
+        p->waitTakeMeasureIdle();
+        p->hostSync.bpm.store (100.0);
+        p->hostSync.timeSigNum.store (4);
+        p->hostSync.bpmKnown.store (true);
+        const auto takes = p->getTakes();
+        if (takes.empty())
+        {
+            check (false, "takeexport: take listed");
+            continue;
+        }
+        const auto stable = takes[0].stable;
+        auto ed = std::make_unique<HotStepLinkEditor> (*p);
+        ed->noWarpExportForTest = teeth;
+        ed->runRefreshForTest();
+        ed->selectTakeForTest (takes[0].name);
+        ed->runRefreshForTest();
+        const bool opened = ed->openTakeEditorForTest();
+        auto& panel = ed->getTakeEditorForTest();
+        for (int i = 0; i < 1000 && opened && ! panel.peaksReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            ed->runRefreshForTest();
+        }
+        const juce::String tag = juce::String ((int) seconds) + " s take";
+        // No warp in effect: both hand out the lasting file unchanged.
+        const auto drag0 = ed->dragFileForTest (takes[0].name);
+        const auto exp0 = ed->exportSourceForTest();
+        std::printf ("  %s: no warp drag=%s export=%s stable=%s%c", tag.toRawUTF8(), drag0.getFileName().toRawUTF8(), exp0.getFileName().toRawUTF8(),
+                     stable.getFileName().toRawUTF8(), 10);
+        check (opened && stable != juce::File() && drag0 == stable && exp0 == stable, ("takeexport: " + tag + ", no warp: drag and Export give the lasting file").toRawUTF8());
+        panel.setWarpForTest (true);
+        check (ed->dragFileForTest (takes[0].name) == stable, ("takeexport: " + tag + ", Warp on with no moved marker: drag gives the lasting file").toRawUTF8());
+        panel.clickWarpToHostForTest();
+        const auto markers = panel.warpMarkersForTest();
+        const int moved = WarpMarkers::movedCount (markers);
+        double sr = 0.0;
+        const auto src = readAll (stable, sr);
+        const auto ref = TakeStretch::renderWarped (src, sr, markers);
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        const auto drag1 = ed->dragFileForTest (takes[0].name);
+        const auto t1 = juce::Time::getMillisecondCounterHiRes();
+        const auto drag2 = ed->dragFileForTest (takes[0].name);
+        const auto t2 = juce::Time::getMillisecondCounterHiRes();
+        const auto exp1 = ed->exportSourceForTest();
+        double osr = 0.0;
+        const auto got = readAll (drag1, osr);
+        const auto gotE = readAll (exp1, osr);
+        const double dDrag = maxDiff (got, ref), dExp = maxDiff (gotE, ref);
+        std::printf ("  %s: markers=%d moved=%d src frames=%d warped ref frames=%d; drag frames=%d export frames=%d; max abs diff drag=%.3g export=%.3g; "
+                     "first drag %.1f ms, repeat %.2f ms (cached=%d)%c",
+                     tag.toRawUTF8(), (int) markers.size(), moved, src.getNumSamples(), ref.getNumSamples(), got.getNumSamples(), gotE.getNumSamples(), dDrag, dExp,
+                     t1 - t0, t2 - t1, drag2 == drag1 ? 1 : 0, 10);
+        check (moved > 0 && ref.getNumSamples() > 0 && ref.getNumSamples() != src.getNumSamples(), ("takeexport: " + tag + ", the warp changes the length").toRawUTF8());
+        check (drag1 != stable && got.getNumSamples() == ref.getNumSamples() && dDrag <= 1e-6, ("takeexport: " + tag + ", drag gives the warped render (within 1e-6)").toRawUTF8());
+        check (exp1 != stable && gotE.getNumSamples() == ref.getNumSamples() && dExp <= 1e-6, ("takeexport: " + tag + ", Export WAV gives the warped render (within 1e-6)").toRawUTF8());
+        check (drag2 == drag1 && exp1 == drag1, ("takeexport: " + tag + ", a repeated drag and Export reuse the cached render").toRawUTF8());
+        // Cache cap and tempo tag (HSLINK_TEETH=NO_WARP_CAP / NO_WARP_TAG = the code before).
+        {
+            const auto mut = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+            ed->noWarpCacheCapForTest = mut == "NO_WARP_CAP";
+            ed->noWarpTagForTest = mut == "NO_WARP_TAG";
+            const auto wdir = drag1.getParentDirectory();
+            const auto now = juce::Time::getCurrentTime();
+            juce::Array<juce::File> fakes;
+            for (int i = 0; i < 70; ++i) // i = 0 newest (2 h old) .. 69 oldest (71 h old)
+            {
+                const auto f = wdir.getChildFile ("fake" + juce::String (i) + "_warp_" + juce::String::toHexString ((juce::int64) i) + ".wav");
+                f.replaceWithText ("x");
+                f.setLastModificationTime (now - juce::RelativeTime::hours (2 + i));
+                fakes.add (f);
+            }
+            const auto other = wdir.getChildFile ("keepme.txt");
+            other.replaceWithText ("x");
+            other.setLastModificationTime (now - juce::RelativeTime::days (30));
+            const int before = wdir.findChildFiles (juce::File::findFiles, false, "*_warp_*.wav").size();
+            drag1.deleteFile();
+            const auto drag3 = ed->dragFileForTest (takes[0].name); // a new write
+            const int after3 = wdir.findChildFiles (juce::File::findFiles, false, "*_warp_*.wav").size();
+            int oldGone = 0, newKept = 0;
+            for (int i = 63; i < 70; ++i) oldGone += fakes[i].existsAsFile() ? 0 : 1;
+            for (int i = 0; i < 63; ++i) newKept += fakes[i].existsAsFile() ? 1 : 0;
+            std::printf ("  %s: cache before write=%d after=%d (cap %d) oldest 7 gone=%d newest 63 kept=%d current kept=%d other file kept=%d%c",
+                         tag.toRawUTF8(), before, after3, HotStepLinkEditor::kWarpCacheMax, oldGone, newKept, drag3.existsAsFile() ? 1 : 0, other.existsAsFile() ? 1 : 0, 10);
+            check (after3 <= 64 && oldGone == 7 && newKept == 63 && drag3 == drag1 && drag3.existsAsFile() && other.existsAsFile(),
+                   ("takeexport: " + tag + ", the warp cache is capped at 64, oldest first, current and foreign files kept").toRawUTF8());
+            // Tempo tag: the acid chunk of the warped file at the warp target tempo.
+            const double want = panel.warpResultBpm();
+            juce::MemoryBlock mb;
+            drag3.loadFileAsData (mb);
+            const auto* b = static_cast<const juce::uint8*> (mb.getData());
+            float tempo = 0.0f;
+            bool hasAcid = false;
+            for (size_t pos = 12; pos + 8 <= mb.getSize();)
+            {
+                const auto size = (size_t) juce::ByteOrder::littleEndianInt (b + pos + 4);
+                if (pos + 8 + size > mb.getSize())
+                    break;
+                if (std::memcmp (b + pos, "acid", 4) == 0 && size >= 24)
+                {
+                    hasAcid = true;
+                    std::memcpy (&tempo, b + pos + 28, 4);
+                }
+                pos += 8 + size + (size & 1u);
+            }
+            std::printf ("  %s: warped file acid=%d tempo=%.4f target=%.4f diff=%.4f%c", tag.toRawUTF8(), hasAcid ? 1 : 0, (double) tempo, want, std::abs ((double) tempo - want), 10);
+            check (hasAcid && want > 0.0 && std::abs ((double) tempo - want) <= 0.01, ("takeexport: " + tag + ", the warped file carries the target tempo tag").toRawUTF8());
+            for (auto& f : fakes) f.deleteFile();
+            other.deleteFile();
+            ed->noWarpCacheCapForTest = ed->noWarpTagForTest = false;
+        }
+        // Warp off again: back to the lasting file, which was never changed.
+        panel.setWarpForTest (false);
+        double ssr = 0.0;
+        const auto after = readAll (stable, ssr);
+        check (ed->dragFileForTest (takes[0].name) == stable && ed->exportSourceForTest() == stable && after.getNumSamples() == src.getNumSamples() && maxDiff (after, src) == 0.0,
+               ("takeexport: " + tag + ", Warp off: the lasting file again, unchanged").toRawUTF8());
+        ed.reset();
+        p.reset();
+    }
+    P::tempoMeasureEnabled = savedMeasure;
+    d.deleteRecursively();
+}
+
+// Take editor warp marker editing (4bf2d3d, 0da44e7, 4d06a6c): double-click on empty space
+// adds a marker at the clicked source frame with the warped position kept (the render does
+// not change), the 64-frame gap refusal, Alt+click removal with the anchors kept, the
+// double-click reset of a marker, Reset markers after an add, the edited list reaching the
+// audition and Apply warp, and the ruler label spacing at 1x, 4x and 8x. Real
+// juce::MouseEvent objects. Teeth (HSLINK_TEETH): TM_NO_GAP, TM_ANCHOR, TM_NO_MAP
+// (WarpMarkers mutants 5, 6, 7), TM_RESET, TM_TAG_TIGHT (TakeEditorMath).
+static void testTakeMarkers (const juce::File& tmp)
+{
+    std::printf ("Take markers: add, gap, remove, anchors, reset, audition and apply lists, ruler labels%c", 10);
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&checks] (bool ok, const char* what) { ++checks; check (ok, what); };
+    using P = HotStepLinkProcessor;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    WarpMarkers::testMutant = teethVar == "TM_NO_GAP" ? WarpMarkers::mutNoInsertGap : teethVar == "TM_ANCHOR" ? WarpMarkers::mutRemoveAnchor
+                            : teethVar == "TM_NO_MAP" ? WarpMarkers::mutInsertNoMap : WarpMarkers::mutNone;
+    TakeEditorMath::testMutant = teethVar == "TM_RESET" ? TakeEditorMath::mutResetMovedOnly : teethVar == "TM_TAG_TIGHT" ? TakeEditorMath::mutTagTight : teethVar == "TM_RULER_CLIP" ? TakeEditorMath::mutRulerAlwaysClip : TakeEditorMath::mutNone;
+    std::printf ("  mutants: warp=%d editor=%d (0 = none)%c", WarpMarkers::testMutant.load(), TakeEditorMath::testMutant.load(), 10);
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("takemarkers_test");
+    d.createDirectory();
+    const int kFrames = 16 * 48000; // 16 s: 8 bars at 120 bpm
+    juce::AudioBuffer<float> audio (2, kFrames);
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < kFrames; ++i)
+            audio.setSample (c, i, 0.25f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * (220.0 + 110.0 * c) * i / 48000.0));
+    const auto file = writeWav (d.getChildFile ("markers.wav"), audio, 48000.0);
+
+    TakeEditorPanel panel;
+    juce::uint32 clock = 1000;
+    panel.setSize (490, 566);
+    panel.clockForTest = [&clock] { return clock; };
+    panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+    TakeEditorPanel::Take take;
+    take.temp = file;
+    take.name = "markers.wav";
+    take.grid.bpm = 120.0;
+    take.grid.downbeatSec = 0.0;
+    take.grid.measured = true;
+    panel.open (take);
+    for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+    {
+        juce::Thread::sleep (10);
+        panel.tick();
+    }
+    panel.setWarpForTest (true);
+    panel.setSnapGridForTest (false);
+    panel.resized();
+    const auto len = panel.getLengthForTest();
+    const auto wa = panel.waveAreaForTest();
+    const auto lane = panel.warpLaneForTest();
+    const int n0 = (int) panel.warpMarkersForTest().size();
+    std::printf ("  length=%lld width=%d auto markers=%d (want 9)%c", (long long) len, wa.getWidth(), n0, 10);
+    ck (len == kFrames && n0 == 9, "0: the take opens with 9 auto-placed markers (bars and both anchors)");
+
+    auto mev = [&panel] (juce::Point<int> pos, juce::ModifierKeys mods, int clicks)
+    {
+        const auto t = juce::Time::getCurrentTime();
+        return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos.toFloat(), mods, juce::MouseInputSource::defaultPressure,
+                                 juce::MouseInputSource::defaultOrientation, juce::MouseInputSource::defaultRotation, juce::MouseInputSource::defaultTiltX,
+                                 juce::MouseInputSource::defaultTiltY, &panel, &panel, t, pos.toFloat(), t, clicks, false);
+    };
+    const auto L = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
+    const auto altL = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier | juce::ModifierKeys::altModifier);
+    auto dbl = [&] (juce::Point<int> p) { static_cast<juce::Component&> (panel).mouseDoubleClick (mev (p, L, 2)); };
+    auto altClick = [&] (juce::Point<int> p)
+    {
+        static_cast<juce::Component&> (panel).mouseDown (mev (p, altL, 1));
+        static_cast<juce::Component&> (panel).mouseUp (mev (p, altL, 1));
+    };
+    // The wave x (panel coordinates) nearest to warped frame f in the current view.
+    auto xFor = [&panel, &wa] (double f) { const auto v = panel.viewForTest(); return wa.getX() + (int) std::lround ((f - (double) v.firstFrame) / v.framesPerPixel); };
+    auto clickedDst = [&panel, &wa] (int x) { return (double) TakeEditorMath::frameAtX (panel.viewForTest(), (double) (x - wa.getX())); };
+    auto laneX = [&panel, &lane] (std::size_t i) { return lane.getX() + (int) std::floor (TakeEditorMath::xOfFrame (panel.viewForTest(), panel.warpMarkersForTest()[i].dstFrame)); };
+    auto sorted = [&panel]
+    {
+        const auto& m = panel.warpMarkersForTest();
+        for (std::size_t i = 0; i + 1 < m.size(); ++i)
+            if (! (m[i].srcFrame < m[i + 1].srcFrame && m[i].dstFrame < m[i + 1].dstFrame))
+                return false;
+        return true;
+    };
+    auto findSrc = [&panel] (double src, double tol)
+    {
+        const auto& m = panel.warpMarkersForTest();
+        for (std::size_t i = 0; i < m.size(); ++i)
+            if (std::abs ((double) m[i].srcFrame - src) <= tol)
+                return (int) i;
+        return -1;
+    };
+
+    // Setup: markers 1 and 2 moved +4800 frames, so region 1-2 is a copy shifted by 4800.
+    const juce::int64 kShift = 4800;
+    panel.dragWarpForTest (1, 96000 + kShift);
+    panel.dragWarpForTest (2, 192000 + kShift);
+    ck (WarpMarkers::movedCount (panel.warpMarkersForTest()) == 2, "0: setup moved markers 1 and 2");
+
+    // 1. Double-click at 1x on empty wave space inside region 1-2 adds one marker.
+    {
+        const auto before = panel.warpMarkersForTest();
+        const auto r0 = TakeStretch::renderWarped (audio, 48000.0, before);
+        const int x = xFor (144000.0 + (double) kShift);
+        const double fpp = panel.viewForTest().framesPerPixel;
+        const double wantSrc = clickedDst (x) - (double) kShift;
+        dbl ({ x, wa.getCentreY() });
+        const auto after = panel.warpMarkersForTest();
+        const int k = findSrc (wantSrc, fpp);
+        const double gotSrc = k >= 0 ? (double) after[(size_t) k].srcFrame : -1.0;
+        const double gotDst = k >= 0 ? (double) after[(size_t) k].dstFrame : -1.0;
+        const double wantDst = (double) WarpMarkers::mapFrame (before, (juce::int64) gotSrc, true);
+        const auto r1 = TakeStretch::renderWarped (audio, 48000.0, after);
+        float md = r0.getNumSamples() == r1.getNumSamples() && r0.getNumSamples() > 0 ? 0.0f : 1.0e9f;
+        if (md == 0.0f)
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < r0.getNumSamples(); ++i)
+                    md = juce::jmax (md, std::abs (r0.getSample (c, i) - r1.getSample (c, i)));
+        std::printf ("  1: 1x x=%d count %d -> %d (want +1) src=%.0f want %.0f (tol %.1f) dst=%.0f want %.0f sorted=%d render len %d/%d max diff %.3g (want < 1e-6)%c",
+                     x, (int) before.size(), (int) after.size(), gotSrc, wantSrc, fpp, gotDst, wantDst, (int) sorted(), r0.getNumSamples(), r1.getNumSamples(), (double) md, 10);
+        ck (after.size() == before.size() + 1 && k >= 0, "1: one marker added at the clicked source frame (within 1 px) at 1x");
+        ck (k >= 0 && gotDst == wantDst && sorted(), "1: its dst is the prior warped position and the list stays sorted");
+        ck (md < 1.0e-6f, "1: the warped render before and after the add is identical");
+    }
+
+    // 2. The same at 4x, in region 1-2 to the left of the first add.
+    {
+        panel.zoomByForTest (4.0, 0.0);
+        const double fpp = panel.viewForTest().framesPerPixel;
+        const auto n = panel.warpMarkersForTest().size();
+        const int x = xFor (120000.0 + (double) kShift);
+        const double wantSrc = clickedDst (x) - (double) kShift;
+        dbl ({ x, wa.getCentreY() });
+        const int k = findSrc (wantSrc, fpp);
+        const auto& m = panel.warpMarkersForTest();
+        std::printf ("  2: 4x fpp=%.1f x=%d count %d -> %d src=%.0f want %.0f dst-src=%lld (want %lld) sorted=%d%c", fpp, x, (int) n, (int) m.size(),
+                     k >= 0 ? (double) m[(size_t) k].srcFrame : -1.0, wantSrc, k >= 0 ? (long long) (m[(size_t) k].dstFrame - m[(size_t) k].srcFrame) : -1LL, (long long) kShift, (int) sorted(), 10);
+        ck (m.size() == n + 1 && k >= 0 && m[(size_t) k].dstFrame - m[(size_t) k].srcFrame == kShift && sorted(), "2: at 4x one marker added within 1 px, warped position kept");
+    }
+
+    // 3. An add within 64 frames of a marker (marker 3, frame 288000, unmoved) is refused.
+    {
+        for (int i = 0; i < 30; ++i)
+            panel.zoomByForTest (2.0, 0.0);
+        panel.setViewStartForTest (288000 - 100 * 64 + 32); // pixels fall half a step off the marker
+        const auto v = panel.viewForTest();
+        int x = -1;
+        juce::int64 f = 0;
+        for (int xi = 0; xi < wa.getWidth(); ++xi)
+        {
+            const auto fi = TakeEditorMath::frameAtX (v, (double) xi);
+            if (fi != 288000 && std::abs (fi - 288000) <= 63 && (x < 0 || std::abs (fi - 288000) < std::abs (f - 288000)))
+            {
+                x = wa.getX() + xi;
+                f = fi;
+            }
+        }
+        const auto n = panel.warpMarkersForTest().size();
+        if (x >= 0)
+            dbl ({ x, wa.getCentreY() });
+        const auto m = panel.warpMarkersForTest().size();
+        std::printf ("  3: view first=%lld fpp=%.3f click %lld frames from marker 288000: count %d -> %d (want unchanged)%c", (long long) v.firstFrame, v.framesPerPixel, (long long) (f - 288000), (int) n, (int) m, 10);
+        ck (x >= 0 && m == n, "3: an add within 64 frames of a marker is refused");
+        panel.zoomByForTest (0.0001, 0.0);
+    }
+
+    // 4. Alt+click removes the added marker at 144000; the anchors stay.
+    {
+        const int k = findSrc (144000.0, 2000.0);
+        const auto n = panel.warpMarkersForTest().size();
+        if (k >= 0)
+            altClick ({ laneX ((size_t) k), lane.getCentreY() });
+        const auto n1 = panel.warpMarkersForTest().size();
+        std::printf ("  4: alt+click marker %d: count %d -> %d (want -1), still there=%d%c", k, (int) n, (int) n1, findSrc (144000.0, 2000.0) >= 0 ? 1 : 0, 10);
+        ck (k >= 0 && n1 == n - 1 && findSrc (144000.0, 2000.0) < 0, "4: Alt+click removes that marker");
+        const juce::Point<int> p0 (laneX (0), lane.getCentreY());
+        const int pick0 = panel.warpMarkerAtForTest (p0);
+        altClick (p0);
+        const auto lastI = panel.warpMarkersForTest().size() - 1;
+        const juce::Point<int> pl (juce::jmin (lane.getRight() - 1, laneX (lastI)), lane.getCentreY());
+        const int pickL = panel.warpMarkerAtForTest (pl);
+        altClick (pl);
+        const auto& m = panel.warpMarkersForTest();
+        std::printf ("  4: alt+click anchors (picked %d and %d of %d): count %d -> %d (want unchanged) first src=%lld last src=%lld (want 0 and %lld)%c",
+                     pick0, pickL, (int) lastI, (int) n1, (int) m.size(), (long long) m.front().srcFrame, (long long) m.back().srcFrame, (long long) len, 10);
+        ck (pick0 == 0 && pickL == (int) lastI && m.size() == n1 && m.front().srcFrame == 0 && m.back().srcFrame == len, "4: the first and last anchors cannot be removed");
+    }
+
+    // 5. Double-click on a moved marker (src 96000, at 100800) resets it.
+    {
+        const int k = findSrc (96000.0, 0.0);
+        const auto n = panel.warpMarkersForTest().size();
+        if (k >= 0)
+            dbl ({ laneX ((size_t) k), lane.getCentreY() });
+        const auto& m = panel.warpMarkersForTest();
+        std::printf ("  5: double-click marker %d: dst %lld (want 96000) count %d -> %d%c", k, k >= 0 ? (long long) m[(size_t) k].dstFrame : -1LL, (int) n, (int) m.size(), 10);
+        ck (k >= 0 && m[(size_t) k].dstFrame == 96000 && m.size() == n, "5: a double-click on a marker resets it, no marker added");
+    }
+
+    // 6. Reset markers: after an add with no move it is enabled, and it restores the auto count.
+    {
+        panel.clickResetMarkersForTest();
+        const auto r0 = panel.warpMarkersForTest().size();
+        const bool en0 = panel.resetMarkersEnabledForTest();
+        dbl ({ xFor (48000.0), wa.getCentreY() });
+        const auto n1 = panel.warpMarkersForTest().size();
+        const int moved = WarpMarkers::movedCount (panel.warpMarkersForTest());
+        const bool en1 = panel.resetMarkersEnabledForTest();
+        if (en1)
+            panel.clickResetMarkersForTest(); // a click needs the button enabled
+        const auto r1 = panel.warpMarkersForTest().size();
+        std::printf ("  6: after reset count=%d enabled=%d (want %d, 0); add: count=%d moved=%d enabled=%d (want %d, 0, 1); after Reset count=%d (want %d)%c",
+                     (int) r0, (int) en0, n0, (int) n1, moved, (int) en1, n0 + 1, (int) r1, n0, 10);
+        ck ((int) r0 == n0 && ! en0 && (int) n1 == n0 + 1 && moved == 0, "6: an add with no move leaves no moved marker");
+        ck (en1 && (int) r1 == n0, "6: Reset markers is enabled after the add and restores the auto-placed count");
+    }
+
+    // 7. The audition and Apply warp get the edited list.
+    {
+        int auditionCount = -1, applyCount = -1;
+        panel.onAuditionWarp = [&auditionCount] (const std::vector<WarpMarkers::Marker>& m) { auditionCount = (int) m.size(); };
+        panel.onAuditionPlay = [] (const juce::File&, juce::int64, juce::int64, juce::int64, bool) {};
+        panel.onApply = [&applyCount] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions& o, juce::String&) { applyCount = (int) o.warp.size(); return (juce::uint64) 7; };
+        panel.dragWarpForTest (1, 96000 + kShift);
+        dbl ({ xFor (48000.0), wa.getCentreY() });
+        dbl ({ xFor (600000.0), wa.getCentreY() });
+        const int edited = (int) panel.warpMarkersForTest().size();
+        panel.auditionPlayForTest();
+        panel.clickApplyWarpForTest();
+        std::printf ("  7: edited count=%d (want %d) audition got %d apply got %d%c", edited, n0 + 2, auditionCount, applyCount, 10);
+        ck (edited == n0 + 2 && auditionCount == edited && applyCount == edited, "7: the audition and Apply warp receive the edited marker list");
+    }
+
+    // 8. Ruler labels at 1x, 4x, 8x: adjacent labels at least 44 px apart, two or more shown.
+    {
+        panel.zoomByForTest (0.0001, 0.0);
+        const double zooms[] = { 1.0, 4.0, 2.0 };
+        const char* names[] = { "1x", "4x", "8x" };
+        for (int z = 0; z < 3; ++z)
+        {
+            if (zooms[z] != 1.0)
+                panel.zoomByForTest (zooms[z], 0.0);
+            double prev = -1.0e9, gap = 1.0e9;
+            int count = 0;
+            for (const auto& l : panel.beatLinesForTest())
+                if (l.label > 0 || l.tagBar > 0)
+                {
+                    if (count > 0)
+                        gap = juce::jmin (gap, l.x - prev);
+                    prev = l.x;
+                    ++count;
+                }
+            std::printf ("  8: %s zoom=%.2f labels=%d min gap=%.1f px (want >= 2, >= 44)%c", names[z], panel.getZoomForTest(), count, gap, 10);
+            ck (count >= 2 && gap >= 44.0, "8: ruler labels at least 44 px apart, two or more visible");
+        }
+    }
+
+    // 9. Ruler labels and ticks run the full visible width (readout hidden): the rightmost
+    // drawn label and tick are within one label spacing of the right edge, at 1x, 2x, 4x
+    // and 8x, with the view at the start and scrolled to the middle. "Drawn" uses the
+    // same limit and label widths as paintRuler. Teeth: HSLINK_TEETH=TM_RULER_CLIP.
+    {
+        const auto ra = panel.rulerAreaForTest();
+        const double steps[] = { 1.0, 2.0, 2.0, 2.0 };
+        const char* names[] = { "1x", "2x", "4x", "8x" };
+        panel.zoomByForTest (0.0001, 0.0);
+        for (int z = 0; z < 4; ++z)
+        {
+            if (steps[z] != 1.0)
+                panel.zoomByForTest (steps[z], 0.0);
+            for (int pos = 0; pos < 2; ++pos)
+            {
+                panel.setViewStartForTest (pos == 0 ? 0 : panel.getLengthForTest() / 2);
+                const int clipR = panel.rulerClipNow();
+                double lastLabel = -1.0, lastTick = -1.0, prev = -1.0, spacing = 0.0;
+                for (const auto& l : panel.beatLinesForTest())
+                {
+                    const int x = (int) std::floor (l.x);
+                    if (x >= clipR)
+                        continue;
+                    lastTick = x;
+                    const bool drawn = (l.label > 0 && x + 33 <= clipR) || (l.label <= 0 && l.tagBar > 0 && x + 43 <= clipR);
+                    if (drawn)
+                    {
+                        if (prev >= 0.0)
+                            spacing = juce::jmax (spacing, (double) x - prev);
+                        prev = lastLabel = x;
+                    }
+                }
+                const double gapL = ra.getRight() - lastLabel, gapT = ra.getRight() - lastTick;
+                std::printf ("  9: %s start=%s readout=%d ruler right=%d last label x=%.0f (gap %.0f) last tick x=%.0f (gap %.0f) spacing=%.0f%c",
+                             names[z], pos == 0 ? "0" : "mid", (int) panel.playheadShownForTest(), ra.getRight(), lastLabel, gapL, lastTick, gapT, spacing, 10);
+                ck (lastLabel >= 0.0 && spacing > 0.0 && gapL <= spacing + 43.0 && gapT <= spacing,
+                    "9: ruler labels and ticks reach the right edge of the view");
+            }
+        }
+        panel.setViewStartForTest (0);
+    }
+
+    panel.close (false);
+    WarpMarkers::testMutant = WarpMarkers::mutNone;
+    TakeEditorMath::testMutant = TakeEditorMath::mutNone;
+    P::tempoMeasureEnabled = savedMeasure;
+    std::printf ("  take markers: %d checks, %d failed%c", checks, failures - failuresBefore, 10);
+}
+
 // o132 round 2: the take editor screen, slice 2 (the loop). Flag clamp and stored points,
 // hit picking in the loop lane and the waveform, the drag write throttle for a flag,
 // Cancel, Close, Reset and clear, Export loop, the seam warning, three real loop renders
@@ -19695,7 +21314,7 @@ static void testTakeLoop (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, loop set=%d: %d areas (%d take the mouse, %d buttons or boxes), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty=%d (want 0), buttons under 48 x 24=%d (want 0)%c",
                      size.x, size.y, (int) panel.hasLoopForTest(), (int) areas.size(), hit, buttons, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small, 10);
-        ck (panel.hasLoopForTest() && areas.size() == 34 && hit == 24 && buttons == 21 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.hasLoopForTest() && areas.size() == 38 && hit == 29 && buttons == 25 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686" : "7: no two areas overlap and none leaves the panel at 490 x 566");
         panel.close (false);
     }
@@ -20956,7 +22575,7 @@ static void testTakeSnap (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, snap row filled (note '%s', fits=%d): %d areas (%d take the mouse, %d buttons or boxes, %d of the snap row), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty=%d (want 0), buttons under 48 x 24=%d (want 0)\n",
                      size.x, size.y, panel.noteTextForTest().toRawUTF8(), (int) panel.noteFitsForTest(), (int) areas.size(), hit, buttons, snapAreas, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small);
-        ck (panel.noteTextForTest().isNotEmpty() && panel.noteFitsForTest() && areas.size() == 34 && hit == 24 && buttons == 21 && snapAreas == 3 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.noteTextForTest().isNotEmpty() && panel.noteFitsForTest() && areas.size() == 38 && hit == 29 && buttons == 25 && snapAreas == 3 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the snap row filled" : "7: no two areas overlap and none leaves the panel at 490 x 566 with the snap row filled");
         panel.close (false);
     }
@@ -22077,7 +23696,7 @@ static void testTakeFit (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, fit row filled, Stretch to fit lit=%d: %d areas (%d take the mouse, %d buttons or boxes, %d of the fit row), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d, empty=%d, buttons under 48 x 24=%d (want 0 each)\n",
                      size.x, size.y, (int) panel.stretchEnabledForTest(), (int) areas.size(), hit, buttons, fitAreas, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small);
-        ck (panel.stretchEnabledForTest() && areas.size() == 34 && hit == 24 && buttons == 21 && fitAreas == 4 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.stretchEnabledForTest() && areas.size() == 38 && hit == 29 && buttons == 25 && fitAreas == 4 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the fit row filled" : "7: no two areas overlap and none leaves the panel at 490 x 566 with the fit row filled");
         if (size.x == 490)
         {
@@ -25303,6 +26922,36 @@ static void testEditorAudition (const juce::File& tmp)
         }
     }
 
+    // r. A loop region moved while the clip plays (the loop brace in the take editor):
+    // what plays comes from the new region by the next block, with a crossfade at the
+    // jump and no step. Ramp source: the read position is (value - 0.3) / slope.
+    {
+        std::printf ("  r. region moved while playing: A = [0, 4800), then B = [14400, 19200), ramp 48 kHz\n");
+        Rig r (d, "r", 48000.0);
+        const bool playing = r.play (rampFile, 0, 4800, kLen, true);
+        const auto a = r.run (4096);
+        r.p->editorAudition.setRegion (14400, 19200, kLen);
+        const auto b = r.run (8192);
+        const int fade = EditorAudition::fadeSamples (48000.0);
+        auto at = [&] (float v) { return (int) std::lround ((v - 0.3f) / slope); };
+        int lo = 1 << 30, hi = -1;
+        for (size_t i = (size_t) fade + 4; i < b[0].size(); ++i)
+        {
+            const int k = at (b[0][i]);
+            lo = juce::jmin (lo, k);
+            hi = juce::jmax (hi, k);
+        }
+        double step = 0.0;
+        for (size_t i = 1; i < (size_t) fade + 4; ++i)
+            step = juce::jmax (step, std::abs ((double) b[0][i] - (double) b[0][i - 1]));
+        const double stepB = 1.2 * (0.6 * 14400.0 / (double) (kLen - 1)) / (double) fade + 1.0e-3;
+        std::printf ("    A read positions %d..%d; after the move (from sample %d) %d..%d (want inside 14400 - fade (the wrap pre-roll) .. 19199); largest step in the jump %.5f (limit %.5f, a cut is %.3f)\n",
+                     at (a[0][100]), at (a[0].back()), fade + 4, lo, hi, step, stepB, 0.6 * 14400.0 / (double) (kLen - 1));
+        ck (playing && lo >= 14400 - fade - 2 && hi < 19200 && hi - lo > 4000 && step <= stepB,
+            "r: a moved region plays from the new region at once, crossfaded, and loops inside it");
+        r.p->editorAudition.stop();
+    }
+
     P::tempoMeasureEnabled = savedMeasure;
     d.deleteRecursively(); // this group's own folder under the run's temp folder
     std::printf ("  editoraudition: %d checks counted (%d guards), %d failed\n", checks, guards, failures - failuresBefore);
@@ -25954,6 +27603,13 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && juce::String (argv[1]) == "layoutfit")
+    {
+        testMainLayoutFit();
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "r4")
     {
         testR4Reach();
@@ -26086,6 +27742,7 @@ int main (int argc, char** argv)
     {
         testTempoFallback (tmp);
         testTempoHostAndStretchToken (tmp);
+        // testRephase(); // off: rephase is off by design, see W2 in docs/KNOWN_ISSUES.md
         tmp.deleteRecursively();
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
@@ -26114,12 +27771,25 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
-    if (argc > 1 && (juce::String (argv[1]) == "offline" || juce::String (argv[1]) == "editticket" || juce::String (argv[1]) == "takeeditor" || juce::String (argv[1]) == "takeloop" || juce::String (argv[1]) == "takesnap" || juce::String (argv[1]) == "takefit" || juce::String (argv[1]) == "loopexport" || juce::String (argv[1]) == "editoraudition"))
+    if (argc > 1 && (juce::String (argv[1]) == "offline" || juce::String (argv[1]) == "editticket" || juce::String (argv[1]) == "takeeditor" || juce::String (argv[1]) == "takezoom" || juce::String (argv[1]) == "takemarkers" || juce::String (argv[1]) == "takeexport" || juce::String (argv[1]) == "midiexport" || juce::String (argv[1]) == "takeloop" || juce::String (argv[1]) == "takesnap" || juce::String (argv[1]) == "takefit" || juce::String (argv[1]) == "loopexport" || juce::String (argv[1]) == "editoraudition"))
     {
         if (juce::String (argv[1]) == "offline")
             testOfflineSwitch();
         else if (juce::String (argv[1]) == "editoraudition")
             testEditorAudition (tmp);
+        else if (juce::String (argv[1]) == "takemarkers")
+            testTakeMarkers (tmp);
+        else if (juce::String (argv[1]) == "takeexport")
+            testTakeExport (tmp);
+        else if (juce::String (argv[1]) == "midiexport")
+        {
+            testMidiExport (tmp);
+            testMidiTimeSig (tmp);
+            testMidiTempoMap (tmp);
+            testMidiDrag (tmp);
+        }
+        else if (juce::String (argv[1]) == "takezoom")
+            testTakeZoom (tmp);
         else if (juce::String (argv[1]) == "takeeditor")
             testTakeEditor (tmp);
         else if (juce::String (argv[1]) == "takeloop")
@@ -26298,6 +27968,7 @@ int main (int argc, char** argv)
     testUnderstandTagsAndMeter();
     testTempo (tmp);
     testTempoFallback (tmp);
+    // testRephase(); // off: rephase is off by design, see W2 in docs/KNOWN_ISSUES.md
     testTempoHostAndStretchToken (tmp);
     testStretch (tmp);
     testEdit (tmp);
@@ -26306,6 +27977,8 @@ int main (int argc, char** argv)
     testTakeLoop (tmp);
     testTakeSnap (tmp);
     testTakeFit (tmp);
+    testTakeZoom (tmp);
+    testTakeWarpDraw (tmp);
     testLoopExport (tmp);
     testEditorAudition (tmp);
     testL1PreviewStopped();

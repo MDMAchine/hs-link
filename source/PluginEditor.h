@@ -222,6 +222,11 @@ public:
     static juce::String stateLabel (const DawJob& j);
     static constexpr int kRowH = 22;
     int getNumCards() const { return (int) cards.size(); }
+    // The empty-list hint and the lines paint() may wrap it to.
+    static constexpr const char* kEmptyHint = "No jobs yet. Generate while a job runs to queue more.";
+    static constexpr int kEmptyHintLines = 2;
+    static constexpr float kEmptyHintFontH = 11.0f;
+    static constexpr int kEmptyHintInsetX = 6;
 private:
     juce::Rectangle<int> rowBounds (int i) const;
     std::vector<Card> cards;
@@ -362,6 +367,61 @@ public:
     void paint (juce::Graphics&) override;
 };
 
+// What the MIDI file build needs about one take (all values, safe to copy to a thread).
+struct MidiBuildInputs
+{
+    juce::File src;                          // the WAV to read (warped copy when a warp is in effect)
+    TakeEditorMath::Grid grid;               // bpm/downbeat of src
+    std::vector<WarpMarkers::Marker> markers; // effective warp (empty = none)
+    double srcBpm = 0.0;                     // unwarped tempo, for the per-segment map
+    bool hasTempo = false;
+    int beatsPerBar = 4, sigDen = 4;
+    int mutant = 0;                          // test mutants (0 = real)
+    int quantDiv = 0;                        // export quantize grid: 0 off, 16, 8
+    double quantStrength = 1.0;              // 0..1
+    // The loop (else the crop) of the take in frames of src (through the warp when one is
+    // in effect); end exclusive. -1 = file start / file end. Only hits inside are kept,
+    // timed from regionStart, and the tempo map is shifted to match.
+    juce::int64 regionStart = -1, regionEnd = -1;
+};
+struct MidiBuildResult
+{
+    juce::File tempo, hits, notes;           // {} = not written (notes: only for tonal takes)
+    juce::String err;                        // empty = ok
+};
+// Reads in.src, writes <name>_hits.mid (and <name>_tempo.mid when hasTempo, and
+// <name>_notes.mid when the take is tonal, see MidiExport::isTonal) into destDir.
+// Blocking file I/O: call from a background thread. Editor-free, so tests can call it.
+MidiBuildResult buildMidiFiles (const MidiBuildInputs& in, const juce::File& destDir);
+// buildMidiFiles, returning the full paths of the files that exist afterwards ({} on failure).
+juce::StringArray buildMidiFilesForDrag (const MidiBuildInputs& in, const juce::File& destDir);
+// A fresh unique folder under the system temp dir for drag-out MIDI files (created).
+juce::File midiDragTempDir();
+// The root midiDragTempDir() makes its folders in (temp/HOTSTEP_LINK_midi).
+juce::File midiDragTempRoot();
+// Removes everything inside root (the root itself stays). Refuses (returns -1) unless
+// root is named HOTSTEP_LINK_midi; never touches anything outside root. Returns the
+// number of children it could not remove.
+int clearMidiDragTempRoot (const juce::File& root, juce::RelativeTime minAge = juce::RelativeTime::hours (1.0),
+                           juce::Time now = juce::Time());
+
+// Drag source for the MIDI files of the selected take. When the files are missing the
+// chip asks the editor to build them (background thread) and starts the drag once ready.
+class MidiDragChip : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    std::function<juce::StringArray()> filesFor; // {} = nothing to drag yet
+    std::function<bool()> requestBuild;          // start a background build; false = cannot
+    void paint (juce::Graphics&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override { dragStarted = false; }
+    // Message thread, when a requested build ends: drags the files if the mouse is still down.
+    void buildFinished (const juce::StringArray& files);
+    bool isBuilding() const { return building; }
+private:
+    bool dragStarted = false, building = false;
+};
+
 class HotStepLinkEditor : public juce::AudioProcessorEditor, public juce::FileDragAndDropTarget
 {
 public:
@@ -407,6 +467,17 @@ public:
     bool exportEnabledForTest() const { return exportWavButton.isEnabled(); }
     // The file Export WAV would read now ({} = nothing selected); no chooser is opened.
     juce::File exportSourceForTest() { return exportSource(); }
+    // Teeth (HSLINK_TEETH=NO_WARP_EXPORT): Export and drag ignore the editor's warp.
+    bool noWarpExportForTest = false;
+    // Test mutants: skip the cache cap / the tempo tag on a newly written warped file.
+    bool noWarpCacheCapForTest = false;
+    bool noWarpTagForTest = false;
+    // Keep at most kWarpCacheMax files in <root>_warped and drop any older than
+    // kWarpCacheMaxAgeDays, oldest first; keep is never removed.
+    static constexpr int kWarpCacheMax = 64;
+    static constexpr int kWarpCacheMaxAgeDays = 7;
+    static void trimWarpCache (const juce::File& dir, const juce::File& keep);
+    juce::File warpedFileForTest (const juce::File& temp, const juce::File& src) { return warpedFileFor (temp, src); }
     // The "x" of a take cell and the Undo button, without a click.
     void deleteTakeForTest (const juce::String& tempPath) { deleteTake (tempPath); }
     void undoDeleteForTest() { undoDelete(); }
@@ -420,6 +491,36 @@ public:
     TakeEditorPanel& getTakeEditorForTest() { return takeEditor; }
     bool editTakeEnabledForTest() const { return editTakeButton.isEnabled(); }
     juce::Rectangle<int> editTakeBoundsForTest() const { return editTakeButton.getBounds(); }
+    juce::Rectangle<int> reanalyzeBoundsForTest() const { return reanalyzeButton.getBounds(); }
+    juce::Rectangle<int> setupPlateForTest() const { return setupPlate; }
+    juce::Rectangle<int> generateBoundsForTest() const { return generateButton.getBounds(); }
+    juce::Rectangle<int> exportWavBoundsForTest() const { return exportWavButton.getBounds(); }
+    // Smallest window with the whole Preview section. Height: the rows of the middle plate
+    // take 700 px, and previewWaveArea() needs a card of 60 px. Hosts clamp to this too.
+    static constexpr int kMinWindowW = 1080, kMinWindowH = 760;
+    juce::Rectangle<int> exportMidiBoundsForTest() const { return exportMidiButton.getBounds(); }
+    juce::Rectangle<int> quantizeBoundsForTest() const { return quantizeBox.getBounds(); }
+    juce::Rectangle<int> midiDragBoundsForTest() const { return midiDrag.getBounds(); }
+    bool exportMidiEnabledForTest() const { return exportMidiButton.isEnabled(); }
+    // Export MIDI without a click. midiSyncForTest = run the export and its completion on
+    // this thread (no worker, no callAsync). Mutants: 1 = the writer uses a fixed 120 BPM,
+    // 2 = every hit one onset hop (2.5 ms) late.
+    bool midiSyncForTest = false;
+    int midiMutantForTest = 0;
+    void exportMidiForTest() { exportMidi(); }
+    juce::File lastMidiTempoForTest() const { return lastMidiTempo; }
+    juce::File lastMidiHitsForTest() const { return lastMidiHits; }
+    bool midiDragEnabledForTest() const { return midiDrag.isEnabled(); }
+    bool midiDragBuildingForTest() const { return midiDrag.isBuilding(); }
+    juce::Rectangle<int> playBoundsForTest() const { return playButton.getBounds(); }
+    juce::Rectangle<int> gainLabelBoundsForTest() const { return gainLabel.getBounds(); }
+    juce::Rectangle<int> followHostBoundsForTest() const { return followHostButton.getBounds(); }
+    juce::Rectangle<int> levelMatchBoundsForTest() const { return levelMatchButton.getBounds(); }
+    juce::Rectangle<int> previewCardForTest() const { return previewCard; }
+    juce::Rectangle<int> previewWaveForTest() const { return previewWaveArea(); }
+    juce::Rectangle<int> genPlateForTest() const { return genPlate; }
+    juce::Rectangle<int> previewHeaderForTest() const { return previewHeaderArea(); }
+    juce::Rectangle<int> queueListBoundsForTest() const { return queueList.getBounds(); }
     // True while the seed field holds a text that was refused (over the limit).
     bool isSeedRefusedForTest() const { return seedRefused; }
     // Types into the seed field without committing it (no Return, no focus loss).
@@ -453,7 +554,16 @@ private:
     void selectTake (const juce::String& key);
     juce::File dragFileFor (const juce::String& key);
     juce::File exportSource(); // the file Export reads, decided on the button press
+    // src, or when the take editor holds a warp in effect for temp, a rendered copy of
+    // src with that warp (cached by take and marker list); {} when the render fails.
+    juce::File warpedFileFor (const juce::File& temp, const juce::File& src);
     void exportWav();
+    // Writes <take>_tempo.mid and <take>_hits.mid beside the file Export reads (the
+    // lasting take, or its warped copy) on a worker thread; announced in the job label.
+    void exportMidi();
+    juce::StringArray midiFilesForSelection() const;
+    bool midiInputsForSelection (MidiBuildInputs& out); // false = nothing selected
+    bool buildMidiForDrag();                            // chip request: background build to temp
 
     // Source clip (plugin: Capture arm; standalone: Drop WAV + region fields)
     juce::TextButton captureButton { "Capture" }, dropButton { "Drop WAV..." };
@@ -471,6 +581,7 @@ private:
     // newest finished understand job; tags and input level are editor-side text
     // state only (no backing state in the processor yet).
     juce::Rectangle<int> understandPanel, inputPanel;
+    juce::Rectangle<int> previewHeaderArea() const;
     juce::String understandKeyText { "--" }, understandTempoText { "--" };
     juce::StringArray understandTags;
     float inputLevelShown = 0.0f;
@@ -486,7 +597,18 @@ private:
 
     // R6 export
     juce::TextButton exportWavButton { "Export WAV" }, exportMidiButton { "Export MIDI" };
+    juce::ComboBox quantizeBox;
+    juce::Slider quantStrengthSlider { juce::Slider::LinearHorizontal, juce::Slider::NoTextBox };
     std::unique_ptr<juce::FileChooser> exportChooser;
+    MidiDragChip midiDrag;
+    bool midiBusy = false;
+    // Where the last export went: full folder path plus a reveal button (hidden until an export).
+    juce::Label exportPathLabel;
+    juce::TextButton showExportButton { "Show in folder" };
+    juce::File lastExportFile;
+    void showExportResult (const juce::File& written);
+    juce::File lastMidiSelection;          // the selected take the files below belong to
+    juce::File lastMidiTempo, lastMidiHits, lastMidiNotes; // {} = not written (tempo: the take had no tempo)
 
     // R5 take list + audition
     TakeListComponent takeList;
@@ -532,6 +654,10 @@ private:
 
     HotStepLinkProcessor& proc;
     const bool standalone;
+    // Dev shot hooks (Standalone --shot-* flags, see parseShotArgs). step 0 = idle.
+    struct ShotPlan { int step = 0, take = 0, marker = -1, waitTicks = 0; double dstSec = 0.0, zoomStart = 0.0, zoomEnd = 0.0; bool snap = false; } shot;
+    void parseShotArgs (const juce::String& cmd);
+    void runShotStep();
 
     // Take editor screen: an overlay on the Generate plate for the selected take. Declared
     // after proc: its callbacks reach the processor.

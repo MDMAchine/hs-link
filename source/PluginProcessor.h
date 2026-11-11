@@ -742,6 +742,13 @@ public:
     // Loop on: the region repeats. Off: it plays to its end once. Takes effect at the
     // next pass through the end of the region.
     void setLoop (bool on) { loopOn.store (on, std::memory_order_relaxed); }
+    // Any thread: moves the region of the clip that plays (frames of the file, as
+    // play()). The audio thread takes it at its next block; a read position outside
+    // the new region jumps to its start with a crossfade of the fade length.
+    // play() sets it too. end <= start or length <= 0 = the whole take.
+    void setRegion (juce::int64 start, juce::int64 end, juce::int64 length);
+    // Pure: the region packed as two 32-bit fractions of the take (lo = start, hi = end).
+    static juce::uint64 packRegion (juce::int64 start, juce::int64 end, juce::int64 length);
     State getState() const;
     // Any thread: where the clip plays, as a fraction of the decoded take (0..1), the
     // last position the audio thread wrote; -1 = no clip has a position. The editor
@@ -798,6 +805,7 @@ private:
 
     std::atomic<double> rate { 48000.0 };
     std::atomic<bool> loopOn { false };
+    std::atomic<juce::uint64> regionReq { 0xFFFFFFFF00000000ull }; // packRegion(), see setRegion()
     std::atomic<double> playFrac { -1.0 }; // audio thread writes, see getPlayFraction()
     std::atomic<int> generation { 0 };
     std::atomic<Clip*> requested { nullptr };
@@ -821,6 +829,11 @@ private:
     int duckN = 576;   // the ramp length in use; follows duckLen only at an end of the ramp
     bool hold = false; // the clip taken waits until the main output is down
     bool ended = false, tailLoop = false;
+    // The region in use (frames of cur->audio), from regionReq; a moved region that
+    // leaves pos outside jumps, and the old read position fades out over jumpLeft.
+    static constexpr juce::uint64 kNoRegion = 0; // never a packed region (end > start)
+    juce::uint64 seenRegion = kNoRegion;
+    int curStart = 0, curEnd = 0, jumpFrom = 0, jumpLeft = 0;
     void duckSync();              // takes a new duckLen when the ramp is at one of its ends
     float duckNext (bool down);   // one sample along the ramp, returns the gain there
     // Moves the duck one step per sample over [from, to) of buf, down or up, and
@@ -1076,6 +1089,9 @@ public:
     static std::atomic<bool> editReportsByTicket;
     // Tests: gives the listed take with this temp file another name (may be empty).
     void setTakeNameForTest (const juce::File& tempFile, const juce::String& name);
+    // Standalone dev shot hook (--shot-load): list a WAV already on disk as a saved take
+    // at the front of the list (take 0), as the edit-result path lists a rendered take.
+    bool addShotTake (const juce::File& wav);
     // Queues a crop or loop render (TakeEdit) of the listed take with this temp file on
     // the pool thread of the stretch (one heavy take job at a time). Any thread but the
     // audio thread; returns at once with the job's ticket (never 0), the key of its

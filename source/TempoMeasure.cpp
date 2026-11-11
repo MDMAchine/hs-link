@@ -409,6 +409,20 @@ const char* TempoMeasure::levelName (Level level)
     return "none";
 }
 
+std::vector<TempoMeasure::Onset> TempoMeasure::onsets (const float* mono, std::size_t numSamples, double sampleRate,
+                                                       const AbortFn& shouldAbort)
+{
+    std::vector<TempoMeasure::Onset> out;
+    if (mono == nullptr || ! (sampleRate >= 4000.0) || ! (sampleRate <= 768000.0))
+        return out;
+    Curves curves;
+    if (! buildCurves (mono, numSamples, sampleRate, curves, shouldAbort))
+        return out;
+    for (const auto& on : pickOnsets (curves))
+        out.push_back ({ std::max (0.0, on.t), on.w });
+    return out;
+}
+
 TempoMeasure::Result TempoMeasure::analyse (const float* mono, std::size_t numSamples, double sampleRate,
                                             double hintBpm, const AbortFn& shouldAbort)
 {
@@ -603,6 +617,18 @@ TempoMeasure::Result TempoMeasure::analyse (const float* mono, std::size_t numSa
     r.firstBeatSec = first;
     r.beats = beats;
     r.hintFit = hintFit;
+    {
+        std::vector<std::size_t> idx (onsets.size());
+        for (std::size_t i = 0; i < idx.size(); ++i)
+            idx[i] = i;
+        const std::size_t n = std::min (idx.size(), kTopOnsets);
+        std::stable_sort (idx.begin(), idx.end(), [&onsets] (std::size_t a, std::size_t b) { return onsets[a].w > onsets[b].w; });
+        idx.resize (n);
+        std::sort (idx.begin(), idx.end());
+        r.topOnsets.reserve (n);
+        for (const auto i : idx)
+            r.topOnsets.push_back ({ std::max (0.0, onsets[i].t), onsets[i].w });
+    }
     if (hinted)
     {
         const double oct = std::round (std::log2 (bpm / hintBpm));

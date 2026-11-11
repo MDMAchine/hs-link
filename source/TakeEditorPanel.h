@@ -24,9 +24,21 @@ namespace TakeEditorMath
     };
     // The whole take across widthPx (slice 1 has no zoom).
     View wholeTake (juce::int64 length, int widthPx);
+    // Horizontal zoom. zoom 1 = the whole take; the view never leaves the take.
+    // kMinFramesPerPixel caps the zoom (2 frames per pixel at the deepest: about 50 ms fills 1200 px at 48 kHz).
+    constexpr double kMinFramesPerPixel = 2.0;
+    double maxZoom (juce::int64 length, int widthPx);
+    juce::int64 clampViewStart (juce::int64 length, int widthPx, double zoom, juce::int64 start);
+    View zoomedView (juce::int64 length, int widthPx, double zoom, juce::int64 start);
+    // Zoom by factor about the pixel anchorX (from the left of the view), keeping the
+    // frame under it where it is. zoom and start are updated in place and clamped.
+    void zoomAround (juce::int64 length, int widthPx, double& zoom, juce::int64& start, double anchorX, double factor);
     // clamp (firstFrame + llround (x * framesPerPixel), 0, length).
     juce::int64 frameAtX (const View& v, double x);
     double xOfFrame (const View& v, juce::int64 frame);
+    // The frame is inside the view (x from 0 to widthPx). A crop handle or loop flag
+    // whose frame is not is neither drawn nor picked.
+    bool frameInView (const View& v, juce::int64 frame);
 
     // The shortest crop: max (2, round (0.020 * rate)) frames.
     juce::int64 minCropLength (double sampleRate);
@@ -123,8 +135,16 @@ namespace TakeEditorMath
         juce::int64 beat = 0; // 0 = the downbeat
         bool bar = false;     // the first beat of a bar
         int label = 0;        // the bar number to print, 0 = none
+        // Zoomed in far enough that bars are wide: a bar.beat (or bar.beat.part) label on
+        // a line inside a bar. tagBar 0 = none; tagPart 0 = on the beat itself.
+        int tagBar = 0, tagBeat = 0, tagPart = 0;
     };
-    constexpr double kMinBeatPx = 7.0, kMinBarLabelPx = 34.0;
+    // kMinTagPx: the narrowest spacing of bar.beat labels. Beat labels come in once a beat
+    // is that wide; each halving of the step needs the half to be that wide too, so the
+    // labels never touch and are never further apart than 2 x kMinTagPx (two or more in
+    // any view wider than that, up to the 64 frames per pixel cap).
+    constexpr double kMinBeatPx = 7.0, kMinBarLabelPx = 34.0, kMinTagPx = 44.0;
+    constexpr int kMaxTagHalvings = 10;
     constexpr int kBeatsPerBar = 4;
     // resolution (manual stepping, phase 2): 0 = the automatic density above; each step
     // up doubles the beats from line to line, each step down halves them, never finer
@@ -248,13 +268,18 @@ namespace TakeEditorMath
     // line and the fit readout is shown with the toggle off too.
     // mutFitRowTight = Stretch to fit is laid out 100 px to the left, over a readout
     // that is 82 px narrower.
+    // mutResetMovedOnly = Reset markers follows moved markers only (an added one does
+    // not enable it). mutTagTight = bar.beat labels halve down to half of kMinTagPx.
+    // mutRulerAlwaysClip = the ruler stops short of the playhead readout even when it is hidden.
     enum Mutant { mutNone = 0, mutPixelOff, mutClampPass, mutCancelKeeps, mutNoThrottle, mutNoUpWrite, mutNoSelfClose,
                   mutLoopNoClamp, mutFlagAnywhere, mutExportLoose, mutSeamLoose, mutButtonsOverlap,
                   mutNoButtonCheck, mutOldAnchor,
                   mutSnapOff, mutSnapSendLoose, mutZeroNotSent, mutBeatsNoThin, mutSnapNoEnds,
                   mutStrictRight, mutClearMidDrag, mutOpenNoEndDrag, mutGridStale,
                   mutFitReadoutLoose, mutFitTempoLoose, mutFitNoHost, mutFitStretchLoose, mutFitSendAlways,
-                  mutFitStretchWrong, mutFitRowTight, mutFitWarnWrong };
+                  mutFitStretchWrong, mutFitRowTight, mutFitWarnWrong,
+                  mutZoomWhole, mutZoomNoAnchor, mutZoomNoCap, mutZoomNoClamp, mutHandleEdgeClamp,
+                  mutResetMovedOnly, mutTagTight, mutRulerAlwaysClip };
     extern std::atomic<int> testMutant;
 }
 
@@ -265,7 +290,8 @@ namespace TakeEditorMath
 // field, bars readout, Stretch to fit). It holds no processor: the editor wires the callbacks and drives
 // tick() from its VBlank tick (no timer of its own).
 class TakeEditorPanel : public juce::Component,
-                        public juce::TooltipClient
+                        public juce::TooltipClient,
+                        private juce::ScrollBar::Listener
 {
 public:
     struct Take
@@ -288,6 +314,18 @@ public:
     void close (bool restore);
     bool isOpen() const { return opened; }
     const juce::File& getTemp() const { return take.temp; }
+    // The warp in effect for Export WAV and drag to DAW, the same test as Play: Warp on
+    // and at least one marker moved; empty = none. Held in the panel only (not saved).
+    std::vector<WarpMarkers::Marker> effectiveWarp() const
+    {
+        if (! opened)
+            return {};
+        ensureWarp();
+        return warpButton.getToggleState() && WarpMarkers::movedCount (warpMarkers) > 0 ? warpMarkers : std::vector<WarpMarkers::Marker> {};
+    }
+    // The tempo the warped result is tagged at (as Apply): the Warp to host target, else
+    // the tempo the moved markers give.
+    double warpResultBpm() const { ensureWarp(); return warpTagBpm > 0.0 ? warpTagBpm : WarpMarkers::resultTempo (warpMarkers, take.grid.bpm); }
     // Once per VBlank from the editor: picks up the peaks, flushes a throttled point
     // write, polls the edit report of the Apply ticket while an Apply is running and
     // gives up on it after kApplyTimeoutMs.
@@ -305,7 +343,29 @@ public:
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp (const juce::MouseEvent&) override;
     void mouseMove (const juce::MouseEvent&) override;
-    void mouseDoubleClick (const juce::MouseEvent&) override; // warp lane: resets one marker
+    void mouseDoubleClick (const juce::MouseEvent&) override; // marker: reset; empty lane or wave (Warp on): add
+    int addWarpMarkerAtX (double xInWave);
+    bool removeWarpMarker (int index); // Alt + click; never the end anchors
+    void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override; // wheel: zoom about the pointer; Shift or horizontal: pan
+    double getZoomForTest() const { return zoom; }
+    juce::int64 getViewStartForTest() const { return viewStart; }
+    void zoomByForTest (double factor, double anchorX) { zoomBy (factor, anchorX); }
+    void setViewStartForTest (juce::int64 s) { setViewStart (s); }
+    TakeEditorMath::View viewForTest() const { return view(); }
+    juce::Rectangle<int> waveAreaForTest() const { return waveArea; }
+    juce::Rectangle<int> scrollAreaForTest() const { return scrollArea; }
+    juce::Rectangle<int> overviewAreaForTest() const { return overviewArea; }
+    bool zoomInEnabledForTest() const { return zoomInButton.isEnabled(); }
+    void zoomToLoopForTest() { zoomToLoop(); }
+    // Zooms so the window [startSec, startSec + spanSec) fills the waveform (clamped).
+    void zoomToSecondsForTest (double startSec, double spanSec) { zoomToFrames ((juce::int64) std::llround (startSec * sampleRate), (juce::int64) std::llround ((startSec + spanSec) * sampleRate)); }
+    double xOfSecondsForTest (double sec) const { return TakeEditorMath::xOfFrame (view(), (juce::int64) std::llround (sec * sampleRate)); }
+    juce::Range<double> scrollRangeForTest() const { return scrollBar.getCurrentRange(); }
+    double scrollTotalForTest() const { return scrollBar.getMaximumRangeLimit() - scrollBar.getMinimumRangeLimit(); }
+    juce::Rectangle<int> loopLaneForTest() const { return loopLane; }
+    // What paint draws: the S and E grips and the two loop flags (false = off view).
+    bool cropGripDrawnForTest (bool endGrip) const { return gripShown (endGrip ? cropEnd : cropStart); }
+    bool loopFlagDrawnForTest (bool endFlag) const { return hasLoop() && gripShown (endFlag ? loopEnd : loopStart); }
     juce::String getTooltip() override; // the loop lane says how it is used
 
     // setTakeEdit, requestTakeEdit and getTakeEditReport of the processor. onApply
@@ -340,6 +400,9 @@ public:
     std::function<void (const std::vector<WarpMarkers::Marker>&)> onAuditionWarp;
     std::function<void()> onAuditionStop;
     std::function<void (bool)> onAuditionLoop;
+    // The loop brace moved (start, end, length in frames of the file, as onAuditionPlay):
+    // the playing audition follows at once. Sent from tick() when the region changes.
+    std::function<void (juce::int64 start, juce::int64 end, juce::int64 length)> onAuditionRegion;
     std::function<int()> onAuditionState;
     // The playhead: getPlayFraction of the EditorAudition (0..1 of the take, -1 = none),
     // read in tick() while the audition plays. Not set = no playhead.
@@ -424,6 +487,9 @@ public:
     juce::Rectangle<int> rulerAreaForTest() const { return rulerArea; }
     void setPlayheadOverlayWidthForTest (int w) { playheadOverlayW = w; resized(); }
     // Right-hand x limit for ruler ticks and labels: they stop short of the playhead overlay.
+    // The x limit paintRuler uses now (panel coordinates).
+    int rulerClipNow() const;
+    bool playheadShownForTest() const { return playheadValue.isVisible(); }
     static int rulerClipRight (int rulerRight, int rulerWidth, int overlayW) noexcept
     {
         return rulerRight - juce::jmax (0, juce::jmin (rulerWidth, overlayW)) - 4; // 4 px gap before the overlay
@@ -464,6 +530,8 @@ public:
     bool getFitBarsForTest() const { return fitButton.getToggleState(); }
     void setFitBpmForTest (const juce::String& typed) { tempoField.setText (typed, juce::dontSendNotification); tempoTyped(); }
     double getFitBpmForTest() const { return fitBpm; }
+    // The Fit to bars tempo only when the user typed it, else 0 (the host default is not one).
+    double userFitBpm() const { return tempoByUser ? fitBpm : 0.0; }
     juce::String tempoFieldTextForTest() const { return tempoField.getText(); }
     juce::String fitTextForTest() const { return barsLabel.getText(); }
     bool fitTextFitsForTest() const { return textFits (barsLabel); }
@@ -480,6 +548,9 @@ public:
     const std::vector<WarpMarkers::Marker>& warpMarkersForTest() const { ensureWarp(); return warpMarkers; }
     void dragWarpForTest (int index, juce::int64 dstFrame) { ensureWarp(); WarpMarkers::moveTo (warpMarkers, (std::size_t) index, dstFrame, length); repaint(); }
     void auditionPlayForTest() { auditionPlay(); }
+    int addWarpMarkerAtXForTest (double xInWave) { return addWarpMarkerAtX (xInWave); }
+    bool warpResetEnabledForTest() const { return warpResetButton.isEnabled(); }
+    bool removeWarpMarkerForTest (int index) { return removeWarpMarker (index); }
     void resetWarpForTest (int index) { WarpMarkers::resetOne (warpMarkers, (std::size_t) index); repaint(); }
     int warpMarkerAtForTest (juce::Point<int> p) const { return warpMarkerAt (p); }
     juce::Rectangle<int> warpLaneForTest() const { return warpLane; }
@@ -490,7 +561,15 @@ public:
     bool warpToHostEnabledForTest() const { return warpHostButton.isEnabled(); }
     bool resetMarkersEnabledForTest() const { return warpResetButton.isEnabled(); }
     bool applyWarpEnabledForTest() const { return applyWarpButton.isEnabled(); }
+    // Dev shot hooks (Standalone --shot-* flags): marker drag via the mouse path, zoom to a range.
+    bool shotDragWarp (int marker, double dstSec, bool snap);
+    void shotZoom (double startSec, double endSec);
     void setWarpForTest (bool on) { warpButton.setToggleState (on, juce::dontSendNotification); refreshButtons(); }
+    // The warp redraw (4eed68e): the source frame a wave column at warped frame d reads,
+    // the dst a marker drag lands on (Shift = free), and a double-click on marker i.
+    juce::int64 columnSourceForTest (juce::int64 d) const { return columnSource (d); }
+    juce::int64 warpDragTargetForTest (juce::int64 dst, bool shift) const { return warpDragTarget (dst, shift); }
+    void doubleClickWarpMarkerForTest (int i) { ensureWarp(); warpMarkerDoubleClicked (i); }
     struct Area { juce::String name; juce::Rectangle<int> bounds; bool hit = false; bool button = false; };
     std::vector<Area> areasForTest() const;
 
@@ -538,6 +617,7 @@ private:
     void writeEdit();
     TakeEdit::EditData currentEdit() const;
     juce::Rectangle<int> handleStrip (juce::int64 frame) const;
+    bool gripShown (juce::int64 frame) const; // in the view (or the old edge clamp mutant)
 
     bool waiting = false;
     juce::uint64 waitTicket = 0;   // the Apply whose report is waited for
@@ -583,6 +663,7 @@ private:
     // Audition
     void auditionPlay();
     void auditionStop();
+    juce::int64 sentRegionStart = -2, sentRegionEnd = -2; // the region last given to the audition
     void refreshAudition(); // the Play and Stop buttons from onAuditionState
     int auditionShown = -1;
     int playheadOverlayW = 0;       // test override of the overlay width, 0 = kPlayheadOverlayW
@@ -591,7 +672,13 @@ private:
     // Warp markers (round 2a). mutable: built lazily from paint and the test reads.
     mutable std::vector<WarpMarkers::Marker> warpMarkers;
     mutable bool warpBuilt = false;
+    bool markersEdited = false; // a marker added or removed by hand since the auto placement
     int warpDrag = -1;              // marker index in the drag, -1 = none
+    juce::int64 columnSource (juce::int64 warpedFrame) const; // renderWave's column map
+    juce::int64 warpDragTarget (juce::int64 dst, bool shiftDown) const; // marker drag snap
+    void releaseDrag(); // mouseUp body
+    void warpDragMove (juce::int64 frame, bool shiftDown); // one drag step of marker warpDrag (mouse and shot hook)
+    void warpMarkerDoubleClicked (int i); // remove, or reset an end anchor
     void ensureWarp() const;
     int warpMarkerAt (juce::Point<int> p) const;
     void paintWarp (juce::Graphics&) const;
@@ -603,11 +690,23 @@ private:
     void resetMarkers();
     void applyWarp();
     int playheadX() const;          // x in panel coordinates, -1 when hidden or out of view
+    // Horizontal zoom and pan (not persisted). zoom 1 = whole take.
+    double zoom = 1.0;
+    juce::int64 viewStart = 0;
+    void zoomBy (double factor, double anchorX);
+    void setViewStart (juce::int64 start);
+    void zoomChanged();
+    void zoomToFrames (juce::int64 first, juce::int64 end); // that range fills the view
+    void zoomToLoop();
+    void overviewSeek (double xInOverview); // centres the view on that point of the take
+    bool overviewDrag = false;
+    void scrollBarMoved (juce::ScrollBar*, double newRangeStart) override;
 
     // One source for bounds: set in resized(), used by paint and the mouse code.
-    juce::Rectangle<int> rulerArea, warpLane, loopLane, waveArea, scrollArea, snapRow, fitRow, zoomRow;
+    juce::Rectangle<int> rulerArea, warpLane, loopLane, waveArea, scrollArea, overviewArea, snapRow, fitRow, zoomRow;
     juce::Image waveImage;
     bool waveDirty = true;
+    std::uint64_t waveWarpSig = 0; // warp state the wave image was drawn with
     void renderWave();
     void paintRuler (juce::Graphics&) const;
 
@@ -631,6 +730,8 @@ private:
                      exportButton { "Export loop" }, stretchButton { "Stretch to fit" };
     juce::ToggleButton warpButton { "Warp" };
     juce::TextButton warpHostButton { "Warp to host" }, warpResetButton { "Reset markers" }, applyWarpButton { "Apply warp" };
+    juce::TextButton zoomOutButton { "-" }, zoomInButton { "+" }, zoomFitButton { "Fit" }, zoomLoopButton { "Loop" };
+    juce::ScrollBar scrollBar { false };
     juce::ThreadPool pool { 1 }; // peak builds only; declared last, stopped first
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TakeEditorPanel)
