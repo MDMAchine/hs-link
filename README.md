@@ -100,7 +100,7 @@ The test binary covers host sync, capture ring, DawWorker offline detection, aud
 
 Windows x64 only for now. Install by hand from the zip.
 
-Download: https://github.com/MDMAchine/hs-link/releases (`HOTSTEP_LINK_<version>_Windows_x64.zip`, with a `.sha256`)
+Download: https://github.com/MDMAchine/hs-link/releases (`MDMAchine_HOT-STEP_LINK_<version>_beta_win.zip` / `_mac.zip`; sha256 in the release notes)
 
 Before you start, you need:
 
