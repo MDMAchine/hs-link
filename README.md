@@ -112,7 +112,7 @@ Before you start, you need:
 
 The files are **not code-signed yet**. Windows SmartScreen may show a blue "Windows protected your PC" box when you run the Standalone. To continue, click **More info**, then **Run anyway**.
 
-The zip (`HOTSTEP_LINK_<version>_Windows_x64.zip`) holds the three built files, plus `INSTALL.txt`, `LICENSE` and `THIRD_PARTY_NOTICES.md`:
+The zip (`MDMAchine_HOT-STEP_LINK_<version>_beta_win.zip` / `_mac.zip`; sha256 in the release notes) holds the three built files, plus `INSTALL.txt`, `LICENSE` and `THIRD_PARTY_NOTICES.md`:
 
 - `VST3\HOT-STEP LINK.vst3` (a folder; copy the whole folder, not just what is inside it)
 - `CLAP\HOT-STEP LINK.clap`
