@@ -6,6 +6,7 @@
 #include <juce_core/juce_core.h>
 #include "TempoMeasure.h"
 #include "TakeEdit.h"
+#include "WarpMarkers.h"
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -121,16 +122,31 @@ struct HslinkTakeEntry
     juce::int64 createdMs = 0;   // wall clock (ms since epoch) when the take was registered
     // Measured tempo (TempoMeasure). bpm above is the tempo that was asked for and is
     // never changed by the measurement. tempo is meaningful only in state measured.
-    enum TempoState { tempoNotMeasured = 0, tempoMeasuring = 1, tempoMeasured = 2 };
+    enum TempoState { tempoNotMeasured = 0, tempoMeasuring = 1, tempoMeasured = 2, tempoEstimated = 3 };
     int tempoState = tempoNotMeasured;
     TempoMeasure::Result tempo;
+    // Derived takes (crop, loop, stretch): the tempo to fall back on when the remeasure
+    // gives no number (parent tempo for an edit, target bpm for a stretch). 0 = none.
+    // In state estimated, tempo.bpm carries this value with tempo.valid false.
+    double estimatedBpm = 0.0;
     // The tempo the grid uses and its source (TempoResolve::resolve), set once when the
     // measurement is stored, with the host tempo of that moment. It does not follow the
     // host afterwards. Source none while the take is not measured.
     TempoResolve::Resolved resolvedTempo;
     // Crop and loop points of this take (TakeEdit), in sample frames of its own file,
     // -1 = not set. Kept beside the take; the audio file is never changed by them.
-    TakeEdit::EditData edit;
+    TakeEdit::EditData edit;    // R1b: the beatgrid set by hand in the take editor; set false = the detected grid.
+    TakeEdit::GridEdit gridEdit;
+    // C1: the warp of this take as the take editor left it (setTakeWarp). Empty markers
+    // = automatic placement from the grid. Kept beside the take, saved in the state.
+    std::vector<WarpMarkers::Marker> warpMarkers;
+    bool warpMarkersEdited = false;
+    double warpTagBpm = 0.0;
+    // C1: restored from the saved state but its file is gone (no path found). Shown, never played.
+    bool missing = false;
+    // D2: the take's stable number (T<n>), given once when it is first listed and never
+    // changed; saved in the state. 0 = not numbered yet. Lists show the highest first.
+    int number = 0;
 };
 
 // One saved take in the Collection: <base>.wav plus the sidecar <base>.json.
@@ -257,7 +273,7 @@ private:
 // box map to a CollectionQuery; a row's second line is built from its metadata.
 struct CollectionChips
 {
-    enum Backend { all = 0, sa3 = 1, yue2 = 2, ace = 3 };
+    enum Backend { all = 0, sa3 = 1, yue2 = 2, ace = 3, minimax = 4, heartmula = 5 };
     int backend = all;           // one of Backend
     bool starredOnly = false;    // the starred toggle
     juce::String search;         // the search box, as typed

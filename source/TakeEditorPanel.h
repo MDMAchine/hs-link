@@ -4,6 +4,7 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -106,7 +107,7 @@ namespace TakeEditorMath
     // frame back. The caller clamps after it (clampCrop), which then changes nothing
     // unless no beat was left between other and the file end.
     juce::int64 snapCropPoint (juce::int64 frame, juce::int64 other, bool movedEnd, const Grid& grid, double sampleRate,
-                               juce::int64 length, juce::int64 minLen);
+                               juce::int64 length, juce::int64 minLen, double stepBeats = 1.0);
     // A loop on the grid, the way the render snaps one: the start on a beat inside the
     // file, the length a whole number of beats (at least one), the end inside the file.
     // movedEnd false: the start was dragged, the end is the fixed one (it goes to its
@@ -114,7 +115,43 @@ namespace TakeEditorMath
     // dragged. A loop at the file end is cut down to the beats that fit; when not one
     // whole beat fits there the start moves back. Returns false and changes nothing when
     // the grid is not usable or no whole beat fits in the file at all.
-    bool snapLoop (juce::int64& start, juce::int64& end, bool movedEnd, const Grid& grid, double sampleRate, juce::int64 length);
+    bool snapLoopBeats (juce::int64& start, juce::int64& end, bool movedEnd, const Grid& grid, double sampleRate, juce::int64 length);
+    // The loop snap of a drag (R1 2026-11-11): each handle to its nearest target, where the
+    // targets are the grid lines stepBeats beats apart (from the downbeat) inside the file
+    // plus 0 and length, which are always legal. When the handles would meet, the dragged
+    // one moves one target away (else the fixed one). false and nothing changed when the
+    // grid is not usable or the file has no room. snapLoopBeats above is the render's rule
+    // (whole beats from a beat) and is what loopOnGrid checks.
+    bool snapLoop (juce::int64& start, juce::int64& end, bool movedEnd, const Grid& grid, double sampleRate, juce::int64 length,
+                   double stepBeats = 1.0, bool keepOther = false);
+    // keepOther (B1, handle drag on an existing loop): only the dragged handle snaps; the other stays.
+    // One loop target (see snapLoop): dir 0 nearest, -1 the largest below x, +1 the smallest above x, -1 when none.
+    juce::int64 snapLoopPoint (juce::int64 x, const Grid& grid, double sampleRate, juce::int64 length, double stepBeats, int dir);
+    // R1b 2026-11-11, beatgrid editing (pure). The grid the panel draws and snaps on:
+    // a hand grid that is set and usable (bpm and downbeat), measured true so the render
+    // is asked to snap on it (the processor uses the same hand grid); else detected.
+    Grid effectiveGrid (const Grid& detected, const TakeEdit::GridEdit& hand);
+    // A downbeat moved to the first bar line at or after 0: sec - bar * floor (sec / bar),
+    // bar = kBeatsPerBar * 60 / bpm. The grid lines are the same. sec back when bpm is
+    // not inside TakeEdit::kMinBpm..kMaxBpm or sec is not finite.
+    double wrapDownbeat (double sec, double bpm);
+    // Set 1: the downbeat at sec (wrapped), the tempo of g. set false when g has no
+    // tempo inside the range or sec is not finite.
+    TakeEdit::GridEdit gridWithDownbeat (const Grid& g, double sec);
+    // Nudge: the grid deltaSec later (negative = earlier), wrapped.
+    TakeEdit::GridEdit gridShifted (const Grid& g, double deltaSec);
+    // A new tempo, the downbeat kept: bpm rounded to 0.001 and clamped to
+    // TakeEdit::kMinBpm..kMaxBpm. set false for a bpm that is not finite or not positive.
+    TakeEdit::GridEdit gridWithBpm (const Grid& g, double bpm);
+    // Half (factor 0.5) and double (2): set false when the result leaves the range.
+    TakeEdit::GridEdit gridScaled (const Grid& g, double factor);
+    constexpr double kGridNudgeSec = 0.001, kGridNudgeShiftSec = 0.010; // < > and Shift + < >
+    constexpr double kGridBpmStep = 0.01, kGridBpmShiftStep = 0.1;     // - + and Shift + - +
+    // The grid bpm field text: two decimals, "" for no tempo.
+    juce::String gridBpmText (double bpm);
+    // The finest snap step: 1/64 beat. A step that is not finite or not positive is 1 beat.
+    constexpr double kMinSnapStepBeats = 1.0 / 64.0;
+    double clampStepBeats (double stepBeats);
     // True when a render with snapToGrid on this grid would leave the points where they
     // are: every crop point that is set sits on a beat (cropOnGrid; an unset point is
     // never moved), the loop is one snapLoop gives back unchanged (loopOnGrid). The panel
@@ -148,9 +185,28 @@ namespace TakeEditorMath
     constexpr int kBeatsPerBar = 4;
     // resolution (manual stepping, phase 2): 0 = the automatic density above; each step
     // up doubles the beats from line to line, each step down halves them, never finer
-    // than one line per beat. Clamped to -kMaxResolutionStep..kMaxResolutionStep.
+    // than kMinSnapStepBeats (1/64 beat). Clamped to -kMaxResolutionStep..kMaxResolutionStep.
     constexpr int kMaxResolutionStep = 6;
+    // R3 2026-11-11, warp marker quantize (pure). The note values of the Quantize box,
+    // finest first: 1/64T 1/64 1/32T 1/32 1/16T 1/16 1/8T 1/8 1/4T 1/4 1/2T 1/2 1 bar
+    // (a quarter = one beat, a triplet = 2/3 of the straight value).
+    int quantizeChoiceCount();
+    juce::String quantizeChoiceName (int choice);
+    double quantizeChoiceBeats (int choice); // beats from line to line; 0 for a choice out of range
+    constexpr int kQuantizeDefaultChoice = 5; // 1/16
+    // Moves every selected marker (selected[i], dst time) strengthPct percent (0..100,
+    // 100 = exact) of the way to its nearest grid line stepBeats apart from the grid's
+    // downbeat. Each move goes through WarpMarkers::moveTo, so the order and kMinGapFrames
+    // hold (a target past a neighbour stops at the neighbour). The targets are worked out
+    // from the dst before the call; a few passes let markers moving the same way settle.
+    // Returns the number of markers whose dst changed. A grid that is not usable, a step
+    // <= 0 or no selection: nothing moves.
+    int quantizeMarkers (std::vector<WarpMarkers::Marker>& m, const std::vector<bool>& selected, const Grid& grid, double sampleRate,
+                         juce::int64 length, double stepBeats, double strengthPct);
     void beatLines (const View& v, const Grid& grid, double sampleRate, std::vector<BeatLine>& out, int resolution = 0);
+    // The beats from line to line of beatLines (its finest division) for this view and
+    // resolution; the snap step of dragged points. 1 for a grid that is not usable.
+    double gridStepBeats (const View& v, const Grid& grid, double sampleRate, int resolution = 0);
     // Loop length jump (phase 2): the loop start stays, the length halves (doubleIt false)
     // or doubles. false and the points unchanged when there is no loop, the half would be
     // shorter than minLen, or the double would run past length.
@@ -216,6 +272,9 @@ namespace TakeEditorMath
     // a flag." (level 1) or "... Ends join badly, the level dips (-0.75); try moving a
     // flag." (level 2).
     juce::String resultText (const HotStepLinkProcessor::TakeEditReport& report, const TakeEdit::EditOptions& asked);
+    // zeromove: where Zero crossing moved the cuts, e.g. 'cuts moved: start +0.8 ms, end -1.2 ms'
+    // (signed, + = later in the file). Empty when the snap was not asked or not applied.
+    juce::String zeroMoveText (const TakeEdit::EditResult& result);
     int resultTone (const HotStepLinkProcessor::TakeEditReport& report);
     // As resultTone, and for a loop that was made with a seam warning: 4 = level 1
     // (amber), 5 = level 2 (the error colour).
@@ -254,6 +313,16 @@ namespace TakeEditorMath
     // (only the right button alone clears, Ctrl + left on macOS makes a loop, a right
     // press that ends a drag clears); mutClearMidDrag = lanePress ignores dragOn;
     // mutOpenNoEndDrag = open() does not end a drag of the take shown before.
+    // R1 2026-11-11 (snap follows the grid): mutLoopSnapBeats = snapLoop uses the old
+    // whole-beat rule (0 and the file end not targets, beats only); mutGridFloorBeat =
+    // the grid resolution and the snap step stay at one beat or more.
+    // R1b 2026-11-11 (beatgrid editing): mutGridEditIgnored = effectiveGrid gives the
+    // detected grid (the hand grid is never drawn or snapped on); mutGridNoWrap =
+    // wrapDownbeat gives sec back unwrapped; mutGridBpmMovesDownbeat = gridWithBpm keeps
+    // the first beat after 0 in place of the downbeat, i.e. sets downbeat 0;
+    // mutGridNotStored = the panel does not call onSetGrid (the hand grid is lost when the
+    // editor closes); mutGridMarkersStale = an edited grid leaves untouched warp markers
+    // on the old bar starts.
     // o135 round B (takesnap group, item 8): mutGridStale = setLiveGrid does nothing,
     // so the panel keeps the grid it was opened with.
     // o136 (takefit group): mutFitReadoutLoose = the bars readout is shown with the
@@ -271,6 +340,15 @@ namespace TakeEditorMath
     // mutResetMovedOnly = Reset markers follows moved markers only (an added one does
     // not enable it). mutTagTight = bar.beat labels halve down to half of kMinTagPx.
     // mutRulerAlwaysClip = the ruler stops short of the playhead readout even when it is hidden.
+    // mutLoopBodyNoKeep = a loop bar body drag moves the start only (length not kept).
+    // mutWarpLimitNever = a marker drag that hits its limit never sets the limit cue.
+    // R3 (takequant group): mutQuantNoStrength = quantize moves every selected marker all
+    // the way (strength ignored); mutQuantDetectedGrid = Quantize uses the detected grid,
+    // not the grid in effect; mutSelLoopNoBounds = Select in loop selects every marker;
+    // mutLoopBodyNoSnap = a loop bar body drag ignores Snap to grid; mutLoopBodyStillWrites
+    // = a still click on the loop bar writes the edit.
+    // R4 (undo): mutUndoSkipsGrid = undo and redo do not restore the take grid;
+    // mutDragStepPerMove = a drag pushes one undo step per move instead of one per gesture.
     enum Mutant { mutNone = 0, mutPixelOff, mutClampPass, mutCancelKeeps, mutNoThrottle, mutNoUpWrite, mutNoSelfClose,
                   mutLoopNoClamp, mutFlagAnywhere, mutExportLoose, mutSeamLoose, mutButtonsOverlap,
                   mutNoButtonCheck, mutOldAnchor,
@@ -279,7 +357,27 @@ namespace TakeEditorMath
                   mutFitReadoutLoose, mutFitTempoLoose, mutFitNoHost, mutFitStretchLoose, mutFitSendAlways,
                   mutFitStretchWrong, mutFitRowTight, mutFitWarnWrong,
                   mutZoomWhole, mutZoomNoAnchor, mutZoomNoCap, mutZoomNoClamp, mutHandleEdgeClamp,
-                  mutResetMovedOnly, mutTagTight, mutRulerAlwaysClip };
+                  mutResetMovedOnly, mutTagTight, mutRulerAlwaysClip,
+                  mutLoopSnapBeats, mutGridFloorBeat,
+                  mutGridEditIgnored, mutGridNoWrap, mutGridBpmMovesDownbeat, mutGridNotStored, mutGridMarkersStale,
+                  mutLoopBodyNoKeep, mutWarpLimitNever,
+                  mutQuantNoStrength, mutQuantDetectedGrid, mutSelLoopNoBounds, mutLoopBodyNoSnap, mutLoopBodyStillWrites,
+                  mutUndoSkipsGrid, mutDragStepPerMove,
+                  mutCueOnLane, mutLoopMovesOther, mutWarpResetsNoHost, mutGridDropsHand, mutFitIgnoresTakeBpm,
+                  mutExportTextStatic, mutExportTextNarrow,
+                  mutR2OffsetNoReset, mutR2CountAsOne, mutR2HintWrong, mutR2Narrow,
+                  mutZeroMoveHidden };
+    // zeromove: mutZeroMoveHidden = the result line never says where the zero crossing moved the cuts.
+    // readouts2: mutR2OffsetNoReset = Set 1 keeps the old offset zero; mutR2CountAsOne = several selected
+    // markers read as '1 marker at'; mutR2HintWrong = the hint names gestures the code does not have;
+    // mutR2Narrow = the grid offset readout is laid out 20 px wide.
+    // readouts1: mutExportTextStatic = the Export loop button keeps its plain text when Repeats changes;
+    // mutExportTextNarrow = the Export loop button is laid out 64 px wide, too narrow for 'Export loop x4'.
+    // mutFitIgnoresTakeBpm = open() fills the Fit to bars tempo from the typed or host value, not the take's.
+    // Gap round 1: mutCueOnLane = the Shift / limit cue is drawn back on the marker lane's right end.
+    // B2: mutLoopMovesOther = a flag drag snaps the other flag too (before B1);
+    // mutWarpResetsNoHost = the editor passes the manual tempo as the Warp to host tempo (B3 bug);
+    // mutGridDropsHand = a grid edit rebuilds hand-placed warp markers on the new bar starts.
     extern std::atomic<int> testMutant;
 }
 
@@ -301,6 +399,11 @@ public:
         juce::String tempoText;   // the cell's tempo tag text, may be empty
         TakeEdit::EditData edit;  // the points the take has now
         TakeEditorMath::Grid grid; // the take's measured tempo and downbeat; measured false = no grid
+        TakeEdit::GridEdit gridEdit; // R1b: the hand-set grid of the take (HslinkTakeEntry::gridEdit)
+        std::vector<WarpMarkers::Marker> warpMarkers; // C1: stored warp (HslinkTakeEntry), empty = auto
+        bool warpMarkersEdited = false;
+        double warpTagBpm = 0.0;
+        double takeBpm = 0.0;     // the take's measured or estimated tempo, 0 = none: Fit to bars opens on it
     };
 
     TakeEditorPanel();
@@ -343,6 +446,7 @@ public:
     void mouseDrag (const juce::MouseEvent&) override;
     void mouseUp (const juce::MouseEvent&) override;
     void mouseMove (const juce::MouseEvent&) override;
+    bool keyPressed (const juce::KeyPress&) override; // R4: Ctrl+Z undo, Ctrl+Y and Ctrl+Shift+Z redo
     void mouseDoubleClick (const juce::MouseEvent&) override; // marker: reset; empty lane or wave (Warp on): add
     int addWarpMarkerAtX (double xInWave);
     bool removeWarpMarker (int index); // Alt + click; never the end anchors
@@ -372,6 +476,9 @@ public:
     // returns the job's ticket (0 = not started, whyNot says why). onReport fills the
     // report of that ticket and returns true once the job has finished.
     std::function<bool (const juce::File&, const TakeEdit::EditData&)> onSetEdit;
+    std::function<bool (const juce::File&, const TakeEdit::GridEdit&)> onSetGrid; // R1b: stores the hand grid on the take
+    // C1: stores the warp on the take (markers, edited flag, tag tempo); empty markers = auto.
+    std::function<bool (const juce::File&, const std::vector<WarpMarkers::Marker>&, bool, double)> onSetWarp;
     std::function<juce::uint64 (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String& whyNot)> onApply;
     std::function<bool (juce::uint64 ticket, HotStepLinkProcessor::TakeEditReport&)> onReport;
     // getTakeEditState of the processor. The 30 s of kApplyTimeoutMs start when the job
@@ -388,6 +495,9 @@ public:
     // Apply crop with Fit to bars on is off until a valid tempo is typed. onStretch: requestTakeStretch of the processor for
     // the listed take with this name (the take an Apply just made); false = not started.
     std::function<double()> onHostBpm;
+    // B4. onWarpHostBpm: the real host tempo for Warp to host, 0 when there is no host
+    // (Standalone, or the host gives no tempo). Never the manual tempo. Not set = no host.
+    std::function<double()> onWarpHostBpm;
     std::function<bool (const juce::String& takeName, double fromBpm, double toBpm)> onStretch;
     // Audition (Play, Stop, Loop in the zoom row): play, stop, setLoop and getState of
     // the processor's EditorAudition. Play sends the loop region in frames of the file
@@ -400,6 +510,11 @@ public:
     std::function<void (const std::vector<WarpMarkers::Marker>&)> onAuditionWarp;
     std::function<void()> onAuditionStop;
     std::function<void (bool)> onAuditionLoop;
+    // Metronome: the Click toggle, with the take's grid tempo and first beat (seconds).
+    std::function<void (bool on, double bpm, double downbeatSec)> onAuditionClick;
+    juce::Button& clickButtonForTest() { return clickButton; }
+    // F1: the crop region (frames of the file) and the level shaping of the take for the audition.
+    std::function<void (juce::int64 cropStart, juce::int64 cropEnd, juce::int64 length, const TakeEdit::EditData&)> onAuditionLevel;
     // The loop brace moved (start, end, length in frames of the file, as onAuditionPlay):
     // the playing audition follows at once. Sent from tick() when the region changes.
     std::function<void (juce::int64 start, juce::int64 end, juce::int64 length)> onAuditionRegion;
@@ -428,18 +543,41 @@ public:
     // testClockAtClick: the timeout counts from the click whatever onJobState says, as
     // before the job state.
     static std::atomic<bool> testMatchByName, testNoTimeout, testKeepExpiredTicket, testClockAtClick;
+    static std::atomic<bool> testOpenWipesWarp; // teeth TS_OPEN_WIPES_WARP: open ignores the take's stored warp
+    static std::atomic<bool> testUndoClearedOnOpen; // teeth UNDO_CLEARED_ON_OPEN: open starts every take with an empty history
+    static std::atomic<bool> testNormOff, testLevelNotInUndo, testOldLevelLayout; // F1 teeth LV_NORM_OFF, LV_NOT_IN_UNDO; F2 LF_OLD_LAYOUT
+    juce::Slider& levelBoxForTest (int i) { juce::Slider* b[] = { &fadeInBox, &fadeOutBox, &xfadeBox, &gainBox }; return *b[juce::jlimit (0, 3, i)]; }
+    static std::atomic<bool> testNoFocusGrab; // teeth: a click inside the panel does not take keyboard focus
+    static std::atomic<bool> testNoCtrlCharMap; // teeth: Ctrl+letter control codes (0x1A) are not mapped back to letters
 
     // Test access (no display): handle frames, a drag given in frames, the peak state.
     juce::int64 getCropStartForTest() const { return cropStart; }
     juce::int64 getCropEndForTest() const { return cropEnd; }
     juce::int64 getLengthForTest() const { return length; }
     bool headerReadyForTest() const { return length > 0; }
-    bool peaksReadyForTest() const { return peaks != nullptr && peaks->ok; }
+    // F1 level row test hooks
+    void setLevelForTest (double fadeIn, double fadeOut, double xfade, double gain)
+    {
+        fadeInBox.setValue (fadeIn, juce::sendNotificationSync); fadeOutBox.setValue (fadeOut, juce::sendNotificationSync);
+        xfadeBox.setValue (xfade, juce::sendNotificationSync); gainBox.setValue (gain, juce::sendNotificationSync);
+    }
+    void normalizeForTest() { normalizeGain(); }
+    void clickReverseForTest() { if (reverseButton.onClick) reverseButton.onClick(); }
+    bool reverseShownForTest() const { return reverseButton.getToggleState(); }
+    juce::Rectangle<int> reverseBoundsForTest() const { return reverseButton.getBounds(); }
+    TakeEdit::EditData levelEditForTest() const { return take.edit; }
+    juce::String levelTextForTest (int i)
+    {
+        juce::Slider* b[] = { &fadeInBox, &fadeOutBox, &xfadeBox, &gainBox };
+        return b[juce::jlimit (0, 3, i)]->getTextFromValue (b[juce::jlimit (0, 3, i)]->getValue());
+    }
+    double previewPeakDbForTest() const { return previewPeakDb(); }
+        bool peaksReadyForTest() const { return peaks != nullptr && peaks->ok; }
     bool peaksFailedForTest() const { return peakError.isNotEmpty(); }
     juce::Thread::ThreadID peaksThreadForTest() const { return peaks != nullptr ? peaks->buildThread : juce::Thread::ThreadID(); }
     // The same path as the mouse: begin takes the handle, drag moves it to a frame
     // (clamped, throttled write), end is the mouse up (always writes).
-    void beginDragForTest (TakeEditorMath::Handle h) { dragging = h; dragLoop = false; grabOffset = 0.0; }
+    void beginDragForTest (TakeEditorMath::Handle h) { endGesture(); beginGesture(); dragging = h; dragLoop = false; grabOffset = 0.0; }
     void dragToFrameForTest (juce::int64 frame) { moveHandleTo (frame); }
     void endDragForTest() { endDrag(); }
     TakeEditorMath::Handle handleAtForTest (juce::Point<int> p) const { return handleAt (p); }
@@ -454,11 +592,14 @@ public:
     juce::int64 getLoopStartForTest() const { return loopStart; }
     juce::int64 getLoopEndForTest() const { return loopEnd; }
     bool hasLoopForTest() const { return hasLoop(); }
-    void beginLoopDragForTest (TakeEditorMath::Handle h) { dragging = hasLoop() ? h : TakeEditorMath::handleNone; dragLoop = true; loopJustMade = false; loopAnchor = -1; grabOffset = 0.0; }
-    void createLoopForTest (juce::int64 frame) { createLoopAt (frame); endDrag(); }
+    void beginLoopDragForTest (TakeEditorMath::Handle h) { endGesture(); beginGesture(); dragging = hasLoop() ? h : TakeEditorMath::handleNone; dragLoop = true; loopJustMade = false; loopAnchor = -1; grabOffset = 0.0; }
+    void createLoopForTest (juce::int64 frame) { endGesture(); beginGesture(); createLoopAt (frame); endDrag(); }
     void clearLoopForTest() { clearLoop(); }
     TakeEditorMath::Handle flagAtForTest (juce::Point<int> p) const { return flagAt (p); }
-    void setRepeatsForTest (int n) { repeatsBox.setValue ((double) n, juce::dontSendNotification); }
+    void setRepeatsForTest (int n) { repeatsBox.setValue ((double) n, juce::sendNotificationSync); }
+    juce::String exportTextForTest() const { return exportButton.getButtonText(); }
+    // The Export loop text at the look's 12 pt bold fits the button less its 4 px side margins.
+    bool exportTextFitsForTest (float* textW = nullptr, int* roomW = nullptr) const;
     int getRepeatsForTest() const { return repeats(); }
     void clickExportLoopForTest() { exportLoop(); }
     bool exportLoopEnabledForTest() const { return exportButton.isEnabled(); }
@@ -520,6 +661,8 @@ public:
     // The beat lines the ruler paints now; x in panel coordinates. Empty = the ruler shows seconds.
     std::vector<TakeEditorMath::BeatLine> beatLinesForTest() const;
     int getResolutionForTest() const { return gridResolution; }
+    double snapStepBeats() const;      // R1: the snap step in beats, = the finest ruler division now
+    juce::int64 snapToStep (juce::int64 frame) const; // R1: nearest line snapStepBeats() apart (warp markers)
     void stepResolution (int delta);   // the grid resolution box steps (phase 2), per panel, not saved
     void scaleLoopLength (bool doubleIt); // /2 and x2 (phase 2), GUI and edit state only
     bool rulerShowsBeatsForTest() const { return gridIsUsable() && length > 0; }
@@ -531,7 +674,7 @@ public:
     void setFitBpmForTest (const juce::String& typed) { tempoField.setText (typed, juce::dontSendNotification); tempoTyped(); }
     double getFitBpmForTest() const { return fitBpm; }
     // The Fit to bars tempo only when the user typed it, else 0 (the host default is not one).
-    double userFitBpm() const { return tempoByUser ? fitBpm : 0.0; }
+    double userFitBpm() const { return tempoByUser ? userBpm : 0.0; }
     juce::String tempoFieldTextForTest() const { return tempoField.getText(); }
     juce::String fitTextForTest() const { return barsLabel.getText(); }
     bool fitTextFitsForTest() const { return textFits (barsLabel); }
@@ -548,6 +691,7 @@ public:
     const std::vector<WarpMarkers::Marker>& warpMarkersForTest() const { ensureWarp(); return warpMarkers; }
     void dragWarpForTest (int index, juce::int64 dstFrame) { ensureWarp(); WarpMarkers::moveTo (warpMarkers, (std::size_t) index, dstFrame, length); repaint(); }
     void auditionPlayForTest() { auditionPlay(); }
+    void auditionStopForTest() { auditionStop(); } // editor-shot: the hand-off check presses Play; the shot stops it again
     int addWarpMarkerAtXForTest (double xInWave) { return addWarpMarkerAtX (xInWave); }
     bool warpResetEnabledForTest() const { return warpResetButton.isEnabled(); }
     bool removeWarpMarkerForTest (int index) { return removeWarpMarker (index); }
@@ -564,12 +708,92 @@ public:
     // Dev shot hooks (Standalone --shot-* flags): marker drag via the mouse path, zoom to a range.
     bool shotDragWarp (int marker, double dstSec, bool snap);
     void shotZoom (double startSec, double endSec);
+    // R2: the marker limit cue (marker index, -1 = none, and its lane text) and the grid row labels.
+    int warpLimitMarkerForTest() const { return warpLimitMarker; }
+    juce::String warpLimitTextForTest() const { return warpLimitText; }
+    juce::String warpHostNoteForTest() const { return warpHostNote; }
+    juce::StringArray gridRowTextsForTest() const { return { gridEarlierButton.getButtonText(), gridLaterButton.getButtonText(), gridHalfButton.getButtonText(), gridDoubleButton.getButtonText(), gridBpmUnit.getText() }; }
+    // R3: marker selection and quantize, as the clicks do them.
+    void selectWarpMarkerForTest (int i, bool shift) { ensureWarp(); selectWarpMarker (i, shift); }
+    int selectWarpInFramesForTest (juce::int64 d0, juce::int64 d1, bool add) { ensureWarp(); return selectWarpInFrames (d0, d1, add); }
+    int clickSelectInLoopForTest() { return selectWarpInLoop(); }
+    bool warpSelectedForTest (int i) const { return warpSelectedAt (i); }
+    int warpSelectedCountForTest() const { int n = 0; for (bool b : warpSelectionMask()) n += b ? 1 : 0; return n; }
+    void setQuantizeForTest (int choice, double strengthPct) { quantizeBox.setSelectedItemIndex (choice, juce::dontSendNotification); quantizeStrengthBox.setValue (strengthPct, juce::dontSendNotification); }
+    int clickQuantizeForTest() { return quantizeSelected(); }
+    bool quantizeEnabledForTest() const { return quantizeButton.isEnabled(); }
+    bool selectInLoopEnabledForTest() const { return warpSelLoopButton.isEnabled(); }
+    juce::String warpLaneHintForTest() const { return quantizeHint(); }
+    void setWarpBoxForTest (int x0, int x1) { warpBoxX0 = x0; warpBoxX1 = x1; repaint(); } // shot: a box mid-drag
     void setWarpForTest (bool on) { warpButton.setToggleState (on, juce::dontSendNotification); refreshButtons(); }
     // The warp redraw (4eed68e): the source frame a wave column at warped frame d reads,
     // the dst a marker drag lands on (Shift = free), and a double-click on marker i.
     juce::int64 columnSourceForTest (juce::int64 d) const { return columnSource (d); }
     juce::int64 warpDragTargetForTest (juce::int64 dst, bool shift) const { return warpDragTarget (dst, shift); }
     void doubleClickWarpMarkerForTest (int i) { ensureWarp(); warpMarkerDoubleClicked (i); }
+    // R1b beatgrid editing: the grid row, as a click does it.
+    void gridSetDownbeatForTest (juce::int64 frame) { setGridDownbeat (frame); }
+    void gridNudgeForTest (double deltaSec) { applyGridEdit (TakeEditorMath::gridShifted (take.grid, deltaSec)); }
+    void gridBpmStepForTest (double delta) { gridBpmStep (delta); }
+    void gridTypeBpmForTest (const juce::String& typed) { gridBpmField.setText (typed, juce::dontSendNotification); gridBpmTyped(); }
+    void gridHalfForTest() { applyGridEdit (TakeEditorMath::gridScaled (take.grid, 0.5)); }
+    void gridDoubleForTest() { applyGridEdit (TakeEditorMath::gridScaled (take.grid, 2.0)); }
+    void gridResetForTest() { resetGrid(); }
+    void gridRulerDragForTest (juce::int64 pressFrame, juce::int64 nowFrame);
+    const TakeEditorMath::Grid& detectedGridForTest() const { return detectedGrid; }
+    const TakeEdit::GridEdit& gridEditForTest() const { return take.gridEdit; }
+    juce::String gridBpmTextForTest() const { return gridBpmField.getText(); }
+    void setClickFrameForTest (juce::int64 f) { lastClickFrame = f; refreshButtons(); }
+    bool gridSetEnabledForTest() const { return gridSetButton.isEnabled(); }
+    bool gridResetEnabledForTest() const { return gridResetButton.isEnabled(); }
+    bool gridHalfEnabledForTest() const { return gridHalfButton.isEnabled(); }
+    bool gridDoubleEnabledForTest() const { return gridDoubleButton.isEnabled(); }
+    // readouts2: the grid offset readout and the warp marker line (count, time, gesture hint).
+    juce::String gridOffsetTextForTest() const { return gridOffsetLabel.getText(); }
+    juce::String warpInfoTextForTest() const { return warpInfoLabel.getText(); }
+    static juce::String warpGestureHintForTest() { return warpGestureHint(); }
+    bool readouts2FitForTest() const;
+    // R4 undo and redo. One snapshot (crop, loop, take grid, warp markers) is pushed per
+    // committed gesture: a button click, or a drag on its mouse up. A gesture that changes
+    // nothing pushes nothing. History capped at kUndoCap; a new step clears the redo list.
+    struct UndoSnapshot
+    {
+        juce::int64 cropStart = 0, cropEnd = 0, loopStart = -1, loopEnd = -1;
+        TakeEdit::GridEdit gridEdit;
+        std::vector<WarpMarkers::Marker> markers;
+        bool markersEdited = false;
+        double warpTagBpm = 0.0;
+        double fadeInMs = 0.0, fadeOutMs = 0.0, loopXfadeMs = 0.0, gainDb = 0.0; // F1 level shaping
+        bool reverse = false;
+        bool sameEdit (const UndoSnapshot& o) const;
+    };
+    static constexpr int kUndoCap = 100;
+    bool undo();
+    bool redo();
+    bool undoForTest() { return undo(); }
+    bool redoForTest() { return redo(); }
+    int undoDepthForTest() const { return (int) undoStack.size(); }
+    int historyTakesForTest() const { return (int) histories.size(); }
+    // C3: the undo history of a take is kept for the session across Close and reopen;
+    // a deleted take forgets its history. Not saved in the state.
+    void forgetHistory (const juce::File& takeFile);
+    // D2: forget every history whose take temp path is not in keep (a loaded state replaced the list).
+    void forgetHistoriesExcept (const juce::StringArray& keep)
+    {
+        for (auto it = histories.begin(); it != histories.end();)
+            it = keep.contains (it->first) ? std::next (it) : histories.erase (it);
+    }
+    static constexpr int kHistoryTakes = 64;
+    int redoDepthForTest() const { return (int) redoStack.size(); }
+    UndoSnapshot snapshotForTest() const { return takeSnapshot(); }
+    bool undoEnabledForTest() const { return undoButton.isEnabled(); }
+    bool redoEnabledForTest() const { return redoButton.isEnabled(); }
+    bool keyForTest (const juce::KeyPress& k) { return keyPressed (k); }
+    juce::Button& undoButtonForTest() { return undoButton; }
+    juce::Button& redoButtonForTest() { return redoButton; }
+    void beginGestureForTest() { beginGesture(); } // a mouse down
+    void endGestureForTest() { endGesture(); }     // a mouse up
+    void loopBodyDragForTest (juce::int64 pressFrame, juce::int64 nowFrame); // body press, one move, release
     struct Area { juce::String name; juce::Rectangle<int> bounds; bool hit = false; bool button = false; };
     std::vector<Area> areasForTest() const;
 
@@ -630,6 +854,7 @@ private:
     void showReport (const HotStepLinkProcessor::TakeEditReport& r);
     void exportLoop();
     bool textFits (const juce::Label&) const;
+    void updateExportText();
     juce::uint32 nowMs() const { return clockForTest ? clockForTest() : juce::Time::getMillisecondCounter(); }
     TakeEdit::EditOptions askedOptions;
     void applyCrop();
@@ -648,6 +873,7 @@ private:
     double fitBpm = 0.0;        // 0 = not set (no host tempo and nothing typed), never 120
 #endif
     bool tempoByUser = false;   // a tempo was typed: open() no longer asks the host tempo
+    double userBpm = 0.0;       // the tempo typed last, kept apart from a take tempo shown in the field
     void fitChanged();          // the toggle
     void tempoTyped();          // the tempo field lost its editor
     void stretchToFit();
@@ -674,12 +900,36 @@ private:
     mutable bool warpBuilt = false;
     bool markersEdited = false; // a marker added or removed by hand since the auto placement
     int warpDrag = -1;              // marker index in the drag, -1 = none
+    // R2: a marker drag that hit its limit: that marker draws red and a short status
+    // text shows in the warp lane, fading over kWarpLimitFadeMs after the last hit.
+    int warpLimitMarker = -1;
+    juce::String warpLimitText;
+    juce::String warpHostNote; // B1: shown in the lane cue when Warp to host has no host tempo
+    juce::uint32 warpLimitMs = 0;
+    // R3: the selected warp markers, kept by source frame (a drag or quantize moves dst
+    // only, so the key stays put while indices shift on add and remove).
+    std::vector<juce::int64> warpSelSrc;
+    int warpBoxX0 = -1, warpBoxX1 = -1; // a box being dragged in the marker lane (panel x), -1 = none
+    bool warpBoxAdd = false;            // Shift held at the box press: add to the selection
+    bool warpSelectedAt (int i) const;
+    std::vector<bool> warpSelectionMask() const;
+    void selectWarpMarker (int i, bool toggle); // click (only this one) or Shift-click (toggle)
+    int selectWarpInFrames (juce::int64 d0, juce::int64 d1, bool add); // dst inside d0..d1
+    int selectWarpInLoop();
+    int quantizeSelected();
+    juce::String quantizeHint() const;
+    // R2: dragging the loop bar body moves the whole loop; pointer frame minus loopStart.
+    bool loopBodyDrag = false;
+    juce::int64 loopBodyOffset = 0, loopBodyFrom = 0; // loopStart at the press: a click that moves nothing writes nothing
+    bool loopBodyAt (juce::Point<int> p) const;
     juce::int64 columnSource (juce::int64 warpedFrame) const; // renderWave's column map
     juce::int64 warpDragTarget (juce::int64 dst, bool shiftDown) const; // marker drag snap
     void releaseDrag(); // mouseUp body
     void warpDragMove (juce::int64 frame, bool shiftDown); // one drag step of marker warpDrag (mouse and shot hook)
     void warpMarkerDoubleClicked (int i); // remove, or reset an end anchor
     void ensureWarp() const;
+    void storeWarp(); // C1: hands the warp to onSetWarp
+    Take openedWarp; // C1: the take as opened; Cancel stores its warp again
     int warpMarkerAt (juce::Point<int> p) const;
     void paintWarp (juce::Graphics&) const;
     // Round 3: the warp buttons. warpTagBpm: the tempo Warp to host warped to (the acid
@@ -688,6 +938,20 @@ private:
     double warpTargetBpm() const;   // host tempo, else the Fit to bars tempo; 0 = none
     void warpToHost();
     void resetMarkers();
+    // R1b beatgrid editing. detectedGrid: the grid from detection (open, setLiveGrid);
+    // take.grid = effectiveGrid (detectedGrid, take.gridEdit).
+    TakeEditorMath::Grid detectedGrid;
+    juce::int64 lastClickFrame = -1;     // the last press on the ruler or the waveform, -1 = none
+    juce::int64 gridDragFrame = -1;      // Ctrl/Cmd + drag on the ruler: the press frame, -1 = none
+    TakeEditorMath::Grid gridDragFrom;   // the grid at that press
+    void applyGridEdit (const TakeEdit::GridEdit& e);
+    void storeGridEdit (const TakeEdit::GridEdit& e); // stores (onSetGrid) and draws; set false = detected
+    void gridChanged (const TakeEditorMath::Grid& before); // markers, bpm field, texts, repaint
+    void setGridDownbeat (juce::int64 frame);
+    void gridBpmStep (double delta);
+    void gridBpmTyped();
+    void resetGrid();
+    juce::int64 gridSetFrame() const;    // the playhead when shown, else lastClickFrame
     void applyWarp();
     int playheadX() const;          // x in panel coordinates, -1 when hidden or out of view
     // Horizontal zoom and pan (not persisted). zoom 1 = whole take.
@@ -723,14 +987,85 @@ private:
     TempoLabel tempoField;
     juce::ToggleButton snapGridButton { "Snap to grid" }, zeroButton { "Zero crossing" }, fitButton { "Fit to bars" },
                        loopButton { "Loop" };
-    juce::TextButton playButton { "Play" }, stopButton { "Stop" }, loopHalfButton { "/2" }, loopDoubleButton { "x2" };
+    juce::TextButton playButton { "Play" }, stopButton { "Stop" }, loopHalfButton { "Loop /2" }, loopDoubleButton { "Loop x2" };
     juce::Slider repeatsBox;
     juce::Slider gridResBox; // manual grid resolution (phase 2): -6..6, 0 = automatic
     juce::TextButton closeButton { "Close" }, resetButton { "Reset" }, cancelButton { "Cancel" }, applyButton { "Apply crop" },
                      exportButton { "Export loop" }, stretchButton { "Stretch to fit" };
     juce::ToggleButton warpButton { "Warp" };
+    juce::TextButton warpSelLoopButton { "Select in loop" }, quantizeButton { "Quantize" };
+    juce::ComboBox quantizeBox;
+    juce::Slider quantizeStrengthBox; // 0..100 %
+    // F1: the level row: fade in, fade out, loop crossfade (ms), gain (dB), Normalize, peak.
+    juce::Label fadeInLabel, fadeOutLabel, xfadeLabel, gainLabel, peakLabel;
+    juce::Slider fadeInBox, fadeOutBox, xfadeBox, gainBox;
+    juce::TextButton normalizeButton { "Normalize" };
+    juce::TextButton reverseButton { "Rev" }; // Reverse: a toggle, EditData::reverse
+    void setReverse (bool on);                // one undo step, writeEdit
+    void setLevelField (double TakeEdit::EditData::* field, double value); // one undo step, writeEdit
+    void syncLevelBoxes();
+    void normalizeGain();
+    double previewPeakDb() const; // peak of the cropped preview, -inf (<= -200) when unknown or silent
+    void refreshPeakLabel();
+    void sendAuditionLevel();
     juce::TextButton warpHostButton { "Warp to host" }, warpResetButton { "Reset markers" }, applyWarpButton { "Apply warp" };
     juce::TextButton zoomOutButton { "-" }, zoomInButton { "+" }, zoomFitButton { "Fit" }, zoomLoopButton { "Loop" };
+    // R1b: the grid row.
+    juce::Label gridLabel, gridBpmField, gridBpmUnit;
+    juce::Label gridOffsetLabel, warpInfoLabel; // readouts2
+    juce::ToggleButton clickButton { "Click" }; // metronome on the audition, audition only
+    void sendClick();
+    double gridAnchorSec = 0.0;                 // readouts2: the downbeat the offset counts from
+    juce::String gridOffsetText() const;
+    juce::String warpInfoText() const;
+    static juce::String warpGestureHint();
+    void refreshReadouts2();
+    juce::Label tempoUnit, gridResLabel; // gap round 1: "BPM" after the Fit to bars tempo, "Res" before the grid resolution box
+    juce::Label quantizeToLabel, quantizeStrengthLabel; // the quantize row words, as gridLabel
+    juce::TextButton gridSetButton { "Set 1" }, gridEarlierButton { "< 1ms" }, gridLaterButton { "1ms >" },
+                     gridBpmDownButton { "-" }, gridBpmUpButton { "+" }, gridHalfButton { "Grid /2" }, gridDoubleButton { "Grid x2" },
+                     gridResetButton { "Reset grid" };
+    // R4 undo
+    std::vector<UndoSnapshot> undoStack, redoStack;
+    struct History { std::vector<UndoSnapshot> undo, redo; juce::uint64 used = 0; };
+    std::map<juce::String, History> histories; // C3: key = the take's temp file full path
+    History openedHistory; // the history as loaded at open (Cancel puts it back)
+    juce::uint64 historyClock = 0;
+    static juce::String historyKey (const juce::File& f) { return f.getFullPathName(); }
+    void saveHistory (bool cancelled);
+    void loadHistory();
+    UndoSnapshot gestureBefore;
+    bool gestureOpen = false;
+    bool restoring = false;
+    UndoSnapshot takeSnapshot() const;
+    void restoreSnapshot (const UndoSnapshot& s);
+    void beginGesture();
+    void endGesture();
+    void clearHistory();
+    void loopBodyMoveTo (juce::int64 pointerFrame); // one loop bar body drag step (mouse and test hook)
+    // One undo step around an edit, unless a gesture (a drag) is open already: then the
+    // edit joins it and the step is pushed on the mouse up.
+    struct Step
+    {
+        TakeEditorPanel& p;
+        bool own;
+        explicit Step (TakeEditorPanel& q) : p (q), own (! q.gestureOpen && ! q.restoring) { if (own) p.beginGesture(); }
+        ~Step() { if (own) p.endGesture(); }
+        Step (const Step&) = delete;
+        Step& operator= (const Step&) = delete;
+    };
+    // v0.5.19: any click inside the panel (children included) gives the panel keyboard
+    // focus so Ctrl+Z / Ctrl+Y reach keyPressed. A click in a TextEditor keeps its focus.
+    struct FocusGrabber : juce::MouseListener
+    {
+        explicit FocusGrabber (TakeEditorPanel& p) : panel (p) {}
+        void mouseDown (const juce::MouseEvent& e) override;
+        TakeEditorPanel& panel;
+    };
+    FocusGrabber focusGrabber { *this };
+    void grabFocusIfShowing();
+    void visibilityChanged() override;
+    juce::TextButton undoButton { "Undo" }, redoButton { "Redo" };
     juce::ScrollBar scrollBar { false };
     juce::ThreadPool pool { 1 }; // peak builds only; declared last, stopped first
 

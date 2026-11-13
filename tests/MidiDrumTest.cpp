@@ -120,6 +120,24 @@ int main()
             ++misses;
     misses += 16 - (int) std::min<size_t> (16, notes.size());
     std::printf ("  GM misses %d of 16\n", misses);
+    {
+        // Per class (row 6): every kick 36, every snare 38, hats 42 or 46 (at most 1 off).
+        bool kOk = true, sOk = true; int hatOff = 0;
+        std::printf ("  per hit note:");
+        for (size_t k = 0; k < 16; ++k)
+        {
+            const int n = k < notes.size() ? notes[k] : -1;
+            std::printf (" %s=%d", pattern[k] == kick ? "K" : pattern[k] == snare ? "S" : pattern[k] == chat ? "ch" : "oh", n);
+            if (pattern[k] == kick)  kOk = kOk && n == 36;
+            if (pattern[k] == snare) sOk = sOk && n == 38;
+            if (pattern[k] == chat || pattern[k] == ohat) hatOff += (n == 42 || n == 46) ? 0 : 1;
+        }
+        std::printf ("\n");
+        check (kOk, "every kick hit on note 36");
+        check (sOk, "every snare hit on note 38");
+        std::printf ("  hats off 42/46: %d of 8 (quiet last open hat reads as crash 49)\n", hatOff);
+        check (hatOff <= 1, "hat hits on note 42 or 46 (at most 1 of 8 off)");
+    }
     check (notes.size() == 16, "16 notes exported");
     check (hist.size() >= 4, "at least 4 distinct pitches");
     check (misses <= 1, "each hit type on its GM note (at most 1 miss in 16)");

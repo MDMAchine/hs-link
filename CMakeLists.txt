@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 set(PLUGIN_TARGET "HOTSTEP_LINK")
 set(PLUGIN_CODE   "Hslk")
 
-project(${PLUGIN_TARGET} VERSION 0.5.18)
+project(${PLUGIN_TARGET} VERSION 0.5.23)
 # project(VERSION) is the single version source: juce_add_plugin inherits it as JucePlugin_VersionString;
 # the console test app gets the same define below.
 set(CMAKE_CXX_STANDARD 17)
@@ -55,6 +55,8 @@ juce_add_plugin(${PLUGIN_TARGET}
     NEEDS_MIDI_OUTPUT        FALSE
     IS_MIDI_EFFECT           FALSE
     COPY_PLUGIN_AFTER_BUILD  FALSE
+    # macOS only (ignored on Windows): user-set Hot-Step URL is plain http, often a LAN or Tailscale IP.
+    PLIST_TO_MERGE           "<plist><dict><key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict><key>NSLocalNetworkUsageDescription</key><string>HOT-STEP LINK connects to your Hot-Step server on your network.</string></dict></plist>"
 )
 
 clap_juce_extensions_plugin(TARGET ${PLUGIN_TARGET}
@@ -123,6 +125,14 @@ if(HSLINK_TEETH)
     target_compile_definitions(HSLINK_MidiDrumTest PRIVATE HSLINK_TEETH_${HSLINK_TEETH}=1)
 endif()
 target_link_libraries(HSLINK_MidiDrumTest PRIVATE juce::juce_audio_basics juce::juce_audio_formats juce::juce_recommended_config_flags)
+
+# Console test for the melody export (M2) and the shared hits/melody origin (G1).
+# HSLINK_MELODY_OLD_API=1 on this target builds against the pre-origin notes API (teeth).
+juce_add_console_app(HSLINK_MidiMelodyTest PRODUCT_NAME "HSLINK_MidiMelodyTest")
+target_sources(HSLINK_MidiMelodyTest PRIVATE tests/MidiMelodyTest.cpp)
+target_include_directories(HSLINK_MidiMelodyTest PRIVATE source)
+target_compile_definitions(HSLINK_MidiMelodyTest PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
+target_link_libraries(HSLINK_MidiMelodyTest PRIVATE juce::juce_audio_basics juce::juce_audio_formats juce::juce_recommended_config_flags)
 
 # Console test for the WAV tempo tag injector (acid + smpl chunks).
 juce_add_console_app(HSLINK_WavTagTest PRODUCT_NAME "HSLINK_WavTagTest")

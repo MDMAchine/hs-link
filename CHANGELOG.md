@@ -6,6 +6,35 @@ Development through v0.4.0 happened inside the MDMAchine_VST monorepo. The plugi
 
 ---
 
+## v0.5.23 -- 2026-11-13
+
+Changes since v0.5.22:
+
+- Fixed: the MiniMax-M3 take card no longer sticks on loading; the waveform falls back to the stable copy when the temp WAV is gone, and kept cells re-point (29f7fc7, proof shot b033d48).
+- Debug file logger for take registration, saver, cleanup and card path, enabled with HSLINK_DEBUG_LOG=1 (fed60f7, 9b3686d).
+- Note: MiniMax-M3 may return longer audio than requested (19.2 s and 22.3 s seen for a 15 s request).
+
+## v0.5.22 -- 2026-11-13
+
+Changes since v0.5.21:
+
+- QUEUE counts only queued and running jobs (161b3aa).
+- Status pill names the selected backend (161b3aa).
+- BACKEND_MATRIX: note that MiniMax-M3 may return longer audio than requested (17833b4).
+
+Known open: the MiniMax-M3 take card can stay on loading (fixed in v0.5.23).
+
+## v0.5.21 -- 2026-11-13
+
+Changes since v0.5.20 (4c4f830):
+
+- TAKES and QUEUE header counters repaint when the count or the job in flight changes (b1e6a71).
+- Backend picker and GENERATE row: five backend cards, adding MiniMax-M3 and HeartMuLa (863ee3d, 5c13227).
+- MIDI export: drum notes use the General MIDI map (kick 36, snare 38, hats 42/46, toms, cymbals) with a per-take relative fallback (863ee3d, c72fb1b).
+- COLLECTION: MiniMax and HeartMuLa filter chips; wider Q combo (ac7e6c7).
+- Per-take seeds: take i of a batch uses base seed + i (a74a7b1).
+- Level option: Off / Peak guard / Normalise to -1 dBTP, saved in state; the job line shows the boost or cut (a74a7b1).
+
 ## v0.5.18 -- 2026-11-11
 
 - Tempo source: the take tempo now comes from the file name or the host tempo, and the header label shows which one is in use.
@@ -249,7 +278,7 @@ Development through v0.4.0 happened inside the MDMAchine_VST monorepo. The plugi
 
 ## [0.5.x] - 2026-10-02
 
-Split to its own repository. The plugin ID changed: company `HOT-Step`, bundle `com.hotstep.link`, manufacturer code `Hstp`. Projects saved with earlier builds will not reload state automatically because the plugin identity changed.
+Split to its own repository. The plugin ID changed (company `HOT-Step`, new plugin identity). Projects saved with earlier builds will not reload state automatically because the plugin identity changed.
 
 - ACE model choice (Auto, Turbo, Base): sends the optional `model` field on generate for the ACE backend only; Auto omits it, lego forces `base` and greys out Turbo, Base greys out when the server reports `base_available: false`. The job status line shows the server-reported `dit_model`. Stub test `HSLINK_Tests acemodel`, teeth build `-DHSLINK_TEETH=NO_MODEL`.
 

@@ -1,12 +1,24 @@
 # HOT-STEP LINK user manual
 
-Version 0.5.14. This manual covers the plugin (VST3 and CLAP, which behave the same) and the Standalone application together; differences between the two are called out in each section.
+Version 0.5.23 beta. This manual covers the plugin (VST3 and CLAP, which behave the same) and the Standalone application together; differences between the two are called out in each section.
 
 ---
 
 ## Overview
 
 HOT-STEP LINK sends generation requests to a local HOT-Step server and plays back the results inside your DAW session. It does not generate audio itself: everything computational happens in HOT-Step. The plugin's job is to capture source audio, describe what you want, trigger generation, and let you audition and export the takes that come back.
+
+![Main window](images/LINK_main.png)
+
+The main window of the Standalone (v0.5.20) with no HOT-Step server running: the offline banner covers the Generate controls only; the take list, take editor, audition and export work without a server.
+
+---
+
+## Installing and first open
+
+Windows: the files are not code-signed, so SmartScreen warns on the first run of the Standalone. Click "More info", then "Run anyway".
+
+Mac: the Mac bundles are ad-hoc signed, not notarized. On first open macOS may block them. If so, right-click the app or bundle and choose Open, or go to System Settings > Privacy & Security and click Open Anyway. If Logic Pro does not list LINK, open Settings > Plug-in Manager, select it and click "Reset and Rescan Selection"; a failed scan usually means the first-open approval was missed.
 
 ---
 
@@ -21,6 +33,10 @@ The pill colour and label also track the current job state: grey `offline`, whit
 ---
 
 ## Server URL and key
+
+Click SETTINGS in the header to open the settings panel. It holds the Server URL, DAW key, Mode, Backend and ACE model fields.
+
+![Settings panel open](images/LINK_settings.png)
 
 The Server URL field sets the HOT-Step address. The default is `http://127.0.0.1:3001`. Change it if HOT-Step is on a different machine or port.
 
@@ -109,9 +125,9 @@ Picks which ACE-Step DiT the server uses. Auto sends nothing (the server keeps i
 
 ## Duration and takes
 
-The Duration slider sets the requested clip length in seconds (sent as `duration_s`). For YuE2 this is used only as a trim ceiling; the full render time is independent of duration.
+The Duration slider sets the requested clip length in seconds (5 to 240, default 30, sent as `duration_s`). For YuE2 this is used only as a trim ceiling; the full render time is independent of duration.
 
-The Takes slider sets how many takes to request. SA3 ignores this and returns one. ACE runs takes as serial jobs. YuE2 batch-4 is the most efficient for generating multiple takes.
+The Takes slider sets how many takes to request (1 to 8, default 4). SA3 ignores this and returns one. ACE runs takes as serial jobs. YuE2 batch-4 is the most efficient for generating multiple takes.
 
 ## Guidance and steps
 
@@ -178,7 +194,9 @@ If the takes are still unsaved when the plugin closes, their temporary session f
 
 ## Takes grid
 
-Takes appear as cells in the scrollable grid as they download. Each cell shows a waveform thumbnail, a star toggle, a `+` button for the Collection and an `x` button to delete the take. Click a cell to select that take for audition. Click the star to mark it as a keeper.
+Takes appear as cells in the scrollable grid as they download. Each cell shows a waveform thumbnail, a star toggle, a `+` button for the Collection and an `x` button to delete the take. Click a cell to select that take for audition. Click the star to mark it as a keeper. A new take (a finished job, Add as take, or a take made in the take editor) is selected as it arrives. A plate at the lower right of the waveform shows the take length in seconds, for example `15.0 s`.
+
+![Takes grid with a take added](images/LINK_takes.png)
 
 **Fit-to-bars score (added v0.5.13).** Each cell shows a `fit 0-100` score in the lower right corner once the tempo has been measured. It is the product of how close the take's length is to a whole number of host bars and how close the measured tempo is to the host tempo. A score near 100 means the take is close to a whole number of bars at the host tempo. The score is 0 when no host tempo is set.
 
@@ -231,25 +249,37 @@ The Collection is a curated store of takes you want to keep across sessions. It 
 
 ## Take editor
 
-Click **Edit take** in the Takes header row to open the take editor for the selected take. The editor covers the Generate plate area. The Setup, Queue, and Preview plates stay active while the editor is open.
+Click **Edit take** in the Takes header row to open the take editor for the selected take. The editor covers the Generate area; the Source, Takes, Queue and Preview areas stay usable while it is open. The editor works offline, with no HOT-Step server.
 
-**What the editor shows.** The take name and tempo tag, sample rate, channel count and duration in the info row. A seconds ruler (beats when the tempo is known). A warp lane reserved for a future feature. A loop lane. The waveform (two lanes for stereo, one for mono or more than two channels). A scroll bar, a readout, and rows for snap, fit, zoom and buttons.
+![Take editor as opened](images/LINK_editor.png)
 
-**Crop handles.** Two vertical handles mark the start and end of the crop region. The area outside the crop is dimmed. Drag a handle (within 6 px of the line, or by its grip tab) to move it; handles cannot get closer than 20 ms to each other. Click **Apply crop** to render a new take from the crop region; the result line names it. Click **Reset** to put the handles back at the file ends. Click **Cancel** to restore the crop points to where they were when the editor was opened. Click **Close** to keep the current points and close the editor.
+**What the editor shows.** The take name, tempo, sample rate, channel count and duration in the info row. A ruler in bars and beats. The warp marker lane, the loop lane and the waveform (two lanes for stereo). A scroll bar with the Loop and zoom buttons, a readout line, then rows for the toggles, audition, grid, warp, level and the action buttons. Undo, Redo and Close sit in the header.
 
-**Snap to grid and Zero crossing.** Two toggles under the readout. When Snap to grid is on, dragging a handle or a loop flag snaps to the nearest beat of the measured tempo. When Zero crossing is on, Apply crop moves each cut to the nearest zero crossing within 3 ms. Both toggles reset to off each time the plugin window opens and are not saved in project state.
+**Crop handles.** The `S` and `E` handles mark the start and end of the crop; the area outside is dimmed. Drag a handle to move it (Shift + drag places it freely). Handles cannot get closer than 20 ms. **Apply crop** makes a new take from the crop region; the original take is not changed. **Reset** puts the handles back at the file ends and clears the loop. **Cancel** restores the crop points from when the editor was opened. **Close** keeps the current points.
 
-**Loop lane.** Click or drag in the loop lane to set a loop region (start and end flags with a bar between them). Right-click or press Reset to clear the loop. The readout shows the crop region and the loop region. The Repeats box (1 to 64, default 4) sets how many times the loop plays in the exported file.
+**Readouts (new in 0.5.19).** The readout line under the waveform shows the crop and the loop with start, end and length, for example `Crop 1.219 s to 15.000 s (13.781 s)  Loop 0.848 s to 6.148 s (5.300 s)`. The grid row shows the grid offset (`offset 0 ms`) from the downbeat set by Set 1, Reset grid or opening the take. Under the warp row a hint line reads `Double-click: add marker. Double-click or Alt + click a marker: remove`, or the number of selected markers. The Export loop button names the repeat count (`Export loop x4`).
 
-**Export loop.** Renders the loop region, repeated the number of times in the Repeats box, to a new take. The result line shows the new take name and warns in amber when the loop end and start do not join cleanly (amber under a seam correlation of -0.30, red under -0.60). Export loop does not apply crop or fit settings.
+**Snap to grid and Zero crossing.** With Snap to grid on, a dragged handle or loop flag jumps from beat to beat of the take tempo. With Zero crossing on, Apply crop moves each cut to the nearest zero crossing within 3 ms so it does not click; loop points are not moved. **Zero crossing readout (new):** after Apply crop the result line says how far each cut moved, for example `cuts moved: start +0.0 ms, end +0.0 ms`.
 
-**Fit to bars.** A toggle in the fit row. When on, the readout shows how many whole bars the crop region covers at the given tempo and how much is left over, for example `2 bars, +999.5 ms`. When the leftover would make the stretch more than 10 % either way the readout turns amber and adds a second line, for example `far off: stretch 25 %`. The tempo field (30 to 300 BPM) starts at the host tempo and switches to what you type. Apply crop with Fit to bars on sends the bar count and tempo to the renderer, which records them in the result line for the new take.
+**Fit to bars.** With Fit to bars on, the readout next to the tempo field shows how many whole bars the crop covers and what is left over, for example `5 bars, +144.9 ms`. The tempo field now opens on the take tempo (30 to 300 BPM) and switches to what you type. Apply crop with Fit to bars on records the bar count in the result line. **Stretch to fit** then makes one more take, stretched with pitch kept to exactly that many bars at the field tempo. Fit to bars alone stretches nothing.
 
-**Stretch to fit.** Appears after an Apply crop with Fit to bars on makes a new take whose crop left a remainder of at least half a frame. One click stretches that take from the crop tempo to the target bars tempo, making it exactly whole bars long (pitch is kept, using Signalsmith Stretch). The stretched take appears as a new entry in the takes grid with `_st<target>bpm` in its name. The original crop take is not changed.
+**Loop lane.** Click or drag in the loop lane to set a loop (green flags with a bar between them). **Loop /2** and **Loop x2** halve or double its length; the start stays. **Repeats** (1 to 64, default 4) sets how many times **Export loop** plays it in the new take. The result line warns in amber when the loop seam does not join cleanly. In 0.5.20 the audition loop seam uses the same crossfade as the render, forwards and reversed, so what you hear at the seam is what Export loop writes.
 
-**Take editor audition.** The editor has its own Play, Stop and Loop controls (in the zoom row). Play plays the loop region when one is set, or the whole take. It uses the editor's own clock, independent of the host transport, and adds to the plugin output. There is a 5 ms fade at start and stop. Loop is on by default.
+![Take editor with crop, loop, Fit to bars, Zero crossing, Click and Rev on](images/LINK_loop.png)
 
-**Zoom row.** Zoom in and out, All (fit the whole take), Crop (fit the crop region). The zoom is local to the editor session and is not saved.
+**Audition and Click.** Play plays the loop (the whole take while no loop is set) on the editor's own clock; the host transport does not have to run. With Loop on it repeats until Stop. **Click (new)** adds a metronome on the grid beats to the audition only; it is never in a render.
+
+**Grid row.** Set 1 puts the downbeat at the playhead or the last click (Alt + click on the ruler does it there). `< 1ms` and `1ms >` nudge the grid (Shift: 10 ms; Ctrl + drag on the ruler drags it). The BPM field and its - / + buttons set the grid tempo; Grid /2 and Grid x2 halve or double it; Reset grid goes back to the detected grid.
+
+**Warp row.** Warp on previews the take with the warp markers applied. Warp to host moves the markers so the whole take plays at the host tempo (the Fit to bars tempo with no host). Reset markers puts them back. Apply warp makes a new take with the warp rendered in. Select in loop, the To note value, Strength and Quantize move the selected markers toward the grid.
+
+**Level row (new).** Fade **In** and **Out** (0 to 2000 ms, sine fades at the crop ends), loop crossfade **Xf** (0 to 500 ms, equal power at the loop seam) and **Gain** (-24 to +24 dB), each with a value box and - / + buttons. **Normalize** sets the gain so the peak of the cropped take is -1 dBFS. `Pk` shows that peak after the gain. The level settings apply to audition, Apply crop and Export loop, can be undone and are cleared by Reset.
+
+**Reverse (new).** **Rev** plays the cropped take backwards in audition, Apply crop and Export loop. It is saved with the take edits, can be undone and is cleared by Reset.
+
+![After Apply crop: new take T2 selected, cuts moved readout in the result line](images/LINK_crop.png)
+
+**Zoom.** `-`, `+` and Fit zoom the waveform; the mouse wheel zooms about the pointer, Shift + wheel scrolls.
 
 ---
 
@@ -261,7 +291,7 @@ Click Play to audition the selected take. Play is shown in every mode and always
 
 **Follow host transport:** this plugin parameter (off by default) brings back the older host-gated preview: the take plays only while the host plays, in sync with the host transport, starting at the playhead position where it was requested (the anchor PPQ).
 
-**Level match:** the Level match toggle normalises the take's RMS to approximately -18 dBFS. This makes quick A/B comparisons more useful. The gain applied is shown next to the toggle. Level match is off by default; you can automate it via the plugin parameter.
+**Level match:** the Level match toggle normalises the take's RMS to approximately -18 dBFS. This makes quick A/B comparisons more useful. The gain applied is shown next to the toggle. Level match is on by default; you can automate it via the plugin parameter.
 
 The take is resampled to the host rate on load (Lagrange interpolator). There is a 10 ms crossfade on take switch to avoid clicks.
 
@@ -277,7 +307,25 @@ The stable file name encodes the caption, backend, take number, and BPM, and end
 
 If a name is already taken in the stable folder, the plugin appends `_2`, `_3`, and so on.
 
-Click Export WAV to save the selected take via a file chooser. MIDI export is not available in this version.
+Click Export WAV to save the selected take via a file chooser. After any export (WAV or MIDI) a `Saved to: <folder>` line and a Show in folder button appear and stay until the next export.
+
+![Export area](images/LINK_export.png)
+
+## MIDI export
+
+Select a take and click Export MIDI. The files are written next to the take's WAV in its stable folder (no file chooser), and the Collection footer lists the folder and the file names:
+
+- `<take name>_hits.mid`: always written. One General MIDI drum note per detected hit (kick, snare, hats or perc).
+- `<take name>_tempo.mid`: written when the take has a tempo (measured, from the file name or from the host). It carries the tempo map and bar markers. A take with no tempo gets no tempo file and its hits are placed at 120 BPM.
+- `<take name>_melody.mid`: written only when the take is tonal (a pitch is held in more than 40 % of the take) and notes were found. It holds the pitched notes.
+
+The melody file and the drum (hits) file share one origin: the same downbeat lands on tick 0 or a whole bar in both, so dropped side by side they line up with each other and with the tempo file. A hit before the first downbeat (a pickup) moves that shared origin one bar earlier for all files.
+
+When the take editor has a loop set, only hits and notes inside the loop are exported (else inside the crop), timed from its start. Warp markers carry into the tempo map.
+
+**Quantize.** The Q box (Q Off, Q 1/16, Q 1/8; default Off) snaps exported hits and melody notes to the take's grid. The strength slider (0 to 100 %, default 100 %) sets how far each one moves toward the grid.
+
+**MIDI drag chip.** The `MIDI` chip next to Export MIDI drags the selected take's MIDI files into the DAW. If Export MIDI has not been run for that take, the chip builds the files first (it reads `...` meanwhile, then the job line reads `MIDI ready to drag`); drag again once it is ready. Files built for a drag go to a temporary folder, not next to the take.
 
 **Drag to timeline note:** this uses the JUCE external drag API (`performExternalDragDropOfFiles`). It was included in the Ableton Live hand test on 2026-10-07 (per `docs/RELEASE_READINESS.md`). Reaper and Bitwig have not been tested by hand; sandboxed hosts (Logic Pro, Bitwig) may block the file drop.
 
@@ -326,6 +374,17 @@ These items are not yet proven in practice. They are listed so you know what to 
 - **Effect of a switch on a running render.** When HOT-Step switches backends, any render already in progress on the server continues under the old backend (the switch frees that backend's memory once the job ends). The plugin does not know when that job ends; the effect on takes in progress is not known.
 - **Drag to DAW timeline.** Drag to timeline uses the JUCE external drag API (`performExternalDragDropOfFiles`). Tested in Ableton Live on 2026-10-07; Reaper and Bitwig have not been tested by hand. Sandboxed hosts (Logic Pro, Bitwig) may block the file drop.
 
+
+**Known issues in 0.5.18 beta** (full list in [KNOWN_ISSUES.md](KNOWN_ISSUES.md)):
+
+- **Windows SmartScreen.** The Windows files are not code-signed; SmartScreen warns on first run.
+- **Offbeat downbeat at 3:2.** A take whose tempo estimate is 3:2 off (for example 130 read as 88 bpm) may keep a downbeat off beat 1, which also shifts the bars in its MIDI export.
+- **Quantize dropdown clipped.** In the export row, the quantize dropdown is clipped to "Q..." at the default window size. A fix is due in the next LINK build.
+- **Per-take seeds.** For a fixed-seed multi-take job the server reports one seed for the batch (`seed 11 requested (per-take seeds not reported)`).
+- **Recovered duplicates.** Switching between a pre-0.5.14 build and a newer one on the same take folders can leave two copies of a recovered take in `recovered_*`. Delete the duplicates by hand.
+- **TAKES and QUEUE counters.** The TAKES header can read 0 and the QUEUE panel `No job yet` while takes and a finished job are on screen.
+- **Mac.** The AU passes Apple's validation but has not been run in a host. Audition playback on Mac is untested. The 0.5.20 Mac Standalone has not yet been launched in a recorded test.
+
 See [docs/HOST_TEST.md](HOST_TEST.md) for the checklist that covers these items when first tested in a host.
 
 ---
@@ -360,3 +419,20 @@ See [docs/HOST_TEST.md](HOST_TEST.md) for the checklist that covers these items 
 | DAW key | `<AppData>/HOT-Step/LINK.settings` |
 
 Temp session folders from previous plugin instances are cleaned up shortly after startup if they are older than 24 hours, but only when the instance that made them is no longer running and every take in them is recorded as saved. Each instance holds a lock file (`owner.lock`) in its session folder while it runs; a folder whose lock is held is never cleaned up or recovered from by another instance, in the same host or in another program. An instance that could not create its lock file is left alone by the other instances in the same host, and it tries again to create the lock in the background. A folder from an older version of the plugin has no lock file: if it has a `hslink_unsaved.txt` list of unsaved takes, a newer instance recovers those takes into `recovered_<session>/` at once and then deletes only the list; without a list, the folder is not touched until its newest file is a day old. Each saved take gets a line in `saved.log` in its folder, and a folder that holds a take without such a line is not removed, whatever its age; if the stable folder stays unwritable, these folders stay until the takes are saved or you delete them yourself. The 24 hour cleanup follows the same keep rule as recovery: a folder holding a file it does not know, an unknown subfolder or a cut-short `.part` is left alone and named once in the log. A file of zero bytes is never treated as a take. When the plugin closes it deletes its own temp session folder, except when the folder still holds the only copy of a take: a take whose copy to the stable folder failed (the copy is retried in the background, but not at close), or a starred take with no stable copy.
+
+---
+
+## Test host results
+
+Each row comes from a saved log or a recorded run, with the build it ran on and the date of the run.
+
+| Format | Platform | Build | Check | Result | Date |
+|---|---|---|---|---|---|
+| VST3 | Windows | 0.5.20 (4c4f830) | Validator, strictness 5 | Passed (SUCCESS, 0 failures) | 2026-11-12 |
+| All formats | Windows | 0.5.20 (4c4f830) | Unit test suite | ALL PASS, 0 failures | 2026-11-12 |
+| VST3 | Windows | 0.5.20 | TestHost offline render | Pass-through, all level deltas 0.000 | 2026-11-12 |
+| VST3 | macOS | 0.5.20 (universal) | TestHost 1.18.14 list params and offline render | 10 parameters, version 0.5.20, render rc 0 | 2026-11-12 |
+| CLAP | macOS | 0.5.18 r2 | CLAP validator | 44 run: 33 passed, 0 failed, 11 skipped | 2026-11-11 |
+| AU | macOS | 0.5.15 | Apple AU validation | Passed | 2026-11-10 |
+
+Apple AU validation has not yet been recorded for 0.5.20; the AU row is the last recorded run.

@@ -3878,7 +3878,14 @@ void testRoleCards()
     struct Want { int card; const char* name; int backend, takes, aceModel; };
     const Want wants[] = { { RoleCards::kSa3, "SA3", 1, 1, 1 },
                            { RoleCards::kYue2, "YuE2", 2, 4, 1 },
-                           { RoleCards::kAce, "ACE", 3, 6, 2 } };
+                           { RoleCards::kAce, "ACE", 3, 6, 2 },
+                           { 3, "MiniMax-M3", 4, 6, 1 },
+                           { 4, "HeartMuLa", 5, 6, 1 } };
+    // The GENERATE row draws one card per RoleCards::kCount; every backend but Auto needs one.
+    std::printf ("  GENERATE row backend cards: %d (want 5)%c", (int) RoleCards::kCount, 10);
+    check (RoleCards::kCount == 5, "GENERATE row has a card for each of the 5 backends");
+    for (int c = 0; c < 5; ++c)
+        std::printf ("    card %d title=\"%s\" subtitle=\"%s\"%c", c, RoleCards::title (c), RoleCards::subtitle (c), 10);
     auto restOf = [] (GS s) { s.backend = 0; s.takes = 0; s.aceModel = 0; return s; };
     for (const auto& w : wants)
     {
@@ -3893,7 +3900,7 @@ void testRoleCards()
         check (restOf (out) == restOf (base),
                (juce::String (w.name) + " card leaves caption, lyrics, mode, seed, key, bpm, duration alone (informational: cannot fail under NO_ROLE)").toRawUTF8());
     }
-    for (int b = 0; b <= 3; ++b)
+    for (int b = 0; b <= 5; ++b)
     {
         GS s = base;
         s.backend = b;
@@ -4121,7 +4128,8 @@ static void testCollection (const juce::File& tmp)
         }
         const auto takes = p.getTakes();
         HotStepLinkProcessor::TakeEntry a, b, c;
-        if (takes.size() == 3) { a = takes[0]; b = takes[1]; c = takes[2]; }
+        // D2: getTakes() lists newest first, so the first registered take is last.
+        if (takes.size() == 3) { a = takes[2]; b = takes[1]; c = takes[0]; }
         const auto t1 = juce::Time::currentTimeMillis();
         std::printf ("  take 0: caption='%s' backend=%s model=%s bpm=%.1f key='%s' seed=%lld duration=%.3f s mode=%s created=%lld (window %lld..%lld)%c",
                      a.caption.toRawUTF8(), a.backend.toRawUTF8(), a.model.toRawUTF8(), a.bpm, a.key.toRawUTF8(),
@@ -4526,17 +4534,22 @@ static void testCollection (const juce::File& tmp)
             { CollectionChips::sa3, false, "", "sa3", false, "", "chips: SA3 gives backend 'sa3'" },
             { CollectionChips::yue2, false, "", "yue2", false, "", "chips: YuE2 gives backend 'yue2'" },
             { CollectionChips::ace, false, "", "ace", false, "", "chips: ACE gives backend 'ace'" },
+            { CollectionChips::minimax, false, "", "minimax-m3", false, "", "chips: MiniMax gives backend 'minimax-m3'" },
+            { CollectionChips::heartmula, false, "", "heartmula", false, "", "chips: HeartMuLa gives backend 'heartmula'" },
             { CollectionChips::all, true, "", "", true, "", "chips: the starred toggle gives starredOnly" },
             { CollectionChips::ace, true, "night", "ace", true, "night", "chips: ACE + starred + 'night' combine" },
         };
-        // The same 5 items as the filter test, counted through the chip mapping.
-        std::vector<CollectionItem> items (5);
+        // The same 5 items as the filter test plus one MiniMax and two HeartMuLa takes.
+        std::vector<CollectionItem> items (8);
         items[0].name = "Night drive"; items[0].backend = "sa3"; items[0].starred = true;
         items[1].name = "Take b";      items[1].backend = "sa3";
         items[2].name = "Morning";     items[2].backend = "yue2";
         items[3].name = "Night cap";   items[3].backend = "ace"; items[3].starred = true;
         items[4].name = "Take e";      items[4].backend = "auto";
-        const int wantCounts[] = { 0, 2, 1, 1, 2, 1 };
+        items[5].name = "Take f";      items[5].backend = "minimax-m3";
+        items[6].name = "Take g";      items[6].backend = "heartmula";
+        items[7].name = "Take h";      items[7].backend = "heartmula";
+        const int wantCounts[] = { 0, 2, 1, 1, 1, 2, 2, 1 };
         int ci = 0;
         for (const auto& c : chipCases)
         {
@@ -4546,7 +4559,7 @@ static void testCollection (const juce::File& tmp)
             chips.search = c.search;
             const auto q = CollectionView::queryFor (chips);
             const int n = (int) CollectionStore::filter (items, q).size();
-            std::printf ("  chips (backend %d, starred %d, search '%s'): query backend '%s' starred %d text '%s' (want '%s' %d '%s'), 5 items -> %d (want %d)%c",
+            std::printf ("  chips (backend %d, starred %d, search '%s'): query backend '%s' starred %d text '%s' (want '%s' %d '%s'), 8 items -> %d (want %d)%c",
                          c.backend, (int) c.star, c.search, q.backend.toRawUTF8(), (int) q.starredOnly, q.text.toRawUTF8(),
                          c.wantBackend, (int) c.wantStar, c.wantText, n, wantCounts[ci], 10);
             check (q.backend == juce::String (c.wantBackend) && q.starredOnly == c.wantStar && q.text == juce::String (c.wantText)
@@ -6015,7 +6028,11 @@ void testTakeIdentity (const juce::File& tmp)
         r1bWriteWav (jB.takeFiles[0], 96000, 0x55);
         q->registerTakeAndWait (jB, 0);
         const auto listB = q->getTakes();
-        const auto stableB = listB.empty() ? juce::File() : listB[0].stable;
+        // C1: the state round trip lists take A again, so find take B by its temp file, not by index 0.
+        juce::File stableB;
+        for (const auto& t : listB)
+            if (t.temp == jB.takeFiles[0])
+                stableB = t.stable;
         const bool starA = saved && q->isStarred (stableA), starB = stableB != juce::File() && q->isStarred (stableB);
         std::printf ("  T-E same prompt, two takes: take 1 '%s' starred=%d; take 2 '%s' starred=%d (want 1 and 0)%c",
                      stableA.getFileName().toRawUTF8(), (int) starA, stableB.getFileName().toRawUTF8(), (int) starB, 10);
@@ -10371,6 +10388,40 @@ void testEditorNoPolling (const juce::File& tmp)
         check (true, "G8 [informational]: the callback of a destroyed cell returns without touching it (cannot be shown failing without undefined behaviour)");
     }
 
+    // G9. Temp cleanup removed a saved take's temp copy (job 7a, MiniMax-M3): the
+    // waveform source falls back to the lasting copy, and a kept cell is re-pointed.
+    // Teeth: HSLINK_TEETH=NO_THUMB_FALLBACK (the old source: always the temp copy).
+    {
+        TakeGrid::testNoThumbFallback = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_THUMB_FALLBACK";
+        const auto g9Dir = unit.getChildFile ("g9");
+        g9Dir.createDirectory();
+        TakeGrid::Cell c;
+        c.key = "g9_take.wav";
+        c.temp = g9Dir.getChildFile ("tmp").getChildFile ("g9_take.wav");
+        c.stable = c.file = g9Dir.getChildFile ("lasting").getChildFile ("g9_take.wav");
+        c.saved = true;
+        c.temp.getParentDirectory().createDirectory();
+        c.file.getParentDirectory().createDirectory();
+        r1bWriteWav (c.temp, 4800, 0x21);
+        r1bWriteWav (c.file, 4800, 0x21);
+        const auto before = TakeGrid::thumbSourceOf (c);
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        juce::AudioThumbnailCache cache (4);
+        TakeCell cell (c.key, "g9_take", before, 0, fm, cache);
+        c.temp.getParentDirectory().deleteRecursively(); // the cleanup
+        const auto after = TakeGrid::thumbSourceOf (c);
+        const bool repointed = TakeGrid::testNoThumbFallback.load() ? false : cell.repointThumbIfGone (after);
+        std::printf ("  G9 temp cleaned: source before is temp=%d; after cleanup source exists=%d is lasting=%d (want 1 1); kept cell repointed=%d, its file exists=%d (want 1 1)%c",
+                     (int) (before == c.temp), (int) after.existsAsFile(), (int) (after == c.file),
+                     (int) repointed, (int) cell.thumbFile.existsAsFile(), 10);
+        check (before == c.temp && after == c.file && after.existsAsFile(),
+               "G9: after temp cleanup the waveform source is the lasting copy and exists (teeth: NO_THUMB_FALLBACK)");
+        check (repointed && cell.thumbFile == c.file && cell.thumbFile.existsAsFile(),
+               "G9: a kept cell whose temp source was cleaned up is re-pointed at the lasting copy (teeth: NO_THUMB_FALLBACK)");
+        TakeGrid::testNoThumbFallback = false;
+    }
+
     TakeGrid::testEditorStats = false;
     TakeGrid::testThumbFromLasting = false;
     TakeGrid::testNoTempFallback = false;
@@ -11519,14 +11570,14 @@ void testPillAndSeedText()
     // Q-b: from the job status JSON through the real DawWorker::applyJobJson to the text.
     struct JobSeeds { const char* what; const char* takes; int wantCount; const char* want; };
     const JobSeeds jobs[] = {
-        { "4 takes, the same seed 5", R"([{"seed":5,"ready":true},{"seed":5,"ready":true},{"seed":5,"ready":true},{"seed":5,"ready":true}])", 4, "seed 5 requested (per-take seeds not reported)" },
+        { "4 takes, the same seed 5", R"([{"seed":5,"ready":true},{"seed":5,"ready":true},{"seed":5,"ready":true},{"seed":5,"ready":true}])", 4, "seed 5, 6, 7, 8" },
         { "4 takes, seed null", R"([{"seed":null,"ready":true},{"seed":null,"ready":true},{"seed":null,"ready":true},{"seed":null,"ready":true}])", 4, "" },
         { "2 takes, no seed key", R"([{"ready":true},{"ready":true}])", 2, "" },
         { "2 takes, seeds 11 and 12", R"([{"seed":11,"ready":true},{"seed":12,"ready":true}])", 2, "seed 11, 12" },
         { "3 takes, 5, null, 7", R"([{"seed":5,"ready":true},{"seed":null,"ready":true},{"seed":7,"ready":true}])", 3, "seed 5, unknown, 7" },
         { "1 take, seed 7", R"([{"seed":7,"ready":true}])", 1, "seed 7" },
-        { "2 takes, seed 0", R"([{"seed":0,"ready":true},{"seed":0,"ready":true}])", 2, "seed 0 requested (per-take seeds not reported)" },
-        { "2 takes, seed 2457544577", R"([{"seed":2457544577,"ready":true},{"seed":2457544577,"ready":true}])", 2, "seed 2457544577 requested (per-take seeds not reported)" },
+        { "2 takes, seed 0", R"([{"seed":0,"ready":true},{"seed":0,"ready":true}])", 2, "seed 0, 1" },
+        { "2 takes, seed 2457544577", R"([{"seed":2457544577,"ready":true},{"seed":2457544577,"ready":true}])", 2, "seed 2457544577, 2457544578" },
         { "2 takes, 9007199254740991 and 1", R"([{"seed":9007199254740991,"ready":true},{"seed":1,"ready":true}])", 2, "seed 9007199254740991, 1" },
     };
     for (const auto& jb : jobs)
@@ -11544,6 +11595,37 @@ void testPillAndSeedText()
         same ("Q-b", juce::String ("seed text from the parsed job, ") + jb.what, DawJob::seedText (j.takeSeeds), jb.want);
     }
     std::printf ("  pill and seed text: %d counted checks%c", n, 10);
+}
+
+// KNOWN_ISSUES row 14: the server derives take i's seed as base + i, the job status
+// reports only the base. DawJob::resolveTakeSeeds turns the reported list into the
+// real per-take seeds. Teeth: HSLINK_TEETH=NO_TAKE_SEEDS leaves the list alone.
+void testPillSelectedBackend()
+{
+    std::printf ("Status pill names the selected backend (job 6 c)%c", 10);
+    // After a MiniMax-M3 job the server reported eta.backend "ace" while MiniMax-M3 stayed selected.
+    const auto a = DawStatus::onlinePillText ("ace", "", HotStepLinkProcessor::backendIdForIndex (4));
+    const auto b = DawStatus::onlinePillText ("ace_turbo", "acestep-v15-turbo", "ace");
+    const auto c = DawStatus::onlinePillText ("minimax-m3", "", "");
+    std::printf ("  eta ace + selected minimax-m3: '%s' (want MiniMax); eta ace_turbo + selected ace: '%s'; Auto: '%s'%c",
+                 a.toRawUTF8(), b.toRawUTF8(), c.toRawUTF8(), 10);
+    check (a.contains ("MiniMax"), "pill: MiniMax-M3 selected names MiniMax, not ACE");
+    check (b == "Online (ACE: acestep-v15-turbo)", "pill: ACE selected keeps the reported ACE model");
+    check (c == "Online (MiniMax-M3)", "pill: Auto falls back to eta.backend");
+}
+
+void testTakeSeedsDerived()
+{
+    std::printf ("Per-take seeds base + i (row 14)%c", 10);
+    DawJob j;
+    const bool ok = DawWorker::applyJobJson (R"({"id":"x","state":"done","take_count":4,"takes":[{"seed":100,"ready":true},{"seed":100,"ready":true},{"seed":100,"ready":true},{"seed":100,"ready":true}]})", j);
+    juce::StringArray got;
+    for (auto x : j.takeSeeds) got.add (juce::String (x));
+    std::printf ("  base 100, 4 takes: ok=%d seeds [%s] (want 100, 101, 102, 103)%c", ok ? 1 : 0, got.joinIntoString (", ").toRawUTF8(), 10);
+    check (ok && got.joinIntoString (",") == "100,101,102,103", "row 14: take i plays seed base + i");
+    juce::Array<juce::int64> mixed { 5, -1, 7 };
+    DawJob::resolveTakeSeeds (mixed);
+    check (mixed[0] == 5 && mixed[1] == -1 && mixed[2] == 7, "row 14: distinct or unknown seeds are left as reported");
 }
 
 // Liveness: the offline limits (U) and "any good response is proof of life" (L).
@@ -13091,6 +13173,84 @@ namespace TempoTest
     }
 }
 
+// Tempo restore: a take measured at 120.01 that was asked for at 88 comes back from the
+// plugin state at 120.01, never at the asked 88. Teeth: HSLINK_TEETH_TEMPORESTORE=1 drops
+// the measured tempo at save.
+static void testTempoRestore (const juce::File& tmp)
+{
+    using namespace TempoTest;
+    std::printf ("Tempo restore: a measured take tempo survives get/setStateInformation%c", 10);
+    const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH_TEMPORESTORE", {}) == "1";
+    HotStepLinkProcessor::testDropTakeTempoOnSave.store (teeth);
+    const auto dir = tmp.getChildFile ("tempo_restore_test");
+    dir.createDirectory();
+    const double sr = 44100.0, seconds = 32.0, trueBpm = 120.01, askedBpm = 88.0;
+    const auto x = render (drums (steadyBeats (trueBpm, 0.137, seconds)), sr, seconds);
+    juce::MemoryBlock state;
+    double before = 0.0, beforeResolved = 0.0;
+    int stateBefore = -1;
+    {
+        auto p = std::make_unique<HotStepLinkProcessor>();
+        p->setStableRoot (dir.getChildFile ("stable"));
+        p->setCollectionRoot (dir.getChildFile ("coll"));
+        DawJob j;
+        j.localId = 7100;
+        j.request.caption = "tempo restore case";
+        j.request.expectedBackend = "sa3";
+        j.request.bpm = askedBpm;
+        j.request.seed = 9200;
+        j.request.durationS = seconds;
+        const auto f = dir.getChildFile ("dl").getChildFile ("take0.wav");
+        f.getParentDirectory().createDirectory();
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::AudioFormatWriter> w (wav.createWriterFor (new juce::FileOutputStream (f), sr, 1, 16, {}, 0));
+            const float* chans[1] = { x.data() };
+            if (w != nullptr)
+                w->writeFromFloatArrays (chans, 1, (int) x.size());
+        }
+        j.takeFiles.add (f);
+        j.takeSeeds.add (9200);
+        p->registerTakeAndWait (j, 0);
+        p->waitTakeMeasureIdle();
+        const auto takes = p->getTakes();
+        p->waitSaverIdle();
+        if (! takes.empty())
+        {
+            stateBefore = takes[0].tempoState;
+            before = takes[0].tempo.bpm;
+            beforeResolved = takes[0].resolvedTempo.bpm;
+        }
+        p->getStateInformation (state);
+    }
+    double after = 0.0, afterResolved = 0.0, afterAsked = 0.0;
+    int stateAfter = -1, count = 0;
+    {
+        auto q = std::make_unique<HotStepLinkProcessor>();
+        q->setStableRoot (dir.getChildFile ("stable"));
+        q->setCollectionRoot (dir.getChildFile ("coll"));
+        q->setStateInformation (state.getData(), (int) state.getSize());
+        const auto takes = q->getTakes();
+        count = (int) takes.size();
+        if (! takes.empty())
+        {
+            stateAfter = takes[0].tempoState;
+            after = takes[0].tempo.bpm;
+            afterResolved = takes[0].resolvedTempo.bpm;
+            afterAsked = takes[0].bpm;
+        }
+    }
+    HotStepLinkProcessor::testDropTakeTempoOnSave.store (false);
+    std::printf ("  before save: state=%d (want %d measured) measured=%.4f resolved=%.4f (true %.2f, asked %.1f); after load: takes=%d state=%d measured=%.4f resolved=%.4f asked=%.1f%s%c",
+                 stateBefore, (int) HslinkTakeEntry::tempoMeasured, before, beforeResolved, trueBpm, askedBpm, count, stateAfter, after, afterResolved, afterAsked,
+                 teeth ? " [TEETH: tempo dropped at save]" : "", 10);
+    check (stateBefore == HslinkTakeEntry::tempoMeasured && std::abs (before - trueBpm) < 0.05, "temporestore: the take measures 120.01 within 0.05 before save (asked 88)");
+    check (count == 1 && stateAfter == HslinkTakeEntry::tempoMeasured, "temporestore: the reloaded take is still measured");
+    check (std::abs (after - before) < 0.01 && std::abs (after - askedBpm) > 30.0, "temporestore: the reloaded measured tempo is the saved one within 0.01, not the asked 88");
+    check (std::abs (afterResolved - beforeResolved) < 0.01 && std::abs (afterResolved - askedBpm) > 30.0, "temporestore: the reloaded resolved tempo is the saved one within 0.01, not 88");
+    dir.deleteRecursively();
+}
+
 static void testTempo (const juce::File& tmp)
 {
     using namespace TempoTest;
@@ -14363,6 +14523,133 @@ static void testTempoHostAndStretchToken (const juce::File& tmp)
                  checks, failures - failuresBefore, checks - guards, guards, 10);
 }
 
+// Derived take tempo (2026-11-12): a crop or stretch whose remeasure gives no number
+// falls back on the parent tempo (crop) or the target bpm (stretch), marked "est", and
+// the estimate survives a state reload. Teeth: HSLINK_TEETH=NO_DERIVED_EST.
+static void testDerivedTempo (const juce::File& tmp)
+{
+    using namespace TempoTest;
+    std::printf ("Derived tempo: crop and stretch fall back to an estimate when the remeasure fails%c", 10);
+    const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_DERIVED_EST";
+    HotStepLinkProcessor::testNoDerivedEstimate.store (teeth);
+    HotStepLinkProcessor::testStretchEst.store (juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "STRETCH_EST");
+    const auto dir = tmp.getChildFile ("derived_tempo_test");
+    dir.createDirectory();
+    const double sr = 44100.0, seconds = 16.0;
+    const auto x = render (drums (steadyBeats (120.0, 0.0, seconds)), sr, seconds);
+    auto writeMono = [&] (const juce::File& f)
+    {
+        f.getParentDirectory().createDirectory();
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatWriter> w (wav.createWriterFor (new juce::FileOutputStream (f), sr, 1, 16, {}, 0));
+        const float* chans[1] = { x.data() };
+        if (w != nullptr)
+            w->writeFromFloatArrays (chans, 1, (int) x.size());
+    };
+    juce::MemoryBlock state;
+    juce::String cropName, stretchName;
+    {
+        auto p = std::make_unique<HotStepLinkProcessor>();
+        p->setStableRoot (dir.getChildFile ("stable"));
+        p->setCollectionRoot (dir.getChildFile ("coll"));
+        auto reg = [&] (int id, const char* name)
+        {
+            DawJob j;
+            j.localId = id;
+            j.request.caption = "derived tempo case";
+            j.request.expectedBackend = "sa3";
+            j.request.bpm = 120.0;
+            j.request.seed = 9500 + id;
+            j.request.durationS = seconds;
+            const auto f = dir.getChildFile ("dl").getChildFile (name);
+            writeMono (f);
+            j.takeFiles.add (f);
+            j.takeSeeds.add (9500 + id);
+            p->registerTakeAndWait (j, 0);
+            p->waitTakeMeasureIdle();
+        };
+        auto entryOf = [&] (const juce::String& n)
+        {
+            for (const auto& t : p->getTakes())
+                if (t.name == n)
+                    return t;
+            return HslinkTakeEntry();
+        };
+        auto settle = [&] { return p->waitTakeEditIdle() && p->waitTakeMeasureIdle() && p->waitSaverIdle(); };
+        reg (1, "parent.wav");
+        const auto parent = entryOf ("parent.wav");
+        std::printf ("  parent: state=%d (want 2) valid=%d bpm=%.3f%c", parent.tempoState, (int) parent.tempo.valid, parent.tempo.bpm, 10);
+        check (parent.tempoState == HslinkTakeEntry::tempoMeasured && parent.tempo.valid && std::abs (parent.tempo.bpm - 120.0) < 0.1,
+               "derivedtempo: parent measured near 120");
+        HotStepLinkProcessor::testFailRemeasure.store (true);
+        TakeEdit::EditData crop;
+        crop.cropStart = 44100;
+        crop.cropEnd = 44100 * 10;
+        const TakeEdit::EditOptions plain;
+        cropName = HotStepLinkProcessor::editedTakeName (parent.name, crop, plain);
+        p->requestTakeEdit (parent.temp, crop, plain);
+        settle();
+        const auto c = entryOf (cropName);
+        const auto ctag = TakeGrid::tempoTagOf (c.tempoState, c.tempo, c.resolvedTempo).text;
+        std::printf ("  crop of 120 parent, remeasure failed: name='%s' state=%d (want 3) bpm=%.3f tag='%s' (want '120.0 est')%c",
+                     cropName.toRawUTF8(), c.tempoState, c.tempo.bpm, ctag.toRawUTF8(), 10);
+        check (c.tempoState == HslinkTakeEntry::tempoEstimated && std::abs (c.tempo.bpm - parent.tempo.bpm) < 1.0e-9 && ctag == "120.0 est",
+               "derivedtempo: crop of a 120 bpm parent with a failed remeasure shows 120.0 est");
+        p->requestTakeStretch (parent.temp, 120.0, 100.0);
+        settle();
+        HslinkTakeEntry s;
+        for (const auto& t : p->getTakes())
+            if (t.bpm == 100.0)
+                s = t;
+        stretchName = s.name;
+        const auto stag = TakeGrid::tempoTagOf (s.tempoState, s.tempo, s.resolvedTempo).text;
+        std::printf ("  stretch to 100, remeasure failed: name='%s' state=%d (want 2) resolved=%.3f src=%d (want 100/2) tag='%s' (want '100.00 bpm (file)', no est)%c",
+                     s.name.toRawUTF8(), s.tempoState, s.resolvedTempo.bpm, (int) s.resolvedTempo.source, stag.toRawUTF8(), 10);
+        check (s.tempoState == HslinkTakeEntry::tempoMeasured && s.resolvedTempo.bpm == 100.0
+               && s.resolvedTempo.source == TempoResolve::Source::fileName && stag.startsWith ("100.0") && ! stag.contains ("est"),
+               "derivedtempo: stretch to 100 is exact: shows 100.0 firm, no est");
+        reg (2, "notempo.wav"); // remeasure still failing: this parent has no tempo
+        const auto nt = entryOf ("notempo.wav");
+        const auto ntName = HotStepLinkProcessor::editedTakeName (nt.name, crop, plain);
+        p->requestTakeEdit (nt.temp, crop, plain);
+        settle();
+        const auto nc = entryOf (ntName);
+        const auto ntag = TakeGrid::tempoTagOf (nc.tempoState, nc.tempo, nc.resolvedTempo).text;
+        std::printf ("  crop of a parent with no tempo: parent state=%d valid=%d; crop listed=%d state=%d (want 2) bpm=%.3f tag='%s' (want 'tempo ?')%c",
+                     nt.tempoState, (int) nt.tempo.valid, (int) nc.temp.existsAsFile(), nc.tempoState, nc.tempo.bpm, ntag.toRawUTF8(), 10);
+        check (nc.temp.existsAsFile() && nc.tempoState == HslinkTakeEntry::tempoMeasured && ! nc.tempo.valid && ntag == "tempo ?",
+               "derivedtempo: crop of a parent with no tempo stays unknown");
+        HotStepLinkProcessor::testFailRemeasure.store (false);
+        p->waitSaverIdle();
+        p->getStateInformation (state);
+    }
+    {
+        HotStepLinkProcessor::testFailRemeasure.store (true); // a reload remeasure, if any, also fails
+        auto q = std::make_unique<HotStepLinkProcessor>();
+        q->setStableRoot (dir.getChildFile ("stable"));
+        q->setCollectionRoot (dir.getChildFile ("coll"));
+        q->setStateInformation (state.getData(), (int) state.getSize());
+        q->waitTakeMeasureIdle();
+        HslinkTakeEntry c, s;
+        for (const auto& t : q->getTakes())
+        {
+            if (t.name == cropName)
+                c = t;
+            if (t.name == stretchName)
+                s = t;
+        }
+        const auto stag2 = TakeGrid::tempoTagOf (s.tempoState, s.tempo, s.resolvedTempo).text;
+        std::printf ("  after reload: crop state=%d bpm=%.3f; stretch state=%d tag='%s' (want 3/120 and 2/'100.00 bpm (file)')%c", c.tempoState, c.tempo.bpm, s.tempoState, stag2.toRawUTF8(), 10);
+        check (c.tempoState == HslinkTakeEntry::tempoEstimated && std::abs (c.tempo.bpm - 120.0) < 0.1
+               && s.tempoState == HslinkTakeEntry::tempoMeasured && stag2.startsWith ("100.0") && ! stag2.contains ("est"),
+               "derivedtempo: the estimates survive a state reload");
+        HotStepLinkProcessor::testFailRemeasure.store (false);
+    }
+    HotStepLinkProcessor::testNoDerivedEstimate.store (false);
+    HotStepLinkProcessor::testStretchEst.store (false);
+    dir.deleteRecursively();
+}
+
 // TakeStretch::stretchTakeFile and requestTakeStretch: real files, only inside
 // <test temp>/stretch_test, which this function creates and removes. Nothing is played.
 static void testStretch (const juce::File& tmp)
@@ -15094,6 +15381,36 @@ static void testEdit (const juce::File& tmp)
         ck (zr.ok && c0 > 48000 && zr.used.cropStart == c0, "C zero crossing crop: the crop start moves to the crossing 100 frames away");
         ck (zr.ok && c1 > 150000 && zr.used.cropEnd == c1 + 240 && zr.outSamples == c1 + 240 - c0, "C zero crossing crop: the crop end with no crossing within 144 frames stays");
         ck (zr.ok && zr.used.loopStart == 60000 && zr.used.loopEnd == 70001, "C zero crossing crop: the loop points are not moved");
+
+        // zeromove: the result line says where the cuts landed. Teeth: HSLINK_TEETH=ZERO_MOVE_HIDDEN.
+        {
+            const int oldMut = TakeEditorMath::testMutant.load();
+            if (juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "ZERO_MOVE_HIDDEN")
+                TakeEditorMath::testMutant.store (TakeEditorMath::mutZeroMoveHidden);
+            // Teeth: HSLINK_TEETH=ZERO_SNAP_OFF disables the snap in the render (move 0, cut sample off zero).
+            const int oldLv = TakeEdit::testLevelMutant.load();
+            if (juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "ZERO_SNAP_OFF")
+                TakeEdit::testLevelMutant.store (TakeEdit::lvMutNoZeroSnap);
+            const juce::int64 as = c0 + 37, ae = c1 - 61; // both off zero, each within 144 frames of a crossing
+            const auto zm = TakeEdit::renderEditFile (request (tone, d.getChildFile ("zm.wav"), pts (as, ae, -1, -1), zc));
+            const double msS = (double) zm.zeroMoveStart * 1000.0 / sr, msE = (double) zm.zeroMoveEnd * 1000.0 / sr;
+            const float vS = zm.ok ? ti.first[(size_t) zm.used.cropStart] : 1.0f, vE = zm.ok ? ti.first[(size_t) zm.used.cropEnd] : 1.0f;
+            const auto text = TakeEditorMath::zeroMoveText (zm);
+            TakeEdit::EditOptions off;
+            const auto zo = TakeEdit::renderEditFile (request (tone, d.getChildFile ("zo.wav"), pts (as, ae, -1, -1), off));
+            const auto textOff = TakeEditorMath::zeroMoveText (zo);
+            std::printf ("  C zeromove: ticked: snapped=%d start moved %lld frames (%.3f ms) end moved %lld frames (%.3f ms), sample at start %.5f at end %.5f (limit 1e-2); text '%s'; unticked: snapped=%d moves %lld/%lld text '%s' (want empty)%c",
+                         (int) zm.zeroSnapped, (long long) zm.zeroMoveStart, msS, (long long) zm.zeroMoveEnd, msE, (double) vS, (double) vE, text.toRawUTF8(),
+                         (int) zo.zeroSnapped, (long long) zo.zeroMoveStart, (long long) zo.zeroMoveEnd, textOff.toRawUTF8(), 10);
+            ck (zm.ok && zm.zeroSnapped && zm.zeroMoveStart != 0 && zm.zeroMoveEnd != 0 && std::abs (msS) <= 3.0 && std::abs (msE) <= 3.0,
+                "C zeromove: both off-zero cuts report a nonzero move within 3 ms");
+            ck (zm.ok && std::abs (vS) < 1.0e-2f && std::abs (vE) < 1.0e-2f, "C zeromove: the sample at each moved cut is within 1e-2 of zero");
+            ck (text == "cuts moved: start " + juce::String (msS >= 0 ? "+" : "") + juce::String (msS, 1) + " ms, end " + juce::String (msE >= 0 ? "+" : "") + juce::String (msE, 1) + " ms",
+                "C zeromove: the result line shows the signed move of each cut");
+            ck (zo.ok && ! zo.zeroSnapped && textOff.isEmpty(), "C zeromove: with Zero crossing unticked no move is reported");
+            TakeEditorMath::testMutant.store (oldMut);
+            TakeEdit::testLevelMutant.store (oldLv);
+        }
     }
 
     // D: the tempo of a loop render.
@@ -16396,6 +16713,75 @@ static void testMoreLike (const juce::File& tmp)
     dir.deleteRecursively();
 }
 
+// b1e6a71: the TAKES and QUEUE header counts are painted by the editor, so refreshQueue
+// and refreshTakes must repaint (and record the count they repainted for) when the
+// count changes. Teeth HEADER_NO_REPAINT restores the pre-fix code: QUEUE stays unshown.
+// The TAKES half has no teeth: selectTake re-enters refreshTakes (PluginEditor.cpp:1901).
+static void testHeaderCounters (const juce::File& tmp)
+{
+    std::printf ("== header counters (TAKES / QUEUE) ==%c", 10);
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    const auto dir = tmp.getChildFile ("header_counters_test");
+    dir.deleteRecursively();
+    dir.createDirectory();
+    auto p = std::make_unique<HotStepLinkProcessor>();
+    p->daw.stop();
+    p->daw.setEndpoint ("http://127.0.0.1:9", "test-key");
+    p->setStableRoot (dir.getChildFile ("stable"));
+    p->setCollectionRoot (dir.getChildFile ("coll"));
+    juce::AudioBuffer<float> b (2, 4800);
+    for (int i = 0; i < 4800; ++i)
+    {
+        b.setSample (0, i, 0.25f * (float) std::sin (0.05 * (double) i));
+        b.setSample (1, i, b.getSample (0, i));
+    }
+    auto addDone = [&] (int n)
+    {
+        const auto take = dir.getChildFile ("in").getChildFile ("hdr_take_" + juce::String (n) + ".wav");
+        take.getParentDirectory().createDirectory();
+        writeWav (take, b, 48000.0);
+        DawJob j;
+        j.state = DawJob::State::done;
+        j.downloadsComplete = true; // finished: the worker sets this once every take is on disk
+        j.request.caption = "header " + juce::String (n);
+        j.request.seed = 100 + n;
+        j.request.takes = 1;
+        j.request.durationS = 0.1;
+        j.takeFiles.add (take);
+        j.takeSeeds.add ((juce::int64) (500 + n));
+        j.localId = p->daw.addJobForTest (j);
+        p->registerTakeAndWait (j, 0);
+    };
+    for (int n = 0; n < 3; ++n)
+        addDone (n);
+    auto ed = std::make_unique<HotStepLinkEditor> (*p);
+    ed->noHeaderRepaintForTest = teeth == "HEADER_NO_REPAINT";
+    ed->runRefreshForTest();
+    const int q1 = ed->queueCountShownForTest(), t1 = ed->takeCountShownForTest();
+    // A fourth take arrives after the first refresh: the auto-select path of refreshTakes.
+    addDone (3);
+    ed->runRefreshForTest();
+    const int q2 = ed->queueCountShownForTest(), t2 = ed->takeCountShownForTest();
+    // QUEUE counts queued plus running only: a waiting job raises it to 1, done jobs never count.
+    {
+        DawJob w;
+        w.state = DawJob::State::queued;
+        w.request.caption = "header waiting";
+        w.request.takes = 1;
+        p->daw.addJobForTest (w);
+    }
+    ed->runRefreshForTest();
+    const int q3 = ed->queueCountShownForTest();
+    std::printf ("  3 done jobs: QUEUE shown %d (want 0), TAKES shown %d (want 3); after a 4th done: QUEUE shown %d (want 0), TAKES shown %d (want 4); plus 1 queued: QUEUE shown %d (want 1)%c",
+                 q1, t1, q2, t2, q3, 10);
+    check (q1 == 0 && q2 == 0, "header counters: the QUEUE count is 0 when every job is finished (4 done jobs)");
+    check (q3 == 1, "header counters: the QUEUE count is repainted for queued plus running jobs");
+    check (t1 == 3 && t2 == 4, "header counters: the TAKES count is repainted for the number of takes, also on a new take's auto-select");
+    ed.reset();
+    p.reset();
+    dir.deleteRecursively();
+}
+
 static void testLoadTakeKeepsEdits (const juce::File& tmp)
 {
     std::printf ("== load take into the active slot keeps the live edits ==%c", 10);
@@ -16457,6 +16843,226 @@ static void testLoadTakeKeepsEdits (const juce::File& tmp)
     check (o2.seed == 4321, "load slot: a typed but uncommitted seed is kept in the backup slot");
     ed.reset();
     p.reset();
+    dir.deleteRecursively();
+}
+
+// D2 rules: a loaded state REPLACES the take list (files on disk stay), and take numbers
+// stay with the take (newest first). Teeth: HSLINK_TEETH=TS_MERGE_ON_LOAD, TAKE_RENUMBER.
+static void testD2Rules (const juce::File& tmp)
+{
+    using P = HotStepLinkProcessor;
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    P::testMergeOnLoad = teeth == "TS_MERGE_ON_LOAD";
+    P::testRenumberTakes = teeth == "TAKE_RENUMBER";
+    std::printf ("D2 rules: load replaces, stable numbers (teeth: %s)%c", teeth.isEmpty() ? "none" : teeth.toRawUTF8(), 10);
+    const auto dir = tmp.getChildFile ("d2rules_test");
+    dir.createDirectory();
+    auto reg = [&] (P& p, const juce::File& sub, int id)
+    {
+        DawJob j;
+        j.localId = id;
+        j.request.caption = "d2 take " + juce::String (id);
+        j.request.expectedBackend = "sa3";
+        j.request.durationS = 1.0;
+        const auto f = sub.getChildFile ("dl").getChildFile ("t" + juce::String (id) + ".wav");
+        collWriteWav (f, 0.25);
+        j.takeFiles.add (f);
+        j.takeSeeds.add (100 + id);
+        p.registerTakeAndWait (j, 0);
+    };
+    // 1. Load replaces.
+    {
+        const auto sub = dir.getChildFile ("load");
+        juce::MemoryBlock state;
+        {
+            P src;
+            src.setStableRoot (sub.getChildFile ("stableSrc"));
+            src.setCollectionRoot (sub.getChildFile ("coll"));
+            reg (src, sub, 1);
+            src.getStateInformation (state);
+        }
+        P p;
+        p.setStableRoot (sub.getChildFile ("stable"));
+        p.setCollectionRoot (sub.getChildFile ("coll"));
+        reg (p, sub, 2);
+        reg (p, sub, 3);
+        const auto live = p.getTakes();
+        p.setStateInformation (state.getData(), (int) state.getSize());
+        const auto after = p.getTakes();
+        int liveOnDisk = 0;
+        for (const auto& t : live)
+            liveOnDisk += (t.stable.existsAsFile() || t.temp.existsAsFile()) ? 1 : 0;
+        const auto name0 = after.empty() ? juce::String ("<none>") : after[0].temp.getFileName();
+        std::printf ("  load: live takes=%d (want 2), after load=%d (want 1) first='%s' (want 't1.wav'), replaced files on disk=%d (want 2)%c",
+                     (int) live.size(), (int) after.size(), name0.toRawUTF8(), liveOnDisk, 10);
+        check (live.size() == 2 && after.size() == 1 && name0 == "t1.wav", "D2 load: the loaded state replaces the list, exactly its 1 take");
+        check (liveOnDisk == 2, "D2 load: the 2 replaced takes' files are still on disk");
+    }
+    // 2. Stable numbers: add 3, delete the middle, add one -> numbers 4,3,1 newest first.
+    {
+        const auto sub = dir.getChildFile ("num");
+        P p;
+        p.setStableRoot (sub.getChildFile ("stable"));
+        p.setCollectionRoot (sub.getChildFile ("coll"));
+        p.takeDeleteUndoMs = 50;
+        reg (p, sub, 11);
+        reg (p, sub, 12);
+        reg (p, sub, 13);
+        const auto three = p.getTakes(); // newest first: 13, 12, 11
+        const auto r = three.size() == 3 ? p.deleteTake (three[1].temp.getFullPathName()) : P::TakeDelete::notFound;
+        juce::Thread::sleep (170);
+        p.pollTakeDelete();
+        p.waitTakeDeleteIdle (5000);
+        reg (p, sub, 14);
+        const auto out = p.getTakes();
+        juce::String nums, order;
+        for (const auto& t : out)
+        {
+            nums << t.number << " ";
+            order << t.temp.getFileNameWithoutExtension() << " ";
+        }
+        std::printf ("  numbers: delete result=%d (want %d) list=%d (want 3) numbers newest first '%s' (want '4 3 1') files '%s' (want 't14 t13 t11')%c",
+                     (int) r, (int) P::TakeDelete::deleted, (int) out.size(), nums.trim().toRawUTF8(), order.trim().toRawUTF8(), 10);
+        check (out.size() == 3 && out[0].number == 4 && out[1].number == 3 && out[2].number == 1,
+               "D2 numbers: add 3, delete the middle, add one gives 4,3,1");
+        check (out.size() == 3 && out[0].temp.getFileName() == "t14.wav" && out[1].temp.getFileName() == "t13.wav" && out[2].temp.getFileName() == "t11.wav",
+               "D2 numbers: order is newest first (t14, t13, t11)");
+    }
+    // 3. D2c: a derived take (Apply crop) gets a fresh number on top; the parent keeps
+    // its number; save and load into a fresh processor keeps numbers and order.
+    {
+        P::testDerivedInheritsNum = teeth == "DERIVED_INHERITS_NUM";
+        const auto sub = dir.getChildFile ("derived");
+        auto listOf = [] (const std::vector<P::TakeEntry>& v, juce::String& nums, juce::String& names)
+        {
+            nums.clear();
+            names.clear();
+            for (const auto& t : v)
+            {
+                nums << t.number << " ";
+                names << t.name << " ";
+            }
+            nums = nums.trim();
+            names = names.trim();
+        };
+        juce::MemoryBlock state;
+        juce::String nums, names, nums2, names2;
+        bool asked = false, idle = false;
+        {
+            P p;
+            p.setStableRoot (sub.getChildFile ("stable"));
+            p.setCollectionRoot (sub.getChildFile ("coll"));
+            reg (p, sub, 21);
+            reg (p, sub, 22);
+            const auto two = p.getTakes(); // newest first: T2, T1
+            TakeEdit::EditData crop;
+            crop.cropStart = 2000;
+            crop.cropEnd = 10000;
+            const TakeEdit::EditOptions plain;
+            asked = two.size() == 2 && p.requestTakeEdit (two[1].temp, crop, plain) != 0;
+            idle = p.waitTakeEditIdle() && p.waitTakeMeasureIdle() && p.waitSaverIdle();
+            listOf (p.getTakes(), nums, names);
+            p.getStateInformation (state);
+        }
+        {
+            P q;
+            q.setStableRoot (sub.getChildFile ("stable2"));
+            q.setCollectionRoot (sub.getChildFile ("coll"));
+            q.setStateInformation (state.getData(), (int) state.getSize());
+            listOf (q.getTakes(), nums2, names2);
+        }
+        std::printf ("  derived: crop on T1 accepted=%d idle=%d; numbers newest first '%s' (want '3 2 1') names '%s'; after save and load into a fresh processor '%s' (want '3 2 1') names '%s'%c",
+                     (int) asked, (int) idle, nums.toRawUTF8(), names.toRawUTF8(), nums2.toRawUTF8(), names2.toRawUTF8(), 10);
+        check (asked && idle && nums == "3 2 1" && names.upToFirstOccurrenceOf (" ", false, false).contains ("_edc"),
+               "D2c derived: Apply crop on T1 lists the new take as T3 on top, order 3,2,1");
+        check (nums2 == "3 2 1" && names2 == names, "D2c derived: save and load keeps the same numbers and order");
+        P::testDerivedInheritsNum = false;
+    }
+    P::testMergeOnLoad = false;
+    P::testRenumberTakes = false;
+    dir.deleteRecursively();
+}
+
+// D-fix: a restored take whose file is gone shows FILE MISSING, dimmed, and audition,
+// Edit take, Export WAV, drag-out and Apply refuse it. Teeth: HSLINK_TEETH=MISSING_IGNORED.
+static void testMissingTakeUi (const juce::File& tmp)
+{
+    using P = HotStepLinkProcessor;
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    TakeGrid::testMissingIgnored = teeth == "MISSING_IGNORED";
+    std::printf ("Missing take UI (teeth: %s)%c", teeth.isEmpty() ? "none" : teeth.toRawUTF8(), 10);
+    const auto dir = tmp.getChildFile ("missing_take_ui");
+    dir.createDirectory();
+    juce::MemoryBlock state;
+    juce::File gone;
+    {
+        P src;
+        src.setStableRoot (dir.getChildFile ("stable"));
+        src.setCollectionRoot (dir.getChildFile ("coll"));
+        DawJob j;
+        j.localId = 1;
+        j.request.caption = "missing take";
+        j.request.expectedBackend = "sa3";
+        j.request.durationS = 1.0;
+        const auto f = dir.getChildFile ("dl").getChildFile ("tm.wav");
+        collWriteWav (f, 0.25);
+        j.takeFiles.add (f);
+        j.takeSeeds.add (7);
+        src.registerTakeAndWait (j, 0);
+        const auto t = src.getTakes();
+        if (! t.empty())
+            gone = t[0].stable != juce::File() ? t[0].stable : t[0].temp;
+        src.getStateInformation (state);
+    }
+    // Every copy of the take goes: the state now points at nothing.
+    juce::Array<juce::File> wavs;
+    dir.findChildFiles (wavs, juce::File::findFiles, true, "*.wav");
+    for (auto& w : wavs)
+        w.deleteFile();
+    P p;
+    p.setStableRoot (dir.getChildFile ("stable"));
+    p.setCollectionRoot (dir.getChildFile ("coll"));
+    p.setStateInformation (state.getData(), (int) state.getSize());
+    const auto takes = p.getTakes();
+    const bool entryMissing = ! takes.empty() && takes[0].missing;
+    const juce::String key = takes.empty() ? juce::String() : (takes[0].name.isNotEmpty() ? takes[0].name : takes[0].temp.getFileName());
+    auto ed = std::make_unique<HotStepLinkEditor> (p);
+    ed->runRefreshForTest();
+    const auto* cm = ed->getTakeGridForTest().find (key);
+    const int modelMissing = cm == nullptr ? -1 : (int) cm->missing;
+    const int cellMissing = ed->takeCellMissingForTest (key);
+    // Audition: a click on the cell is refused, nothing selected.
+    ed->selectTakeForTest (key);
+    ed->runRefreshForTest();
+    const bool auditionOff = p.audition.getSelected() == juce::File();
+    // The take selected another way (e.g. restored selection): every action still refuses.
+    if (! takes.empty())
+        p.audition.select (takes[0].temp, p.getSourceFile());
+    ed->runRefreshForTest();
+    const bool editOn = ed->editTakeEnabledForTest();
+    const bool exportOn = ed->exportEnabledForTest();
+    const bool opened = ed->openTakeEditorForTest();
+    const auto expSrc = ed->exportSourceForTest();
+    const auto drag = ed->dragFileForTest (key);
+    juce::String why;
+    const auto ticket = takes.empty() ? (juce::uint64) 0 : p.requestTakeEdit (takes[0].temp, {}, {}, &why);
+    juce::Thread::sleep (100);
+    juce::Array<juce::File> after;
+    dir.findChildFiles (after, juce::File::findFiles, true, "*.wav");
+    std::printf ("  listed=%d entry missing=%d model missing=%d cell missing+dimmed=%d (want 1 1 1 1)%c",
+                 (int) takes.size(), (int) entryMissing, modelMissing, cellMissing, 10);
+    std::printf ("  audition off after click=%d (want 1) edit enabled=%d export enabled=%d opened=%d (want 0 0 0) export src='%s' drag='%s' (want '' '') apply ticket=%llu (want 0) new wavs=%d (want 0)%c",
+                 (int) auditionOff, (int) editOn, (int) exportOn, (int) opened, expSrc.getFileName().toRawUTF8(), drag.getFileName().toRawUTF8(),
+                 (unsigned long long) ticket, after.size(), 10);
+    check (takes.size() == 1 && entryMissing && gone != juce::File(), "missing take: the restored take is listed and flagged missing");
+    check (modelMissing == 1 && cellMissing == 1, "missing take: the cell shows FILE MISSING and is dimmed");
+    check (auditionOff, "missing take: audition refuses");
+    check (! editOn && ! opened, "missing take: Edit take is disabled and does not open");
+    check (! exportOn && expSrc == juce::File(), "missing take: Export WAV is disabled and has no source");
+    check (drag == juce::File(), "missing take: drag-out is refused");
+    check (ticket == 0 && after.isEmpty(), "missing take: Apply refuses and no file is written");
+    ed.reset();
+    TakeGrid::testMissingIgnored = false;
     dir.deleteRecursively();
 }
 
@@ -16822,7 +17428,7 @@ static void testTakeDelete (const juce::File& tmp)
             p->registerTakeAndWait (j, 0);
         }
         const auto before = p->getTakes();
-        const bool setup = before.size() == 2 && before[0].temp == fA && before[1].temp == fB && before[0].name == before[1].name
+        const bool setup = before.size() == 2 && before[1].temp == fA && before[0].temp == fB && before[0].name == before[1].name
                            && before[0].stable == juce::File() && before[1].stable == juce::File() && sizeA > 44 && sizeB > sizeA + 1000;
         std::printf ("  S-A setup: takes=%d (want 2) names '%s','%s' (want equal) lasting copies=%d,%d (want 0,0) file sizes A=%lld B=%lld%c",
                      (int) before.size(), keyAt (before, 0).toRawUTF8(), keyAt (before, 1).toRawUTF8(),
@@ -16954,9 +17560,20 @@ static void testTakeDelete (const juce::File& tmp)
         ck (e.stable.existsAsFile() && trashCount() == 0 && tdTrashCalls.load() == 0, (t + "the file is on disk and not in the test trash").toRawUTF8());
         ck ((int) after.size() == wantList && (route == 1 ? indexOf (after, key) >= 0 : indexOf (after, key) == wantIndex),
             (t + (route == 1 ? "the take is back in the list" : "the take is back in the list at its place")).toRawUTF8());
+        if (route == 3)
+        {
+            // D2: a loaded state REPLACES the list and drops the pending delete: the take is back
+            // from the state, nothing was committed (no star keep, no move, no failure, no message).
+            ck (keeps == 0 && moves == 0 && fails == 0 && pending.isEmpty(),
+                (t + "the restore dropped the pending delete: takeDeleteStarKeeps 0, moves 0, failures 0, nothing pending").toRawUTF8());
+            ck (msg1.isEmpty() && msg2.isEmpty(), (t + "no delete message: nothing was committed").toRawUTF8());
+        }
+        else
+        {
         ck (keeps == 1 && moves == 0 && fails == 0, (t + "takeDeleteStarKeeps 1, moves 0, failures 0").toRawUTF8());
         ck (msg1 == P::takeDeleteStarredText (e.name) && msg1.contains (e.name) && msg1.contains ("starred") && msg2.isEmpty(),
             (t + "the message is takeDeleteStarredText, handed out once").toRawUTF8());
+        }
         if (route == 1)
             ck (setup && pending == before[0].name && before[0].stable.existsAsFile(), "S-C next delete: the second delete is the pending one, its file on disk");
         p->undoTakeDelete(); // nothing pending at the close
@@ -17701,7 +18318,7 @@ static int runLoopCheck (int argc, char** argv)
     return res.outSamples == expected ? 0 : 1;
 }
 
-// editor-shot [--closed] [--select N] [--loop] [--seam] [--playhead] [--warp] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]: the whole editor with the take editor
+// editor-shot [--closed] [--settings] [--select N] [--loop] [--seam] [--playhead] [--warp] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]: the whole editor with the take editor
 // open on one take, painted off screen into <out.png>, and the panel alone into
 // <out>_panel.png. The take is a generated kick and hat pattern (real level) or a copy
 // of in.wav. No window, no audio device; an existing output is refused. It also prints
@@ -17721,7 +18338,7 @@ static int runLoopCheck (int argc, char** argv)
 static int runEditorShot (int argc, char** argv, const juce::File& tmp)
 {
     juce::StringArray rest;
-    bool closedList = false, withLoop = false, withSeam = false, withSnap = false, withZero = false, noTempo = false, withFit = false, withPlayhead = false, withWarp = false, addMarker = false, removeMarker = false, badName = false;
+    bool closedList = false, withSettings = false, withLoop = false, withSeam = false, withSnap = false, withZero = false, noTempo = false, withFit = false, withPlayhead = false, withWarp = false, addMarker = false, removeMarker = false, badName = false, withQuant = false, withCue = false;
     double zoomShot = 1.0;
     int selectShot = 0;
     juce::String takeName ("take_kick_hat_120.wav");
@@ -17755,12 +18372,18 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             withWarp = addMarker = true;
         else if (arg == "--removemarker")
             withWarp = addMarker = removeMarker = true;
+        else if (arg == "--quantize")
+            withWarp = withQuant = true;
+        else if (arg == "--limitcue")
+            withWarp = withLoop = withCue = true;
         else if (arg == "--zoom")
             zoomShot = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]).getDoubleValue() : 1.0;
         else if (arg == "--select")
             selectShot = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]).getIntValue() : 0;
         else if (arg == "--closed")
             closedList = true;
+        else if (arg == "--settings")
+            closedList = withSettings = true; // settings panel open over the closed list
         else
             rest.add (arg);
     }
@@ -17776,7 +18399,7 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
     if (badName || ! juce::File::isAbsolutePath (outPath) || (inPath.isNotEmpty() && ! juce::File::isAbsolutePath (inPath))
         || (rest.size() != 0 && rest.size() != 2) || (rest.size() == 2 && (w < 200 || h < 200 || w > 4000 || h > 4000)))
     {
-        std::printf ("usage: HSLINK_Tests editor-shot [--loop] [--seam] [--playhead] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]  (full paths)%c", 10);
+        std::printf ("usage: HSLINK_Tests editor-shot [--settings] [--loop] [--seam] [--playhead] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]  (full paths)%c", 10);
         return 2;
     }
     const juce::File out (outPath);
@@ -17885,6 +18508,12 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             for (auto* c : ed->getChildren())
                 if (auto* o = dynamic_cast<OfflineOverlay*> (c))
                     o->setVisible (false);
+            if (withSettings)
+            {
+                // --settings: default settings in memory; the key store is the temp file set in main.
+                ed->setSettingsOpenForTest (true); // no refresh after: it would bring the offline overlay back
+                std::printf ("editor-shot: settings panel open=%d%c", ed->settingsOpenForTest() ? 1 : 0, 10);
+            }
             for (const auto& t : p->getTakes())
             {
                 const auto* cell = ed->getTakeGridForTest().find (t.name);
@@ -18027,8 +18656,55 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             panel.auditionPlayForTest();
             panel.onAuditionWarp = nullptr;
             std::printf ("editor-shot: preview warp markers handed=%d%c", handed, 10);
+            panel.auditionStopForTest(); // the Play above starts a real async decode (state 1 Loading); stop it so the shot shows the idle transport
             for (std::size_t i = 0; i + 1 < wm.size(); ++i)
                 std::printf ("  region %d: %.1f %%%c", (int) i, WarpMarkers::regionPercent (wm, i), 10);
+            if (withQuant && wm.size() > 3)
+            {
+                // R3: markers 1 and 3 moved off the grid, markers 1..3 selected (click, Shift-click),
+                // then Quantize 1/4 at 50 %: each moves half way to its beat line.
+                panel.dragWarpForTest (1, wm[1].dstFrame + (juce::int64) (0.120 * panel.sampleRateForTest()));
+                panel.dragWarpForTest (3, wm[3].dstFrame - (juce::int64) (0.090 * panel.sampleRateForTest()));
+                std::vector<long long> was;
+                for (const auto& m : wm)
+                    was.push_back ((long long) m.dstFrame);
+                panel.selectWarpMarkerForTest (1, false);
+                panel.selectWarpMarkerForTest (2, true);
+                panel.selectWarpMarkerForTest (3, true);
+                panel.setQuantizeForTest (9, 50.0);
+                const int moved = panel.clickQuantizeForTest();
+                std::printf ("editor-shot: quantize 1/4 at 50 %%: selected=%d moved=%d hint '%s'%c", panel.warpSelectedCountForTest(), moved, panel.warpLaneHintForTest().toRawUTF8(), 10);
+                for (std::size_t i = 0; i < wm.size() && i < was.size(); ++i)
+                    std::printf ("  marker %d: %lld -> %lld selected=%d%c", (int) i, was[i], (long long) wm[i].dstFrame, (int) panel.warpSelectedForTest ((int) i), 10);
+                const auto lane = panel.warpLaneForTest();
+                panel.setWarpBoxForTest (lane.getX() + (int) (0.70 * lane.getWidth()), lane.getX() + (int) (0.88 * lane.getWidth())); // a box mid-drag
+            }
+            if (withCue && wm.size() > 2)
+            {
+                // R2: the loop bar dragged right by 40 px (body drag), then marker 1 pushed past marker 2: the limit cue.
+                auto& c = static_cast<juce::Component&> (panel);
+                const auto lane = panel.loopLaneForTest();
+                const auto v = panel.viewForTest();
+                const int mx = lane.getX() + (int) std::lround ((TakeEditorMath::xOfFrame (v, panel.getLoopStartForTest()) + TakeEditorMath::xOfFrame (v, panel.getLoopEndForTest())) * 0.5);
+                const juce::Point<int> down (mx, lane.getCentreY());
+                const auto mods = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
+                auto mev = [&c, down, mods] (juce::Point<int> pos, bool dragged)
+                {
+                    const auto t = juce::Time::getCurrentTime();
+                    return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos.toFloat(), mods, juce::MouseInputSource::defaultPressure,
+                                             juce::MouseInputSource::defaultOrientation, juce::MouseInputSource::defaultRotation, juce::MouseInputSource::defaultTiltX,
+                                             juce::MouseInputSource::defaultTiltY, &c, &c, t, down.toFloat(), t, 1, dragged);
+                };
+                const auto ls0 = panel.getLoopStartForTest(), le0 = panel.getLoopEndForTest();
+                c.mouseDown (mev (down, false));
+                c.mouseDrag (mev (down.translated (20, 0), true));
+                c.mouseDrag (mev (down.translated (40, 0), true));
+                c.mouseUp (mev (down.translated (40, 0), true));
+                const auto d2 = wm[2].dstFrame;
+                panel.shotDragWarp (1, (double) (d2 + 48000) / panel.sampleRateForTest(), false);
+                std::printf ("editor-shot: loop bar moved %lld..%lld -> %lld..%lld; limit cue marker=%d text '%s'%c", (long long) ls0, (long long) le0,
+                             (long long) panel.getLoopStartForTest(), (long long) panel.getLoopEndForTest(), panel.warpLimitMarkerForTest(), panel.warpLimitTextForTest().toRawUTF8(), 10);
+            }
         }
         bool overlayWasUp = false;
         for (auto* c : ed->getChildren())
@@ -18146,6 +18822,33 @@ static void testOfflineSwitch()
                      otherYes, HotStepLinkProcessor::kDefaultServerUrl, (int) DawWorker::isLiveDefaultBase (HotStepLinkProcessor::kDefaultServerUrl), 10);
         ck (liveYes == 6 && otherYes == 0 && DawWorker::isLiveDefaultBase (HotStepLinkProcessor::kDefaultServerUrl),
             "O1: the plugin's default URL and every loopback form of port 3001 are the live server; other ports and hosts are not");
+    }
+    {
+        // O1b: the base URL the worker requests. A Mac user typed "http;//..." and the
+        // offline overlay showed it, because the typed text was used as is.
+        DawWorker::testNoUrlNormalise = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_URL_NORMALISE";
+        struct UrlCase { const char* in; const char* want; };
+        const UrlCase cases[] = { { "http;//192.168.1.20:3001", "http://192.168.1.20:3001" }, { " http;/192.168.1.20:3001/ ", "http://192.168.1.20:3001" },
+                                  { "http:/127.0.0.1:3001", "http://127.0.0.1:3001" }, { "HTTPS;//host.local:3001", "https://host.local:3001" },
+                                  { "192.168.1.20:3001", "http://192.168.1.20:3001" }, { "localhost:3001", "http://localhost:3001" },
+                                  { "http://127.0.0.1:3001", "http://127.0.0.1:3001" }, { "http://h:3001//", "http://h:3001" } };
+        int good = 0, semis = 0;
+        for (const auto& c : cases)
+        {
+            const auto got = DawWorker::normaliseBaseUrl (c.in);
+            good += got == c.want ? 1 : 0;
+            semis += got.containsChar (';') ? 1 : 0;
+            if (got != c.want)
+                std::printf ("    '%s' -> '%s' (want '%s')%c", c.in, got.toRawUTF8(), c.want, 10);
+        }
+        const auto line = DawWorker::attemptLine ("http://h:3001/api/v1/daw/status", false, 0, 2503, 2500, "21:04:05");
+        const auto okLine = DawWorker::attemptLine ("http://h:3001/api/v1/daw/status", true, 200, 12, 2500, "21:04:08");
+        std::printf ("  O1b normaliseBaseUrl: %d of 8 right (want 8), with a semicolon %d (want 0); log '%s' / '%s'%c", good, semis, line.toRawUTF8(),
+                     okLine.toRawUTF8(), 10);
+        DawWorker::testNoUrlNormalise = false;
+        ck (good == 8 && semis == 0 && line == "21:04:05 GET http://h:3001/api/v1/daw/status -> connect failed, status 0, timed out (2503 ms)"
+                && okLine == "21:04:08 GET http://h:3001/api/v1/daw/status -> HTTP 200 (12 ms)",
+            "O1b: a mistyped scheme separator is repaired to ://, a bare host gets http://, and the attempt line names the URL, result and time");
     }
     int closedPort = 0;
     {
@@ -18280,9 +18983,10 @@ static void testEditTicket (const juce::File& tmp)
         registerFile (2, "tkb.wav");
         registerFile (3, "tkc.wav");
         const auto listed = p->getTakes();
-        const auto a = listed.size() > 0 ? listed[0] : HslinkTakeEntry();
+        // D2: getTakes() lists newest first: a = tka (oldest), c = tkc (newest).
+        const auto a = listed.size() > 2 ? listed[2] : HslinkTakeEntry();
         const auto b = listed.size() > 1 ? listed[1] : HslinkTakeEntry();
-        const auto c = listed.size() > 2 ? listed[2] : HslinkTakeEntry();
+        const auto c = listed.size() > 0 ? listed[0] : HslinkTakeEntry();
 
         // T1: two jobs back to back, both asked before either is read.
         {
@@ -20469,6 +21173,207 @@ static void testTakeMarkers (const juce::File& tmp)
 // mouseDown / mouseDrag / mouseUp) TL_NO_BUTTON_CHECK and TL_OLD_ANCHOR, for items 9
 // and 10 (o135: context clicks in the loop lane, open() during a drag) TL_STRICT_RIGHT,
 // TL_CLEAR_MID_DRAG and TL_OPEN_NO_END_DRAG (TakeEditorMath::testMutant).
+// The take editor panel's real size at the smallest window: a real editor at
+// kMinWindowW x kMinWindowH, the panel's bounds read back (it gets genPlate). The
+// hit-area tests run at this size instead of a hard-coded one, so a layout that grows
+// past what the minimum window gives fails here. Teeth: HSLINK_TEETH_MINPANEL=1 uses
+// the old hard-coded 490 x 566 (fails with outside the panel=4 since the two-line level row).
+static juce::Point<int> takePanelSizeAtMinWindow()
+{
+    if (juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH_MINPANEL", {}) == "1")
+        return { 490, 566 };
+    HotStepLinkProcessor proc;
+    juce::Point<int> size;
+    {
+        HotStepLinkEditor ed (proc);
+        ed.setSize (HotStepLinkEditor::kMinWindowW, HotStepLinkEditor::kMinWindowH);
+        const auto b = ed.getTakeEditorForTest().getBounds();
+        size = { b.getWidth(), b.getHeight() };
+    }
+    std::printf ("  take editor panel at the %d x %d window: %d x %d%c", HotStepLinkEditor::kMinWindowW, HotStepLinkEditor::kMinWindowH, size.x, size.y, 10);
+    return size;
+}
+
+// readouts1: the Export loop button names its repeat count and keeps the full text at the
+// minimum panel size; a take cell shows the take length ('4.0 s', or m:ss over 60 s) in the
+// waveform's lower right corner, clear of the tempo plate and never cut.
+// Teeth: HSLINK_TEETH=RD_EXPORT_STATIC, RD_EXPORT_NARROW, RD_LEN_NO_MSS, RD_LEN_OVER_TEMPO.
+static void testReadouts1()
+{
+    std::printf ("Readouts 1: Export loop xN text and fit, take cell length text and plate%c", 10);
+    const int failuresBefore = failures;
+    using namespace TakeEditorMath;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    testMutant = teethVar == "RD_EXPORT_STATIC" ? mutExportTextStatic : teethVar == "RD_EXPORT_NARROW" ? mutExportTextNarrow : mutNone;
+    TakeGrid::testLengthMutant = teethVar == "RD_LEN_NO_MSS" ? 1 : teethVar == "RD_LEN_OVER_TEMPO" ? 2 : 0;
+    const auto minPanel = takePanelSizeAtMinWindow();
+    {
+        TakeEditorPanel panel;
+        panel.setSize (minPanel.x, minPanel.y);
+        for (const int n : { 4, 2, 64 })
+        {
+            panel.setRepeatsForTest (n);
+            float tw = 0.0f;
+            int room = 0;
+            const bool fits = panel.exportTextFitsForTest (&tw, &room);
+            const auto want = "Export loop x" + juce::String (n);
+            std::printf ("  1 panel %d x %d, Repeats %d: button text '%s' (want '%s'), text %.1f px in %d px of room, fits=%d (want 1)%c",
+                         panel.getWidth(), panel.getHeight(), n, panel.exportTextForTest().toRawUTF8(), want.toRawUTF8(), (double) tw, room, (int) fits, 10);
+            check (panel.exportTextForTest() == want && fits && tw > 40.0f,
+                   ("1: Export loop text is '" + want + "' and fits at the minimum panel size").toRawUTF8());
+        }
+    }
+    {
+        const auto t4 = TakeGrid::lengthTextOf (4.0), t75 = TakeGrid::lengthTextOf (75.0), t0 = TakeGrid::lengthTextOf (0.0), t3600 = TakeGrid::lengthTextOf (600.4);
+        std::printf ("  2 lengthTextOf 4 s='%s' (want '4.0 s'), 75 s='%s' (want '1:15'), 0 s='%s' (want ''), 600.4 s='%s' (want '10:00')%c",
+                     t4.toRawUTF8(), t75.toRawUTF8(), t0.toRawUTF8(), t3600.toRawUTF8(), 10);
+        check (t4 == "4.0 s" && t75 == "1:15" && t0.isEmpty() && t3600 == "10:00", "2: take length text is '4.0 s' for 4 s and '1:15' for 75 s");
+    }
+    {
+        juce::AudioFormatManager fm;
+        juce::AudioThumbnailCache cache (4);
+        TakeCell cell ("t.wav", "t", {}, 0, fm, cache);
+        cell.setSize (TakeListComponent::kMinCellW, TakeListComponent::kCellH);
+        TakeGrid::TempoTag tempo;
+        tempo.text = "~128.0 BPM est";
+        TakeGrid::TempoTag fit;
+        fit.text = "fit 90";
+        cell.setTempoTag (tempo);
+        cell.setFitTag (fit);
+        for (const double s : { 4.0, 75.0, 59.9 })
+        {
+            cell.setLengthText (TakeGrid::lengthTextOf (s));
+            juce::Rectangle<int> lp, tp;
+            const bool fits = cell.lengthFitsForTest (&lp, &tp);
+            const bool clear = ! lp.isEmpty() && ! lp.intersects (tp);
+            std::printf ("  3 cell %d x %d, length '%s': plate %d,%d %dx%d, tempo plate %d,%d %dx%d, fits=%d clear of the tempo=%d (want 1 each)%c",
+                         cell.getWidth(), cell.getHeight(), cell.getLengthText().toRawUTF8(), lp.getX(), lp.getY(), lp.getWidth(), lp.getHeight(),
+                         tp.getX(), tp.getY(), tp.getWidth(), tp.getHeight(), (int) fits, (int) clear, 10);
+            check (fits && clear, "3: the cell length plate fits inside the waveform and clear of the tempo plate");
+        }
+        // A tempo tag too long to share the row: the tag is shortened, the length always shows.
+        for (const char* tt : { "199.99 est", "~199.99 BPM est from the host grid", "199.99 bpm  x2  100 ms" })
+        {
+            tempo.text = tt;
+            cell.setTempoTag (tempo);
+            cell.setLengthText ("1:15");
+            juce::Rectangle<int> lp, tp;
+            const bool lenFits = cell.lengthFitsForTest (&lp, &tp);
+            const auto shown = cell.tempoShownForTest();
+            const float tw = TakeCell::lengthTextWidthForTest (shown), lw = TakeCell::lengthTextWidthForTest ("1:15");
+            const bool tempoWhole = shown.isNotEmpty() && tw <= (float) (tp.getWidth() - 8);
+            std::printf ("  4 cell %d wide, tag '%s' shown as '%s' (%.1f px text in a %d px plate), length '1:15' %.1f px in a %d px plate, overlaps=%d (want 0), both whole=%d (want 1)%c",
+                         cell.getWidth(), tt, shown.toRawUTF8(), (double) tw, tp.getWidth(), (double) lw, lp.getWidth(), (int) lp.intersects (tp), (int) (lenFits && tempoWhole), 10);
+            check (lenFits && tempoWhole && ! lp.intersects (tp), "4: a long tempo tag is shortened; it and the length are both drawn whole, apart");
+        }
+    }
+    testMutant = mutNone;
+    TakeGrid::testLengthMutant = 0;
+    std::printf ("  readouts1: %d failed%c", failures - failuresBefore, 10);
+}
+
+// readouts2: the grid row shows the grid offset from the first-beat position (nudges add,
+// Set 1 and Reset grid zero it); the warp marker line shows the selected count and the time
+// of one selected marker, else the add / remove gesture hint. Both fit at the minimum panel.
+// Teeth: HSLINK_TEETH=RD2_OFFSET_NO_RESET, RD2_COUNT_AS_ONE, RD2_HINT_WRONG, RD2_NARROW.
+static void testReadouts2 (const juce::File& tmp)
+{
+    std::printf ("Readouts 2: grid offset readout, warp marker count, time and gesture hint%c", 10);
+    const int failuresBefore = failures;
+    using namespace TakeEditorMath;
+    using P = HotStepLinkProcessor;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    testMutant = teethVar == "RD2_OFFSET_NO_RESET" ? mutR2OffsetNoReset : teethVar == "RD2_COUNT_AS_ONE" ? mutR2CountAsOne
+               : teethVar == "RD2_HINT_WRONG" ? mutR2HintWrong : teethVar == "RD2_NARROW" ? mutR2Narrow : mutNone;
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto minPanel = takePanelSizeAtMinWindow();
+    const auto d = tmp.getChildFile ("readouts2_test");
+    d.createDirectory();
+    const double sr = 48000.0;
+    const juce::int64 len = 384000;
+    juce::AudioBuffer<float> buf (1, (int) len);
+    for (int i = 0; i < (int) len; ++i)
+        buf.setSample (0, i, 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 100.0 * i / sr));
+    const auto file = writeWav (d.getChildFile ("bare.wav"), buf, sr);
+    {
+        TakeEditorPanel panel;
+        panel.setSize (minPanel.x, minPanel.y);
+        panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+        panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+        panel.onReport = [] (juce::uint64, P::TakeEditReport&) { return false; };
+        panel.onSetGrid = [] (const juce::File&, const TakeEdit::GridEdit&) { return true; };
+        panel.onClosed = [] {};
+        TakeEditorPanel::Take take;
+        take.temp = file;
+        take.name = file.getFileName();
+        take.grid.bpm = 120.0;
+        take.grid.downbeatSec = 0.25;
+        take.grid.measured = true;
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        panel.tick();
+        panel.setWarpForTest (true);
+        panel.resized();
+        const auto o0 = panel.gridOffsetTextForTest();
+        panel.gridNudgeForTest (kGridNudgeSec);
+        panel.gridNudgeForTest (kGridNudgeSec);
+        const auto o2 = panel.gridOffsetTextForTest();
+        const bool fit2 = panel.readouts2FitForTest();
+        std::printf ("  1 panel %d x %d: offset at open '%s' (want 'offset 0 ms'), after two 1 ms nudges right '%s' (want '+2 ms'), downbeat %.4f s, fits=%d%c",
+                     panel.getWidth(), panel.getHeight(), o0.toRawUTF8(), o2.toRawUTF8(), panel.gridForTest().downbeatSec, (int) fit2, 10);
+        check (o0 == "offset 0 ms" && o2 == "+2 ms" && fit2, "1: two nudges right read '+2 ms' and the readout fits");
+        panel.gridNudgeForTest (-12 * kGridNudgeSec);
+        const auto om = panel.gridOffsetTextForTest();
+        panel.gridSetDownbeatForTest (48000);
+        const auto oSet = panel.gridOffsetTextForTest();
+        panel.gridNudgeForTest (kGridNudgeSec);
+        panel.gridResetForTest();
+        const auto oReset = panel.gridOffsetTextForTest();
+        std::printf ("  2 after 12 ms left '%s' (want '-10 ms'), after Set 1 '%s' (want 'offset 0 ms'), after a nudge and Reset grid '%s' (want 'offset 0 ms')%c",
+                     om.toRawUTF8(), oSet.toRawUTF8(), oReset.toRawUTF8(), 10);
+        check (om == "-10 ms" && oSet == "offset 0 ms" && oReset == "offset 0 ms", "2: Set 1 and Reset grid zero the offset readout");
+
+        const auto& wm = panel.warpMarkersForTest();
+        const auto hint = panel.warpInfoTextForTest();
+        check (wm.size() >= 4, "3: at least 4 markers");
+        if (wm.size() >= 4)
+        {
+            panel.selectWarpMarkerForTest (2, false);
+            const auto one = panel.warpInfoTextForTest();
+            const double want = (double) wm[2].dstFrame / sr;
+            const double got = one.fromFirstOccurrenceOf ("at ", false, false).getDoubleValue();
+            const bool fit1 = panel.readouts2FitForTest();
+            std::printf ("  3 one marker: '%s', time %.4f s vs marker %.4f s, error %.2f ms (want under 1), fits=%d%c",
+                         one.toRawUTF8(), got, want, std::abs (got - want) * 1000.0, (int) fit1, 10);
+            check (one.startsWith ("1 marker at ") && std::abs (got - want) < 0.001 && fit1, "3: one selected marker shows its time to within 1 ms");
+            panel.selectWarpMarkerForTest (1, true);
+            panel.selectWarpMarkerForTest (3, true);
+            const auto three = panel.warpInfoTextForTest();
+            std::printf ("  4 three markers: '%s' (want '3 markers selected'), count %d%c", three.toRawUTF8(), panel.warpSelectedCountForTest(), 10);
+            check (three == "3 markers selected" && panel.readouts2FitForTest(), "4: three selected markers read '3 markers selected'");
+        }
+        // The hint names the real gestures: mouseDoubleClick adds (empty) and removes (marker),
+        // mouseDown with Alt in the warp lane removes. Right-click and a plain click do not.
+        const auto h = TakeEditorPanel::warpGestureHintForTest();
+        const bool real = h.contains ("Double-click") && h.contains ("add") && h.contains ("Alt + click") && h.contains ("remove")
+                          && ! h.containsIgnoreCase ("right-click");
+        std::printf ("  5 no selection: '%s', hint '%s', names the real gestures=%d, fits=%d%c", hint.toRawUTF8(), h.toRawUTF8(), (int) real, (int) panel.readouts2FitForTest(), 10);
+        check (hint == h && real, "5: with no selection the line shows the add / remove hint with the real gestures");
+        panel.selectWarpInFramesForTest (1, 0, false);
+        check (panel.warpInfoTextForTest() == h && panel.readouts2FitForTest(), "6: a cleared selection brings the hint back and it fits");
+        panel.close (false);
+    }
+    testMutant = mutNone;
+    P::tempoMeasureEnabled = savedMeasure;
+    d.deleteRecursively();
+    std::printf ("  readouts2: %d failed%c", failures - failuresBefore, 10);
+}
+
 static void testTakeLoop (const juce::File& tmp)
 {
     std::printf ("Take loop: flag clamp, hit picking, drag throttle, Cancel/Close/Reset/clear, Export loop, seam warning, real renders, hit areas, real mouse events%c", 10);
@@ -21285,7 +22190,8 @@ static void testTakeLoop (const juce::File& tmp)
     }
 
     // 7. Hit areas with a loop set, at both window sizes.
-    for (const auto size : { juce::Point<int> (590, 686), juce::Point<int> (490, 566) })
+    const auto minPanel = takePanelSizeAtMinWindow();
+    for (const auto size : { juce::Point<int> (590, 686), minPanel })
     {
         Store st;
         juce::uint32 clock = 100000;
@@ -21314,8 +22220,8 @@ static void testTakeLoop (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, loop set=%d: %d areas (%d take the mouse, %d buttons or boxes), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty=%d (want 0), buttons under 48 x 24=%d (want 0)%c",
                      size.x, size.y, (int) panel.hasLoopForTest(), (int) areas.size(), hit, buttons, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small, 10);
-        ck (panel.hasLoopForTest() && areas.size() == 38 && hit == 29 && buttons == 25 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
-            size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686" : "7: no two areas overlap and none leaves the panel at 490 x 566");
+        ck (panel.hasLoopForTest() && areas.size() == 72 && hit == 51 && buttons == 47 /* metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas (4 labels, 4 boxes, Normalize, peak), 5 of them buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+            size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686" : "7: no two areas overlap and none leaves the panel at the measured minimum-window size");
         panel.close (false);
     }
 
@@ -21728,13 +22634,13 @@ static void testTakeLoop (const juce::File& tmp)
 // and the beat ruler, the toggle state across takes, and the hit areas. No window, no
 // sound; real files in the run's temp folder only. Teeth (HSLINK_TEETH): TS_SNAP_OFF,
 // TS_SEND_LOOSE, TS_ZERO_NOT_SENT, TS_BEATS_NO_THIN, TS_SNAP_NO_ENDS,
-// TL_BUTTONS_OVERLAP and TS_GRID_STALE (item 8, o135 round B: the tempo changes while
+// TL_BUTTONS_OVERLAP and TS_GRID_STALE, TS_LOOP_BEATS and TS_GRID_FLOOR (item 9, R1) (item 8, o135 round B: the tempo changes while
 // the editor is open) (TakeEditorMath::testMutant).
 static void testTakeSnap (const juce::File& tmp)
 {
     std::printf ("Take snap: pure helpers, engine fixed point, requests, real mouse events, note and beat ruler, toggle state, hit areas\n");
     const int failuresBefore = failures;
-    int checks = 0, item = 1, itemChecks[9] = {}, itemFails[9] = {};
+    int checks = 0, item = 1, itemChecks[11] = {}, itemFails[11] = {};
     auto ck = [&] (bool ok, const char* what)
     {
         ++checks;
@@ -21747,7 +22653,10 @@ static void testTakeSnap (const juce::File& tmp)
     const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
     testMutant = teethVar == "TS_SNAP_OFF" ? mutSnapOff : teethVar == "TS_SEND_LOOSE" ? mutSnapSendLoose
                : teethVar == "TS_ZERO_NOT_SENT" ? mutZeroNotSent : teethVar == "TS_BEATS_NO_THIN" ? mutBeatsNoThin
-               : teethVar == "TS_SNAP_NO_ENDS" ? mutSnapNoEnds : teethVar == "TL_BUTTONS_OVERLAP" ? mutButtonsOverlap : teethVar == "TS_GRID_STALE" ? mutGridStale : mutNone;
+               : teethVar == "TS_SNAP_NO_ENDS" ? mutSnapNoEnds : teethVar == "TL_BUTTONS_OVERLAP" ? mutButtonsOverlap : teethVar == "TS_GRID_STALE" ? mutGridStale
+               : teethVar == "TS_LOOP_BEATS" ? mutLoopSnapBeats : teethVar == "TS_GRID_FLOOR" ? mutGridFloorBeat
+               : teethVar == "LOOP_MOVES_OTHER" ? mutLoopMovesOther : teethVar == "WARP_RESETS_NOHOST" ? mutWarpResetsNoHost
+               : teethVar == "GRID_DROPS_HAND" ? mutGridDropsHand : mutNone;
     std::printf ("  mutant=%d (0 = none)\n", testMutant.load());
     const bool savedMeasure = P::tempoMeasureEnabled.load();
     P::tempoMeasureEnabled = false; // the grid is given by the test
@@ -21847,14 +22756,24 @@ static void testTakeSnap (const juce::File& tmp)
                    l7 = sl (5000, 15000, true, g120, 20000, o7);
         std::printf ("  1 snapLoop at 120 bpm: 30000..100000 end moved -> %lld..%lld, start moved -> %lld..%lld (want 24000..96000 both); 95000..100000 start moved -> %lld..%lld (want 72000..96000), end moved -> %lld..%lld (want 96000..120000)\n",
                      ll (l1.first), ll (l1.second), ll (l2.first), ll (l2.second), ll (l3.first), ll (l3.second), ll (l4.first), ll (l4.second));
-        std::printf ("  1 snapLoop at the file end, length 350000: 310000..350000 -> %lld..%lld (want 312000..336000, cut from 2 beats to 1), 340000..350000 -> %lld..%lld (want 312000..336000, the start moved back); file of 20000 frames (under one beat): 5000..15000 -> ok=%d %lld..%lld (want 0, 5000..15000)\n",
-                     ll (l5.first), ll (l5.second), ll (l6.first), ll (l6.second), (int) o7, ll (l7.first), ll (l7.second));
+        // R1 2026-11-11: 0 and the file end are loop targets now (snapLoop, TakeEditorPanel.h),
+        // so a loop at the file end keeps its end there instead of being cut to whole beats,
+        // and a file under one beat gets the loop 0..length. Such a loop is not whole beats,
+        // so loopOnGrid must be false for it: the panel then does not ask the render's grid
+        // snap, and the render-snap invariant (item 2) still holds.
+        const bool g5 = loopOnGrid (l5.first, l5.second, g120, sr, 350000), g6 = loopOnGrid (l6.first, l6.second, g120, sr, 350000), g7 = loopOnGrid (l7.first, l7.second, g120, sr, 20000);
+        std::printf ("  1 snapLoop at the file end, length 350000: 310000..350000 -> %lld..%lld (want 312000..350000, the end stays on the file end), 340000..350000 -> %lld..%lld (want 336000..350000); file of 20000 frames (under one beat): 5000..15000 -> ok=%d %lld..%lld (want 1, 0..20000); loopOnGrid of the three=%d %d %d (want 0 0 0)\n",
+                     ll (l5.first), ll (l5.second), ll (l6.first), ll (l6.second), (int) o7, ll (l7.first), ll (l7.second), (int) g5, (int) g6, (int) g7);
         ck (o1 && o2 && o3 && o4 && l1 == LP (24000, 96000) && l2 == LP (24000, 96000) && l3 == LP (72000, 96000) && l4 == LP (96000, 120000),
             "1: snapLoop puts the start on a beat and makes the length whole beats, at least one, for both drag directions");
-        ck (o5 && o6 && l5 == LP (312000, 336000) && l6 == LP (312000, 336000) && ! o7 && l7 == LP (5000, 15000),
-            "1: snapLoop cuts a loop at the file end to the beats that fit and leaves a file shorter than one beat alone");
+        ck (o5 && o6 && l5 == LP (312000, 350000) && l6 == LP (336000, 350000) && o7 && l7 == LP (0, 20000) && ! g5 && ! g6 && ! g7,
+            "1: snapLoop lets a loop end on the file end and start on 0, and loopOnGrid is false for such a loop");
         // Sweep at the non-integer tempo.
-        int sBad = 0, nBad = 0, inBad = 0, gridBad = 0, pairs = 0;
+        // R1: every end is a beat or a file end (0 / len). A loop with both ends on beats
+        // must be whole beats; loopOnGrid must be true exactly for a loop that starts on a
+        // beat and is whole beats (the render leaves only those alone). fileEnds counts the
+        // results on 0 or len, so the new targets are really exercised.
+        int sBad = 0, nBad = 0, inBad = 0, gridBad = 0, pairs = 0, fileEnds = 0;
         for (int dir = 0; dir < 2; ++dir)
             for (juce::int64 s = 500; s < len - 2000; s += 7919)
                 for (juce::int64 w = 1500; s + w <= len; w += 41077, ++pairs)
@@ -21866,14 +22785,18 @@ static void testTakeSnap (const juce::File& tmp)
                         continue;
                     }
                     const double nn = (double) (b2 - a2) / bl (g937);
-                    sBad += off (g937, a2) > 1 ? 1 : 0;
-                    nBad += std::round (nn) < 1.0 || std::abs ((double) (b2 - a2) - std::round (nn) * bl (g937)) > 1.0 ? 1 : 0;
-                    inBad += a2 < 0 || b2 > len ? 1 : 0;
-                    gridBad += loopOnGrid (a2, b2, g937, sr, len) ? 0 : 1;
+                    const bool aBeat = off (g937, a2) <= 1, bBeat = off (g937, b2) <= 1;
+                    const bool whole = std::round (nn) >= 1.0 && std::abs ((double) (b2 - a2) - std::round (nn) * bl (g937)) <= 1.0;
+                    fileEnds += a2 == 0 || b2 == len ? 1 : 0;
+                    sBad += (aBeat || a2 == 0 ? 0 : 1) + (bBeat || b2 == len ? 0 : 1);
+                    nBad += aBeat && bBeat && ! whole ? 1 : 0;
+                    inBad += a2 < 0 || b2 > len || b2 <= a2 ? 1 : 0;
+                    gridBad += loopOnGrid (a2, b2, g937, sr, len) != (aBeat && whole) ? 1 : 0;
                 }
-        std::printf ("  1 snapLoop sweep at 93.7 bpm, downbeat 0.137 s: %d loops, both directions: start off a beat=%d, length not whole beats (within 1 frame) or under one beat=%d, outside the file or refused=%d, not loopOnGrid=%d (want 0 each)\n",
-                     pairs, sBad, nBad, inBad, gridBad);
-        ck (pairs > 400 && sBad == 0 && nBad == 0 && inBad == 0 && gridBad == 0, "1: every snapLoop result at 93.7 bpm starts on a beat, is whole beats long and lies inside the file");
+        std::printf ("  1 snapLoop sweep at 93.7 bpm, downbeat 0.137 s: %d loops, both directions: an end neither on a beat nor a file end=%d, both on beats but not whole beats=%d, outside the file, empty or refused=%d, loopOnGrid not (start on a beat and whole beats)=%d (want 0 each); on 0 or the file end=%d (want > 0)\n",
+                     pairs, sBad, nBad, inBad, gridBad, fileEnds);
+        ck (pairs > 400 && sBad == 0 && nBad == 0 && inBad == 0 && gridBad == 0 && fileEnds > 0,
+            "1: every snapLoop result at 93.7 bpm ends on beats or file ends, lies inside the file, and loopOnGrid is true exactly for whole beats from a beat");
 
         // gridUsable.
         const double nan = std::numeric_limits<double>::quiet_NaN();
@@ -21922,7 +22845,7 @@ static void testTakeSnap (const juce::File& tmp)
             const juce::int64 cropPtr[][2] = { { 30011, 300007 }, { 0, 200003 }, { 123457, len }, { 5, 383990 }, { 150001, 150777 }, { 222223, 371113 } };
             // Loop: placed points, and which flag was dragged.
             const juce::int64 loopPtr[][3] = { { 30011, 100003, 1 }, { 30011, 100003, 0 }, { 200003, 201001, 1 }, { 350001, 383999, 1 }, { 370001, 383000, 0 }, { 777, 300007, 0 } };
-            int cropBad = 0, loopBad = 0, notOk = 0, notSnapped = 0, lenBad = 0, cropN = 0, loopN = 0;
+            int cropBad = 0, loopBad = 0, notOk = 0, notSnapped = 0, lenBad = 0, cropN = 0, loopN = 0, offGridLoops = 0;
             juce::int64 worstCrop = 0, worstLoop = 0;
             juce::String firstBad;
             for (int i = 0; i < 6; ++i)
@@ -21932,7 +22855,16 @@ static void testTakeSnap (const juce::File& tmp)
                 auto csC = cs;
                 clampCrop (csC, ce, len, minLen, true);
                 juce::int64 ls = loopPtr[i][0], le = loopPtr[i][1];
-                const bool loopOk = snapLoop (ls, le, loopPtr[i][2] == 1, g, sr, len);
+                bool loopOk = snapLoop (ls, le, loopPtr[i][2] == 1, g, sr, len);
+                // R1 2026-11-11: snapLoop may now put a loop end on 0 or the file end, which is
+                // not whole beats. The panel asks the render's grid snap only when loopOnGrid is
+                // true (TakeEditorPanel.h), so only those loops go to the snapped render here;
+                // the 0-frames-moved checks below stay exact for every loop that is sent.
+                if (loopOk && ! loopOnGrid (ls, le, g, sr, len))
+                {
+                    ++offGridLoops;
+                    loopOk = false;
+                }
                 if (! loopOk)
                     ls = le = -1;
                 // Crop render, the loop points along: the panel's stored form (a file end is -1).
@@ -21978,10 +22910,12 @@ static void testTakeSnap (const juce::File& tmp)
                     rq.dest.deleteFile();
                 }
             }
-            std::printf ("  2 %.2f bpm, downbeat %+.3f s (beat %.3f frames): %d crop renders, points moved by the engine in %d (largest %lld frames); %d loop renders, moved in %d (largest %lld frames); not ok=%d, gridSnapped false=%d, output length not the region=%d (want 0 each)%s%s\n",
-                         g.bpm, g.downbeatSec, bl (g), cropN, cropBad, ll (worstCrop), loopN, loopBad, ll (worstLoop), notOk, notSnapped, lenBad, firstBad.isEmpty() ? "" : "; first: ", firstBad.toRawUTF8());
+            std::printf ("  2 %.2f bpm, downbeat %+.3f s (beat %.3f frames): %d crop renders, points moved by the engine in %d (largest %lld frames); %d loop renders, moved in %d (largest %lld frames); not ok=%d, gridSnapped false=%d, output length not the region=%d (want 0 each); loops on a file end (not loopOnGrid, not sent)=%d%s%s\n",
+                         g.bpm, g.downbeatSec, bl (g), cropN, cropBad, ll (worstCrop), loopN, loopBad, ll (worstLoop), notOk, notSnapped, lenBad, offGridLoops, firstBad.isEmpty() ? "" : "; first: ", firstBad.toRawUTF8());
             ck (cropN >= 5 && cropBad == 0 && worstCrop == 0 && notOk == 0 && notSnapped == 0 && lenBad == 0, "2: the render with snapToGrid uses snapped crop points exactly as given (0 frames moved)");
-            ck (loopN >= 5 && loopBad == 0 && worstLoop == 0 && notOk == 0 && notSnapped == 0, "2: the render with snapToGrid uses a snapped loop exactly as given (0 frames moved)");
+            // R1: 3 of the 6 loops at the non-integer tempos end on the file end and are not
+            // sent (see above); every loop is still either rendered or counted there.
+            ck (loopN >= 3 && loopN + offGridLoops == 6 && loopBad == 0 && worstLoop == 0 && notOk == 0 && notSnapped == 0, "2: the render with snapToGrid uses a snapped loop exactly as given (0 frames moved)");
         }
         // Control: the same render does move points that are not on beats.
         TakeEdit::EditRequest rq;
@@ -22094,13 +23028,19 @@ static void testTakeSnap (const juce::File& tmp)
         const auto aOn = apply();
         const auto xHalf = exportL(); // the loop was not dragged: still off the grid
         dragFlag (panel, clock, handleEnd, 201000);
+        const auto loopMidS = panel.getLoopStartForTest(), loopMidE = panel.getLoopEndForTest();
+        const auto xMid = exportL(); // B1: only the end flag moved, the start is still off the grid
+        dragFlag (panel, clock, handleStart, 101000);
         const auto xOn = exportL();
+        std::printf ("  3 flag drags one at a time: end to 201000 -> loop %lld..%lld (want 100000..%lld), Export=%d (want 0); start to 101000 -> loop %lld..%lld (want %lld..%lld)\n",
+                     ll (loopMidS), ll (loopMidE), ll (cf (g937, 6.0)), (int) xMid.snapToGrid, ll (panel.getLoopStartForTest()), ll (panel.getLoopEndForTest()), ll (cf (g937, 3.0)), ll (cf (g937, 6.0)));
+        ck (loopMidS == 100000 && loopMidE == cf (g937, 6.0) && ! xMid.snapToGrid, "3: Export loop with one flag on a beat and the other off sends snapToGrid false");
         std::printf ("  3 after snapped drags: crop %lld..%lld (want %lld..%lld), Apply snapToGrid=%d bpm=%.3f downbeat=%.3f (want 1, 93.700, 0.137); Export before the flag drag=%d (want 0); loop %lld..%lld after it, Export snapToGrid=%d bpm=%.3f downbeat=%.3f repeats=%d (want 1, 93.700, 0.137, 4)\n",
                      ll (panel.getCropStartForTest()), ll (panel.getCropEndForTest()), ll (cf (g937, 1.0)), ll (cf (g937, 10.0)), (int) aOn.snapToGrid, aOn.gridBpm, aOn.gridDownbeatSec, (int) xHalf.snapToGrid,
                      ll (panel.getLoopStartForTest()), ll (panel.getLoopEndForTest()), (int) xOn.snapToGrid, xOn.gridBpm, xOn.gridDownbeatSec, xOn.loopRepeats);
         ck (panel.getCropStartForTest() == cf (g937, 1.0) && panel.getCropEndForTest() == cf (g937, 10.0) && aOn.snapToGrid && aOn.gridBpm == 93.7 && aOn.gridDownbeatSec == 0.137 && aOn.loopRepeats == 0,
             "3: with the toggle on and the crop on beats Apply crop sends snapToGrid true with the take's bpm and downbeat");
-        ck (! xHalf.snapToGrid && xOn.snapToGrid && xOn.gridBpm == 93.7 && xOn.gridDownbeatSec == 0.137 && xOn.loopRepeats == kDefaultRepeats && panel.getLoopStartForTest() == cf (g937, 3.0),
+        ck (! xHalf.snapToGrid && xOn.snapToGrid && xOn.gridBpm == 93.7 && xOn.gridDownbeatSec == 0.137 && xOn.loopRepeats == kDefaultRepeats && panel.getLoopStartForTest() == cf (g937, 3.0) && panel.getLoopEndForTest() == cf (g937, 6.0),
             "3: Export loop sends snapToGrid true only once the loop itself is on beats");
 
         // Zero crossing: Apply crop only.
@@ -22543,7 +23483,8 @@ static void testTakeSnap (const juce::File& tmp)
 
     // 7. Hit areas with the snap row filled, at both window sizes.
     item = 7;
-    for (const auto size : { juce::Point<int> (590, 686), juce::Point<int> (490, 566) })
+    const auto minPanel = takePanelSizeAtMinWindow();
+    for (const auto size : { juce::Point<int> (590, 686), minPanel })
     {
         Store st;
         juce::uint32 clock = 100000;
@@ -22575,8 +23516,8 @@ static void testTakeSnap (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, snap row filled (note '%s', fits=%d): %d areas (%d take the mouse, %d buttons or boxes, %d of the snap row), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty=%d (want 0), buttons under 48 x 24=%d (want 0)\n",
                      size.x, size.y, panel.noteTextForTest().toRawUTF8(), (int) panel.noteFitsForTest(), (int) areas.size(), hit, buttons, snapAreas, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small);
-        ck (panel.noteTextForTest().isNotEmpty() && panel.noteFitsForTest() && areas.size() == 38 && hit == 29 && buttons == 25 && snapAreas == 3 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
-            size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the snap row filled" : "7: no two areas overlap and none leaves the panel at 490 x 566 with the snap row filled");
+        ck (panel.noteTextForTest().isNotEmpty() && panel.noteFitsForTest() && areas.size() == 72 && hit == 51 && buttons == 47 /* metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas, 5 buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && snapAreas == 3 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+            size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the snap row filled" : "7: no two areas overlap and none leaves the panel at the measured minimum-window size with the snap row filled");
         panel.close (false);
     }
 
@@ -22714,17 +23655,1222 @@ static void testTakeSnap (const juce::File& tmp)
             ck (live.tempo.valid && std::abs (live.tempo.bpm - 120.0) < 0.5 && pg.measured && pg.bpm == live.tempo.bpm && pg.downbeatSec == live.tempo.downbeatSec && panel.gridUsableForTest()
                     && ! panel.noteIsAmberForTest() && linesLive > 10 && snapped == want && want != 100000,
                 "8: real editor, a tempo measured while the editor is open reaches the panel at the next refresh and the drag snaps on the engine's grid");
+
+            // 8w. B4 real path: manual tempo 88 set, no host (host sync never active), the
+            // editor's own wiring. Warp to host must leave a hand-moved marker where it is.
+            p->setManualBpm (88.0);
+            const double fitTempo88 = ed->getTakeEditorForTest().onHostBpm ? ed->getTakeEditorForTest().onHostBpm() : -1.0;
+            const auto m0 = panel.warpMarkersForTest();
+            const int wn = (int) m0.size();
+            const juce::int64 wsrc = wn > 2 ? (juce::int64) m0[1].srcFrame : -1;
+            if (wn > 2)
+                panel.dragWarpForTest (1, wsrc + 6000);
+            const auto wb = panel.warpMarkersForTest();
+            panel.clickWarpToHostForTest();
+            const auto wa = panel.warpMarkersForTest();
+            int wchanged = 0;
+            juce::int64 wworst = 0;
+            for (size_t i = 0; i < wa.size() && i < wb.size(); ++i)
+            {
+                const auto dd = (juce::int64) std::abs ((long long) (wa[i].dstFrame - wb[i].dstFrame));
+                wchanged += dd != 0 ? 1 : 0;
+                wworst = juce::jmax (wworst, dd);
+            }
+            const juce::int64 wdst1 = wa.size() > 1 ? (juce::int64) wa[1].dstFrame : -1;
+            const auto wcue = panel.warpHostNoteForTest();
+            std::printf ("  8w real editor, manual 88 bpm (fit field %.2f), no host: markers %d, marker 1 src %lld hand-moved to %lld; after Warp to host marker 1 dst %lld, %d -> %d markers, changed %d, worst %lld frames (want 0); cue '%s'\n",
+                         fitTempo88, wn, ll (wsrc), wb.size() > 1 ? ll (wb[1].dstFrame) : -1LL, ll (wdst1), (int) wb.size(), (int) wa.size(), wchanged, ll (wworst), wcue.toRawUTF8());
+            ck (wn > 2 && wb.size() > 1 && (juce::int64) wb[1].dstFrame - wsrc == 6000 && wa.size() == wb.size() && wchanged == 0 && wdst1 == wsrc + 6000,
+                "8w: real editor, manual tempo but no host: Warp to host leaves every marker in place");
+            ck (wcue == "No host tempo: Warp to host needs a DAW", "8w: real editor, no host: Warp to host shows the amber cue");
             ed.reset();
+        }
+        p.reset();
+    }
+
+    // 9. R1 (snap follows the grid): loop targets include 0 and the file end, the snap
+    // step follows the visible grid down to 1/64 beat, and a loop the panel calls on the
+    // grid is one the render leaves where it is.
+    item = 9;
+    {
+        // a. Loop snap reaches 0 and the file end (downbeat 0.470 s: the first beat in the file is at 22560).
+        const Grid g470 = mk (120.0, 0.470);
+        juce::int64 s1 = 500, e1 = 200000, s2 = 100000, e2 = len - 500;
+        const bool okA1 = snapLoop (s1, e1, false, g470, sr, len, 1.0), okA2 = snapLoop (s2, e2, true, g470, sr, len, 1.0);
+        std::printf ("  9a 120 bpm, downbeat 0.470 s, length %lld: start dragged to 500 -> %lld (want 0, old rule 22560), end dragged to %lld -> %lld (want %lld), ok=%d %d\n",
+                     ll (len), ll (s1), ll (len - 500), ll (e2), ll (len), (int) okA1, (int) okA2);
+        ck (okA1 && okA2 && s1 == 0 && e2 == len, "9a: the loop snap reaches 0 and the file end");
+
+        // b. gridStepBeats at 24 px per beat (1000 frames per pixel at 120 bpm, 48000).
+        View v;
+        v.firstFrame = 0;
+        v.framesPerPixel = 1000.0;
+        v.widthPx = 384;
+        v.length = len;
+        const double b0 = gridStepBeats (v, g120, sr, 0), b3 = gridStepBeats (v, g120, sr, -3), b6 = gridStepBeats (v, g120, sr, -6);
+        std::printf ("  9b gridStepBeats at 24 px/beat: resolution 0 -> %.6f (want 1), -3 -> %.6f (want 0.125), -6 -> %.6f (want 0.015625)\n", b0, b3, b6);
+        ck (b0 == 1.0 && b3 == 0.125 && b6 == 0.015625, "9b: the snap step follows the grid resolution down to 1/64 beat");
+
+        // c. snapCropPoint with a quarter-beat step.
+        const auto c1 = snapCropPoint (30100, len, false, g120, sr, len, minLen, 0.25), c2 = snapCropPoint (30100, len, false, g120, sr, len, minLen, 1.0);
+        std::printf ("  9c snapCropPoint 30100 at 120 bpm: step 0.25 -> %lld (want 30000), step 1 -> %lld (want 24000)\n", ll (c1), ll (c2));
+        ck (c1 == 30000 && c2 == 24000, "9c: snapCropPoint snaps on the step it is given");
+
+        // d. The panel's snapToStep at resolution -2 (a quarter beat, 6000 frames at 120 bpm, downbeat 0).
+        Store st;
+        juce::uint32 clock = 300000;
+        TakeEditorPanel panel;
+        wire (panel, st, clock, 490, 566);
+        openTake (panel, st, bareFile, pOff, g120);
+        panel.stepResolution (-2);
+        const double stepD = panel.snapStepBeats();
+        juce::int64 worst = 0;
+        const juce::int64 probes[] = { 1234, 30100, 77777, 150001, 299999 };
+        for (const auto f : probes)
+        {
+            const auto s = panel.snapToStep (f);
+            const auto r = s % 6000;
+            worst = juce::jmax (worst, juce::jmin (r, 6000 - r), std::abs (s - f) > 3001 ? (juce::int64) 999999 : (juce::int64) 0);
+        }
+        const auto d1 = panel.snapToStep (30100);
+        std::printf ("  9d panel resolution %d: step %.6f beats (want 0.25); 5 probes, worst distance from a multiple of 6000 %lld (want <= 1); 30100 -> %lld (want 30000)\n",
+                     panel.getResolutionForTest(), stepD, ll (worst), ll (d1));
+        ck (stepD == 0.25 && worst <= 1 && d1 == 30000, "9d: snapToStep snaps on the visible grid step");
+        panel.close (false);
+
+        // e. A loop loopOnGrid accepts is one the render moves 0 frames (the render's closed form, written here on its own).
+        auto renderLoop = [&] (const Grid& g, juce::int64& ls, juce::int64& le)
+        {
+            const double beat = sr * 60.0 / g.bpm, origin = g.downbeatSec * sr;
+            auto at = [beat, origin] (double k) { return (juce::int64) std::llround (origin + k * beat); };
+            double k = juce::jmax (std::round (((double) ls - origin) / beat), std::ceil (-origin / beat));
+            if (at (k) < 0)
+                k += 1.0;
+            const auto start = at (k);
+            double beats = juce::jmin (juce::jmax (1.0, std::round ((double) (le - ls) / beat)), std::floor ((double) (len - start) / beat) + 1.0);
+            if (beats >= 1.0 && start + (juce::int64) std::llround (beats * beat) > len)
+                beats -= 1.0;
+            if (beats >= 1.0)
+            {
+                ls = start;
+                le = start + (juce::int64) std::llround (beats * beat);
+            }
+        };
+        struct L { Grid g; juce::int64 s, e; };
+        const L loops[] = { { g120, 24000, 72000 }, { g937, cf (g937, 2.0), cf (g937, 2.0) + (juce::int64) std::llround (4.0 * bl (g937)) }, { g470, 22560, 118560 }, { g120, 30000, 66000 }, { g470, 0, 200000 } };
+        int onGrid = 0, moved = 0;
+        juce::int64 maxMove = 0;
+        for (const auto& l : loops)
+        {
+            if (! loopOnGrid (l.s, l.e, l.g, sr, len))
+                continue;
+            ++onGrid;
+            juce::int64 ls = l.s, le = l.e;
+            renderLoop (l.g, ls, le);
+            const auto mv = std::abs (ls - l.s) + std::abs (le - l.e);
+            maxMove = juce::jmax (maxMove, mv);
+            moved += mv != 0 ? 1 : 0;
+        }
+        const bool offQuarter = loopOnGrid (30000, 66000, g120, sr, len);
+        std::printf ("  9e loops loopOnGrid accepts: %d of 5 (want 3), the render moved %d of them, at most %lld frames (want 0); quarter-beat loop 30000..66000 on grid=%d (want 0)\n",
+                     onGrid, moved, ll (maxMove), (int) offQuarter);
+        ck (onGrid == 3 && moved == 0 && maxMove == 0 && ! offQuarter, "9e: the render moves a loop on the grid 0 frames");
+    }
+
+    // 10. B2: a flag drag leaves the other flag where it is; Warp to host with no host
+    // tempo leaves the markers and shows the cue; a grid edit keeps hand-placed markers.
+    // Teeth: LOOP_MOVES_OTHER, WARP_RESETS_NOHOST, GRID_DROPS_HAND.
+    item = 10;
+    {
+        Store st;
+        juce::uint32 clock = 1700000;
+        TakeEditorPanel panel;
+        wire (panel, st, clock, 490, 566);
+        openTake (panel, st, bareFile, pOff, g937);
+        panel.setSnapGridForTest (true);
+        const auto e0 = panel.getLoopEndForTest();
+        dragFlag (panel, clock, handleStart, 1000); // nearest target is 0 (beat 0 is at 6576)
+        const auto s1 = panel.getLoopStartForTest(), e1 = panel.getLoopEndForTest();
+        std::printf ("  10 snap-drag start to 1000: loop %lld..%lld (want 0..%lld; the end moved %lld samples, want 0)\n", ll (s1), ll (e1), ll (e0), ll (e1 - e0));
+        ck (s1 == 0 && e1 == e0 && e0 == 200000, "10: a snapped start drag to 0 leaves the loop end unchanged in samples");
+
+        // Warp to host with no host tempo.
+        panel.onWarpHostBpm = [] { return 0.0; };
+        const int nm = (int) panel.warpMarkersForTest().size();
+        const juce::int64 src1 = nm > 2 ? (juce::int64) panel.warpMarkersForTest()[1].srcFrame : -1;
+        if (nm > 2)
+            panel.dragWarpForTest (1, src1 + 6000);
+        const juce::int64 dst1 = nm > 2 ? (juce::int64) panel.warpMarkersForTest()[1].dstFrame : -1;
+        const auto before = panel.warpMarkersForTest();
+        panel.clickWarpToHostForTest();
+        const auto after = panel.warpMarkersForTest();
+        int changed = 0;
+        juce::int64 worst = 0;
+        for (size_t i = 0; i < after.size() && i < before.size(); ++i)
+        {
+            const auto dd = (juce::int64) std::abs ((long long) (after[i].dstFrame - before[i].dstFrame));
+            changed += dd != 0 ? 1 : 0;
+            worst = juce::jmax (worst, dd);
+        }
+        const auto cue = panel.warpHostNoteForTest();
+        std::printf ("  10 markers=%d, marker 1 src %lld moved to %lld (+%lld); Warp to host, no host: markers %d -> %d, changed %d, worst %lld frames (want 0); cue '%s'\n",
+                     nm, ll (src1), ll (dst1), ll (dst1 - src1), (int) before.size(), (int) after.size(), changed, ll (worst), cue.toRawUTF8());
+        ck (nm > 2 && dst1 - src1 == 6000 && after.size() == before.size() && changed == 0, "10: Warp to host with no host tempo leaves every marker in place");
+        ck (cue == "No host tempo: Warp to host needs a DAW", "10: Warp to host with no host tempo shows the amber cue text");
+
+        // Grid x2 and a nudge keep the hand-placed markers.
+        const auto b2 = panel.warpMarkersForTest();
+        const double bpm0 = panel.gridForTest().bpm, db0 = panel.gridForTest().downbeatSec;
+        panel.gridDoubleForTest();
+        panel.gridNudgeForTest (0.01);
+        const auto a2 = panel.warpMarkersForTest();
+        int moved2 = 0;
+        juce::int64 worst2 = 0;
+        for (size_t i = 0; i < a2.size() && i < b2.size(); ++i)
+        {
+            const auto dd = (juce::int64) juce::jmax (std::abs ((long long) (a2[i].dstFrame - b2[i].dstFrame)), std::abs ((long long) (a2[i].srcFrame - b2[i].srcFrame)));
+            moved2 += dd != 0 ? 1 : 0;
+            worst2 = juce::jmax (worst2, dd);
+        }
+        std::printf ("  10 grid %.3f bpm %.3f s -> x2 + nudge %.3f bpm %.3f s; markers %d -> %d, changed %d, worst %lld frames (want 0)\n",
+                     bpm0, db0, panel.gridForTest().bpm, panel.gridForTest().downbeatSec, (int) b2.size(), (int) a2.size(), moved2, ll (worst2));
+        ck (panel.gridForTest().bpm > bpm0 * 1.9 && b2.size() > 2 && a2.size() == b2.size() && moved2 == 0,
+            "10: Grid x2 and a nudge keep hand-placed warp markers where they are");
+        panel.close (false);
+    }
+
+    P::tempoMeasureEnabled = savedMeasure;
+    testMutant = mutNone;
+    d.deleteRecursively(); // this group's own folder under the run's temp folder
+    for (int i = 1; i <= 10; ++i)
+        std::printf ("  takesnap item %d: %d checks, %d failed\n", i, itemChecks[i], itemFails[i]);
+    std::printf ("  takesnap: %d checks, %d failed\n", checks, failures - failuresBefore);
+}
+
+// R1b 2026-11-11, beatgrid editing: Set 1, nudge, grid bpm (step, Shift, typed), half and
+// double with their limits, the beat frames after an edit, Reset, the hand grid stored on
+// the take and kept at reopen, warp markers that follow, a new detection that does not
+// override the hand grid, and the render snapping on the hand grid. 48 kHz, detected grid
+// 120 bpm (bar 2.0 s), downbeat 0.25 s. Teeth (HSLINK_TEETH): TG_EDIT_IGNORED,
+// TG_NO_WRAP, TG_BPM_MOVES_DB, TG_NOT_STORED, TG_MARKERS_STALE.
+static void testTakeGridEdit (const juce::File& tmp)
+{
+    std::printf ("Take grid edit: Set 1, nudge, bpm, half and double, reset, stored per take, markers, live grid, render snap\n");
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&] (bool ok, const char* what) { ++checks; check (ok, what); };
+    using namespace TakeEditorMath;
+    using P = HotStepLinkProcessor;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    testMutant = teethVar == "TG_EDIT_IGNORED" ? mutGridEditIgnored : teethVar == "TG_NO_WRAP" ? mutGridNoWrap
+               : teethVar == "TG_BPM_MOVES_DB" ? mutGridBpmMovesDownbeat : teethVar == "TG_NOT_STORED" ? mutGridNotStored
+               : teethVar == "TG_MARKERS_STALE" ? mutGridMarkersStale : mutNone;
+    std::printf ("  mutant=%d (0 = none)\n", testMutant.load());
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("takegrid_test");
+    d.createDirectory();
+    const double sr = 48000.0;
+    const juce::int64 len = 384000;
+    auto sine = [] (int frames)
+    {
+        juce::AudioBuffer<float> b (1, frames);
+        for (int i = 0; i < frames; ++i)
+            b.setSample (0, i, 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 100.0 * i / 48000.0));
+        return b;
+    };
+    const auto bareFile = writeWav (d.getChildFile ("bare.wav"), sine ((int) len), sr);
+    Grid det;
+    det.bpm = 120.0;
+    det.downbeatSec = 0.25;
+    det.measured = true;
+    auto approx = [] (double a, double b) { return std::abs (a - b) < 1e-6; };
+    struct Panel
+    {
+        std::unique_ptr<TakeEditorPanel> p;
+        std::vector<TakeEdit::GridEdit> stored;
+        juce::uint32 clock = 500000;
+    };
+    auto fresh = [&] (TakeEdit::GridEdit hand = {}) -> std::unique_ptr<Panel>
+    {
+        auto s = std::make_unique<Panel>();
+        s->p = std::make_unique<TakeEditorPanel>();
+        auto& panel = *s->p;
+        auto* sp = s.get();
+        panel.setSize (590, 686);
+        panel.clockForTest = [sp] { return sp->clock; };
+        panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+        panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+        panel.onReport = [] (juce::uint64, P::TakeEditReport&) { return false; };
+        panel.onSetGrid = [sp] (const juce::File&, const TakeEdit::GridEdit& g) { sp->stored.push_back (g); return true; };
+        panel.onClosed = [] {};
+        TakeEditorPanel::Take take;
+        take.temp = bareFile;
+        take.name = bareFile.getFileName();
+        take.grid = det;
+        take.gridEdit = hand;
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        panel.tick();
+        return s;
+    };
+    int caseFail[12] = {};
+    auto cc = [&] (int n, bool ok, const char* what) { caseFail[n] += ok ? 0 : 1; ck (ok, what); };
+
+    // 1. Set 1 at 3.29 s wraps to the first bar line: 1.29 s.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        panel.setClickFrameForTest (157920);
+        const bool en = panel.gridSetEnabledForTest();
+        panel.gridSetDownbeatForTest (157920);
+        const auto g = panel.gridForTest();
+        std::printf ("  1 Set 1 at frame 157920 (3.29 s): enabled=%d downbeat %.6f s bpm %.3f (want 1, 1.290000, 120.000) set=%d stores=%d\n", (int) en, g.downbeatSec, g.bpm,
+                     (int) panel.gridEditForTest().set, (int) s->stored.size());
+        cc (1, en && approx (g.downbeatSec, 1.29) && approx (g.bpm, 120.0) && panel.gridEditForTest().set, "1: Set 1 at 3.29 s gives the downbeat 1.29 s (wrapped to the first bar)");
+        panel.close (false);
+    }
+    // 2. Nudge.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        panel.gridNudgeForTest (kGridNudgeSec);
+        const double a = panel.gridForTest().downbeatSec;
+        panel.gridResetForTest();
+        panel.gridNudgeForTest (-kGridNudgeShiftSec);
+        const double b = panel.gridForTest().downbeatSec;
+        panel.gridResetForTest();
+        panel.gridNudgeForTest (-0.3);
+        const double c = panel.gridForTest().downbeatSec;
+        std::printf ("  2 nudge from 0.25: +%.3f -> %.6f (want 0.251), -%.3f -> %.6f (want 0.240), -0.3 -> %.6f (want 1.950)\n", kGridNudgeSec, a, kGridNudgeShiftSec, b, c);
+        cc (2, approx (a, 0.251) && approx (b, 0.240) && approx (c, 1.95), "2: nudge +1 ms, -10 ms, and -0.3 s wraps to 1.95 s");
+        panel.close (false);
+    }
+    // 3. bpm step keeps the downbeat.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        panel.gridBpmStepForTest (kGridBpmStep);
+        const auto g1 = panel.gridForTest();
+        panel.gridResetForTest();
+        panel.gridBpmStepForTest (kGridBpmShiftStep);
+        const auto g2 = panel.gridForTest();
+        std::printf ("  3 bpm +%.2f -> %.4f downbeat %.6f (want 120.0100 0.250000); Shift +%.1f -> %.4f downbeat %.6f (want 120.1000 0.250000)\n", kGridBpmStep, g1.bpm, g1.downbeatSec,
+                     kGridBpmShiftStep, g2.bpm, g2.downbeatSec);
+        cc (3, approx (g1.bpm, 120.01) && approx (g1.downbeatSec, 0.25) && approx (g2.bpm, 120.1) && approx (g2.downbeatSec, 0.25), "3: the bpm step keeps the downbeat, Shift steps 0.1");
+        panel.close (false);
+    }
+    // 4. Typed bpm.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        panel.gridTypeBpmForTest ("121,5");
+        const double a = panel.gridForTest().bpm;
+        const auto ta = panel.gridBpmTextForTest();
+        panel.gridResetForTest();
+        const auto n0 = s->stored.size();
+        panel.gridTypeBpmForTest ("abc");
+        const double b = panel.gridForTest().bpm;
+        const auto tb = panel.gridBpmTextForTest();
+        panel.gridTypeBpmForTest ("400");
+        const double c = panel.gridForTest().bpm;
+        const auto tc = panel.gridBpmTextForTest();
+        const auto n1 = s->stored.size();
+        std::printf ("  4 typed '121,5' -> %.3f field '%s' (want 121.500); 'abc' -> %.3f field '%s', '400' -> %.3f field '%s' (want 120.000 '120.00'), stores after the bad text=%d (want 0), set=%d (want 0)\n",
+                     a, ta.toRawUTF8(), b, tb.toRawUTF8(), c, tc.toRawUTF8(), (int) (n1 - n0), (int) panel.gridEditForTest().set);
+        cc (4, approx (a, 121.5) && approx (b, 120.0) && approx (c, 120.0) && tb == "120.00" && tc == "120.00" && n1 == n0 && ! panel.gridEditForTest().set,
+            "4: a typed bpm with a comma is taken, bad text and out of range revert the field");
+        panel.close (false);
+    }
+    // 5. Half and double with their limits (code: half needs bpm / 2 >= 30, double bpm * 2 <= 300).
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        panel.gridHalfForTest();
+        const double h = panel.gridForTest().bpm;
+        panel.gridResetForTest();
+        panel.gridDoubleForTest();
+        const double x = panel.gridForTest().bpm;
+        panel.gridResetForTest();
+        struct L { const char* t; bool half, dbl; };
+        const L want[] = { { "200", true, false }, { "150", true, true }, { "150.01", true, false }, { "60", true, true }, { "59.99", false, true } };
+        bool limitsOk = true;
+        for (const auto& l : want)
+        {
+            panel.gridTypeBpmForTest (l.t);
+            const bool hEn = panel.gridHalfEnabledForTest(), dEn = panel.gridDoubleEnabledForTest();
+            std::printf ("  5 at %s bpm (grid %.3f): /2 enabled=%d x2 enabled=%d (want %d %d)\n", l.t, panel.gridForTest().bpm, (int) hEn, (int) dEn, (int) l.half, (int) l.dbl);
+            limitsOk = limitsOk && hEn == l.half && dEn == l.dbl;
+        }
+        panel.gridTypeBpmForTest ("200");
+        panel.gridDoubleForTest();
+        const double after = panel.gridForTest().bpm;
+        std::printf ("  5 /2 from 120 -> %.3f (want 60), x2 -> %.3f (want 240); x2 at 200 does nothing -> %.3f (want 200)\n", h, x, after);
+        cc (5, approx (h, 60.0) && approx (x, 240.0) && limitsOk && approx (after, 200.0), "5: half and double, and their buttons off at the range limits");
+        panel.close (false);
+    }
+    // 6. Beat 1 after a +1 ms nudge.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        const auto b0 = beatFrame (panel.gridForTest(), sr, 1.0);
+        panel.gridNudgeForTest (kGridNudgeSec);
+        const auto b1 = beatFrame (panel.gridForTest(), sr, 1.0);
+        std::printf ("  6 beat 1 before %lld (want 36000), after +1 ms %lld (want 36048)\n", (long long) b0, (long long) b1);
+        cc (6, b0 == 36000 && b1 == 36048, "6: after a +1 ms nudge beat 1 is at frame 36048");
+        panel.close (false);
+    }
+    // 7. Reset.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        panel.gridNudgeForTest (0.1);
+        panel.gridBpmStepForTest (1.0);
+        const bool en = panel.gridResetEnabledForTest();
+        const auto edited = panel.gridForTest();
+        panel.gridResetForTest();
+        const auto g = panel.gridForTest();
+        std::printf ("  7 edited %.3f bpm %.4f s, reset enabled=%d (want 1); after Reset %.3f bpm %.4f s set=%d reset enabled=%d last store set=%d (want 120.000 0.2500 0 0 0)\n", edited.bpm,
+                     edited.downbeatSec, (int) en, g.bpm, g.downbeatSec, (int) panel.gridEditForTest().set, (int) panel.gridResetEnabledForTest(),
+                     s->stored.empty() ? -1 : (int) s->stored.back().set);
+        cc (7, en && ! approx (edited.bpm, 120.0) && g.bpm == 120.0 && g.downbeatSec == 0.25 && ! panel.gridEditForTest().set && ! panel.gridResetEnabledForTest(),
+            "7: Reset gives back the detected grid, set false, Reset off");
+        panel.close (false);
+    }
+    // 9. Warp markers on their auto places follow; a hand-moved set stays.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        const auto m0 = panel.warpMarkersForTest();
+        const long long before = m0.size() > 1 ? (long long) m0[1].dstFrame : -1;
+        panel.gridNudgeForTest (kGridNudgeSec);
+        const auto m1 = panel.warpMarkersForTest();
+        const long long after = m1.size() > 1 ? (long long) m1[1].dstFrame : -1;
+        std::printf ("  9 untouched: markers=%d, first bar marker dst %lld -> %lld after +1 ms (want 12000 -> 12048)\n", (int) m1.size(), before, after);
+        cc (9, before == 12000 && after == 12048, "9: an untouched marker follows the edited grid");
+        panel.close (false);
+
+        auto s2 = fresh();
+        auto& p2 = *s2->p;
+        const auto n = p2.warpMarkersForTest();
+        const auto src2 = n.size() > 2 ? n[2].srcFrame : 0;
+        p2.dragWarpForTest (2, src2 + 4000);
+        p2.gridNudgeForTest (kGridNudgeSec);
+        const auto m2 = p2.warpMarkersForTest();
+        const long long dst2 = m2.size() > 2 ? (long long) m2[2].dstFrame : -1, dst1 = m2.size() > 1 ? (long long) m2[1].dstFrame : -1;
+        std::printf ("  9 hand-moved marker 2 (src %lld) to %lld, then +1 ms: marker 2 dst %lld (want %lld), marker 1 dst %lld (want 12000, the set stays)\n", (long long) src2,
+                     (long long) (src2 + 4000), dst2, (long long) (src2 + 4000), dst1);
+        cc (9, src2 == 108000 && dst2 == src2 + 4000 && dst1 == 12000, "9: a hand-moved marker set stays where it was");
+        p2.close (false);
+    }
+    // 10. A new detection does not override a hand grid.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        panel.gridBpmStepForTest (kGridBpmStep);
+        Grid g2;
+        g2.bpm = 93.7;
+        g2.downbeatSec = 0.137;
+        g2.measured = true;
+        panel.setLiveGrid (g2, "93.70 bpm");
+        const auto g = panel.gridForTest();
+        std::printf ("  10 hand grid 120.01, new detection 93.7 / 0.137: panel grid %.3f bpm %.4f s detected %.3f field '%s' (want 120.010 0.2500 93.700 '120.01')\n", g.bpm, g.downbeatSec,
+                     panel.detectedGridForTest().bpm, panel.gridBpmTextForTest().toRawUTF8());
+        cc (10, approx (g.bpm, 120.01) && approx (g.downbeatSec, 0.25) && panel.detectedGridForTest().bpm == 93.7 && panel.gridBpmTextForTest() == "120.01",
+            "10: setLiveGrid with a new detection keeps the hand grid");
+        panel.close (false);
+    }
+    // 8 and 11: the processor. The hand grid stored on the take, kept at reopen, used by the render.
+    {
+        auto p = std::make_unique<P>();
+        p->setStableRoot (d.getChildFile ("stable"));
+        p->setCollectionRoot (d.getChildFile ("coll"));
+        DawJob j;
+        j.localId = 801;
+        j.request.caption = "grid edit";
+        j.request.expectedBackend = "sa3";
+        j.request.bpm = 120.0;
+        j.request.seed = 801;
+        j.request.durationS = 8.0;
+        const auto f = d.getChildFile ("dl").getChildFile ("grid0.wav");
+        f.getParentDirectory().createDirectory();
+        writeWav (f, sine ((int) len), sr);
+        j.takeFiles.add (f);
+        j.takeSeeds.add (801);
+        p->registerTakeAndWait (j, 0);
+        p->waitTakeMeasureIdle();
+        const auto takes = p->getTakes();
+        if (takes.empty())
+            cc (8, false, "8: the take was listed");
+        else
+        {
+            const auto t0 = takes[0];
+            TakeEditorPanel panel;
+            juce::uint32 clock = 500000;
+            panel.setSize (590, 686);
+            panel.clockForTest = [&clock] { return clock; };
+            panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+            panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+            panel.onReport = [] (juce::uint64, P::TakeEditReport&) { return false; };
+            panel.onSetGrid = [&] (const juce::File& tf, const TakeEdit::GridEdit& g) { return p->setTakeGrid (tf, g); };
+            panel.onClosed = [] {};
+            auto openIt = [&] (const TakeEdit::GridEdit& hand)
+            {
+                TakeEditorPanel::Take take;
+                take.temp = t0.temp;
+                take.name = t0.name;
+                take.grid = det;
+                take.gridEdit = hand;
+                panel.open (take);
+                for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+                {
+                    juce::Thread::sleep (10);
+                    panel.tick();
+                }
+                panel.tick();
+            };
+            openIt ({});
+            panel.gridBpmStepForTest (kGridBpmStep);
+            panel.close (false);
+            const auto e1 = p->getTakes()[0].gridEdit;
+            openIt (e1);
+            const auto g = panel.gridForTest();
+            panel.close (false);
+            std::printf ("  8 after +0.01 and close: take grid set=%d %.4f bpm %.4f s (want 1 120.0100 0.2500); reopened panel %.4f bpm %.4f s (want 120.0100 0.2500)\n", (int) e1.set, e1.bpm,
+                         e1.downbeatSec, g.bpm, g.downbeatSec);
+            cc (8, e1.set && approx (e1.bpm, 120.01) && approx (e1.downbeatSec, 0.25) && approx (g.bpm, 120.01) && approx (g.downbeatSec, 0.25), "8: the hand grid is stored on the take and kept at reopen");
+
+            // 11: a hand grid 120 bpm, downbeat 0.251 s; a crop start at 12030 snaps to 12048 (the detected grid would give 12000).
+            TakeEdit::GridEdit hand;
+            hand.set = true;
+            hand.bpm = 120.0;
+            hand.downbeatSec = 0.251;
+            const bool setOk = p->setTakeGrid (t0.temp, hand);
+            TakeEdit::EditData e;
+            e.cropStart = 12030;
+            e.cropEnd = 300000;
+            TakeEdit::EditOptions o;
+            o.snapToGrid = true;
+            const auto ticket = p->requestTakeEdit (t0.temp, e, o);
+            const bool idle = p->waitTakeEditIdle() && p->waitTakeMeasureIdle() && p->waitSaverIdle();
+            const auto rep = p->getLastTakeEditReport();
+            std::printf ("  11 hand grid 120 / 0.251 stored=%d, crop 12030..300000 snap on: ticket=%llu idle=%d ok=%d skipped=%d snapped=%d used start %lld (want 12048)\n", (int) setOk,
+                         (unsigned long long) ticket, (int) idle, (int) rep.ok, (int) rep.gridSkipped, (int) rep.result.gridSnapped, (long long) rep.result.used.cropStart);
+            cc (11, setOk && ticket != 0 && idle && rep.ok && ! rep.gridSkipped && rep.result.gridSnapped && rep.result.used.cropStart == 12048, "11: the render snaps on the hand grid");
         }
         p.reset();
     }
 
     P::tempoMeasureEnabled = savedMeasure;
     testMutant = mutNone;
-    d.deleteRecursively(); // this group's own folder under the run's temp folder
-    for (int i = 1; i <= 8; ++i)
-        std::printf ("  takesnap item %d: %d checks, %d failed\n", i, itemChecks[i], itemFails[i]);
-    std::printf ("  takesnap: %d checks, %d failed\n", checks, failures - failuresBefore);
+    d.deleteRecursively();
+    for (int i = 1; i <= 11; ++i)
+        std::printf ("  takegrid case %d: %d failed\n", i, caseFail[i]);
+    std::printf ("  takegrid: %d checks, %d failed\n", checks, failures - failuresBefore);
+}
+
+// Take editor R2: loop bar body drag (real juce::MouseEvent down, drag, up on the panel),
+// the warp marker limit cue, and the grid row labels. Teeth (HSLINK_TEETH):
+// TB_NO_KEEP (mutLoopBodyNoKeep), TB_LIMIT_NEVER (mutWarpLimitNever), TB_NO_SNAP (mutLoopBodyNoSnap),
+// TB_STILL_WRITES (mutLoopBodyStillWrites).
+static void testTakeLoopBody (const juce::File& tmp)
+{
+    std::printf ("Take loop body: bar drag keeps length, clamps, snaps, still click; warp limit cue; grid labels\n");
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&] (bool ok, const char* what) { ++checks; check (ok, what); };
+    using namespace TakeEditorMath;
+    using P = HotStepLinkProcessor;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    testMutant = teethVar == "TB_NO_KEEP" ? mutLoopBodyNoKeep : teethVar == "TB_LIMIT_NEVER" ? mutWarpLimitNever : teethVar == "TB_NO_SNAP" ? mutLoopBodyNoSnap : teethVar == "TB_STILL_WRITES" ? mutLoopBodyStillWrites : mutNone;
+    std::printf ("  mutant=%d (0 = none)\n", testMutant.load());
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("takebody_test");
+    d.createDirectory();
+    const double sr = 48000.0;
+    const juce::int64 len = 384000;
+    juce::AudioBuffer<float> buf (1, (int) len);
+    for (int i = 0; i < (int) len; ++i)
+        buf.setSample (0, i, 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 100.0 * i / sr));
+    const auto bareFile = writeWav (d.getChildFile ("bare.wav"), buf, sr);
+    Grid det;
+    det.bpm = 120.0;
+    det.downbeatSec = 0.25;
+    det.measured = true;
+    struct Panel
+    {
+        std::unique_ptr<TakeEditorPanel> p;
+        int writes = 0;
+        juce::uint32 clock = 500000;
+    };
+    auto fresh = [&]() -> std::unique_ptr<Panel>
+    {
+        auto s = std::make_unique<Panel>();
+        s->p = std::make_unique<TakeEditorPanel>();
+        auto& panel = *s->p;
+        auto* sp = s.get();
+        panel.setSize (590, 686);
+        panel.clockForTest = [sp] { return sp->clock; };
+        panel.onSetEdit = [sp] (const juce::File&, const TakeEdit::EditData&) { ++sp->writes; return true; };
+        panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+        panel.onReport = [] (juce::uint64, P::TakeEditReport&) { return false; };
+        panel.onSetGrid = [] (const juce::File&, const TakeEdit::GridEdit&) { return true; };
+        panel.onClosed = [] {};
+        TakeEditorPanel::Take take;
+        take.temp = bareFile;
+        take.name = bareFile.getFileName();
+        take.grid = det;
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        panel.tick();
+        return s;
+    };
+    const auto L = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
+    auto mev = [] (juce::Component& c, juce::Point<int> pos, juce::Point<int> down, juce::ModifierKeys mods, bool dragged)
+    {
+        const auto t = juce::Time::getCurrentTime();
+        return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos.toFloat(), mods, juce::MouseInputSource::defaultPressure,
+                                 juce::MouseInputSource::defaultOrientation, juce::MouseInputSource::defaultRotation, juce::MouseInputSource::defaultTiltX,
+                                 juce::MouseInputSource::defaultTiltY, &c, &c, t, down.toFloat(), t, 1, dragged);
+    };
+    // One body drag: press in the middle of the bar, drag to x + dx in two steps, release.
+    struct Res { juce::int64 s0, e0, s1, e1; int writesDelta; double fpp; };
+    auto bodyDrag = [&] (Panel& s, int dx, bool snap) -> Res
+    {
+        auto& panel = *s.p;
+        auto& c = static_cast<juce::Component&> (panel);
+        panel.setSnapGridForTest (snap);
+        const auto lane = panel.loopLaneForTest();
+        const auto v = panel.viewForTest();
+        Res r { panel.getLoopStartForTest(), panel.getLoopEndForTest(), 0, 0, 0, v.framesPerPixel };
+        const int mx = lane.getX() + (int) std::lround ((xOfFrame (v, r.s0) + xOfFrame (v, r.e0)) * 0.5);
+        const juce::Point<int> down (mx, lane.getCentreY());
+        const int w0 = s.writes;
+        c.mouseDown (mev (c, down, down, L, false));
+        if (dx != 0)
+        {
+            s.clock += 1000;
+            c.mouseDrag (mev (c, down.translated (dx / 2, 0), down, L, true));
+            s.clock += 1000;
+            c.mouseDrag (mev (c, down.translated (dx, 0), down, L, true));
+        }
+        c.mouseUp (mev (c, down.translated (dx, 0), down, L, dx != 0));
+        r.s1 = panel.getLoopStartForTest();
+        r.e1 = panel.getLoopEndForTest();
+        r.writesDelta = s.writes - w0;
+        return r;
+    };
+    auto withLoop = [&]() -> std::unique_ptr<Panel>
+    {
+        auto s = fresh();
+        s->p->setSnapGridForTest (false);
+        s->p->createLoopForTest (150000);
+        return s;
+    };
+
+    // 1. Plain drag right by 40 px, snap off: length kept exactly, start moved 40 px.
+    {
+        auto s = withLoop();
+        const bool has = s->p->hasLoopForTest();
+        const auto r = bodyDrag (*s, 40, false);
+        const double movedPx = (double) (r.s1 - r.s0) / r.fpp;
+        std::printf ("  1 loop %lld..%lld (len %lld) has=%d, drag +40 px -> %lld..%lld (len %lld), moved %.2f px, writes %d\n", (long long) r.s0, (long long) r.e0,
+                     (long long) (r.e0 - r.s0), (int) has, (long long) r.s1, (long long) r.e1, (long long) (r.e1 - r.s1), movedPx, r.writesDelta);
+        ck (has && r.e0 - r.s0 > 1000, "1: a loop exists to drag");
+        ck (r.e1 - r.s1 == r.e0 - r.s0, "1: the body drag keeps the loop length exactly");
+        ck (std::abs (movedPx - 40.0) <= 1.5, "1: the start moves with the pointer (40 px within 1.5 px)");
+        ck (r.writesDelta >= 1, "1: the drag writes the edit");
+        s->p->close (false);
+    }
+    // 2. Clamp at 0 and at the file end, length still kept.
+    {
+        auto s = withLoop();
+        const auto r = bodyDrag (*s, -2000, false);
+        std::printf ("  2a drag -2000 px: %lld..%lld (want 0..%lld)\n", (long long) r.s1, (long long) r.e1, (long long) (r.e0 - r.s0));
+        ck (r.s1 == 0 && r.e1 == r.e0 - r.s0, "2a: clamped at 0 exactly, length kept");
+        auto s2 = withLoop();
+        const auto r2 = bodyDrag (*s2, 2000, false);
+        const auto L2 = s2->p->getLengthForTest();
+        std::printf ("  2b drag +2000 px: %lld..%lld (want %lld..%lld)\n", (long long) r2.s1, (long long) r2.e1, (long long) (L2 - (r2.e0 - r2.s0)), (long long) L2);
+        ck (r2.e1 == L2 && r2.e1 - r2.s1 == r2.e0 - r2.s0, "2b: clamped at the file end exactly, length kept");
+        s->p->close (false);
+        s2->p->close (false);
+    }
+    // 3. Snap on: the start lands on a beat line of the grid (120 bpm, downbeat 0.25 s), 0 or file end.
+    {
+        auto s = withLoop();
+        const auto r = bodyDrag (*s, 37, true);
+        const juce::int64 beat = 24000, db = 12000;
+        const auto off = ((r.s1 - db) % beat + beat) % beat;
+        const auto L3 = s->p->getLengthForTest();
+        const bool onGrid = off == 0 || r.s1 == 0 || r.e1 == L3;
+        std::printf ("  3 snap on, drag +37 px: %lld..%lld (len %lld, was %lld), start off a beat line by %lld frames (want 0) snapActive=%d\n", (long long) r.s1, (long long) r.e1,
+                     (long long) (r.e1 - r.s1), (long long) (r.e0 - r.s0), (long long) off, (int) s->p->snapActiveForTest());
+        ck (s->p->snapActiveForTest() && onGrid && r.s1 != r.s0, "3: snap on: the start lands on a grid line");
+        ck (r.e1 - r.s1 == r.e0 - r.s0, "3: snap on: length kept");
+        s->p->close (false);
+    }
+    // 4. A still click on the bar: loop unchanged, nothing written.
+    {
+        auto s = withLoop();
+        const auto r = bodyDrag (*s, 0, false);
+        std::printf ("  4 still click: %lld..%lld -> %lld..%lld, writes %d (want 0)\n", (long long) r.s0, (long long) r.e0, (long long) r.s1, (long long) r.e1, r.writesDelta);
+        ck (r.s1 == r.s0 && r.e1 == r.e0 && r.writesDelta == 0, "4: a still click on the bar moves nothing and writes nothing");
+        s->p->close (false);
+    }
+    // 5. Warp marker limit cue.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        panel.setWarpForTest (true);
+        panel.resized();
+        const int n = (int) panel.warpMarkersForTest().size();
+        ck (n >= 3, "5: at least 3 auto markers");
+        if (n >= 3)
+        {
+            const auto d1 = panel.warpMarkersForTest()[1].dstFrame, d2 = panel.warpMarkersForTest()[2].dstFrame;
+            panel.shotDragWarp (1, (double) (d1 + 4800) / sr, false);
+            const int freeMarker = panel.warpLimitMarkerForTest();
+            const auto freeDst = panel.warpMarkersForTest()[1].dstFrame;
+            std::printf ("  5a marker 1 %lld -> +4800 free: now %lld, limit marker %d (want -1)\n", (long long) d1, (long long) freeDst, freeMarker);
+            ck (freeMarker == -1 && freeDst == d1 + 4800, "5a: a drag inside the range sets no limit cue");
+            panel.shotDragWarp (1, (double) (d2 + 48000) / sr, false);
+            const auto hitDst = panel.warpMarkersForTest()[1].dstFrame;
+            std::printf ("  5b marker 1 pushed past marker 2 (%lld): now %lld (gap %lld, min %lld), limit marker %d text '%s'\n", (long long) d2, (long long) hitDst,
+                         (long long) (d2 - hitDst), (long long) WarpMarkers::kMinGapFrames, panel.warpLimitMarkerForTest(), panel.warpLimitTextForTest().toRawUTF8());
+            ck (d2 - hitDst == WarpMarkers::kMinGapFrames, "5b: the marker stops kMinGapFrames before the next");
+            ck (panel.warpLimitMarkerForTest() == 1 && panel.warpLimitTextForTest() == "Marker limit: next marker", "5b: the limit cue is set on marker 1, text names the next marker");
+        }
+        panel.close (false);
+    }
+    // 6. Grid row labels.
+    {
+        auto s = fresh();
+        const auto t = s->p->gridRowTextsForTest();
+        std::printf ("  6 grid row: '%s'\n", t.joinIntoString ("' '").toRawUTF8());
+        ck (t == juce::StringArray { "< 1ms", "1ms >", "Grid /2", "Grid x2", "BPM" }, "6: grid row labels < 1ms, 1ms >, Grid /2, Grid x2, BPM");
+        s->p->close (false);
+    }
+
+    P::tempoMeasureEnabled = savedMeasure;
+    testMutant = mutNone;
+    d.deleteRecursively();
+    std::printf ("  takebody: %d checks, %d failed\n", checks, failures - failuresBefore);
+}
+
+// Take editor R3: warp marker selection sets, Select in loop, Quantize (pure and on the
+// panel, on the grid in effect), the Shift hint. Teeth (HSLINK_TEETH): QT_NO_STRENGTH
+// (mutQuantNoStrength), QT_DETECTED_GRID (mutQuantDetectedGrid), QT_SELLOOP_ALL (mutSelLoopNoBounds).
+static void testTakeQuant (const juce::File& tmp)
+{
+    std::printf ("Take quantize: selection sets, Select in loop, quantize strength and grid, gap and order, hint\n");
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&] (bool ok, const char* what) { ++checks; check (ok, what); };
+    using namespace TakeEditorMath;
+    using P = HotStepLinkProcessor;
+    using WM = WarpMarkers::Marker;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    testMutant = teethVar == "QT_NO_STRENGTH" ? mutQuantNoStrength : teethVar == "QT_DETECTED_GRID" ? mutQuantDetectedGrid : teethVar == "QT_SELLOOP_ALL" ? mutSelLoopNoBounds : mutNone;
+    std::printf ("  mutant=%d (0 = none)\n", testMutant.load());
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("takequant_test");
+    d.createDirectory();
+    const double sr = 48000.0;
+    const juce::int64 len = 384000;
+    juce::AudioBuffer<float> buf (1, (int) len);
+    for (int i = 0; i < (int) len; ++i)
+        buf.setSample (0, i, 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 100.0 * i / sr));
+    const auto bareFile = writeWav (d.getChildFile ("bare.wav"), buf, sr);
+    Grid det;
+    det.bpm = 120.0;
+    det.downbeatSec = 0.25;
+    det.measured = true;
+    auto fresh = [&]() -> std::unique_ptr<TakeEditorPanel>
+    {
+        auto p = std::make_unique<TakeEditorPanel>();
+        auto& panel = *p;
+        panel.setSize (590, 686);
+        panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+        panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+        panel.onReport = [] (juce::uint64, P::TakeEditReport&) { return false; };
+        panel.onSetGrid = [] (const juce::File&, const TakeEdit::GridEdit&) { return true; };
+        panel.onClosed = [] {};
+        TakeEditorPanel::Take take;
+        take.temp = bareFile;
+        take.name = bareFile.getFileName();
+        take.grid = det;
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        panel.tick();
+        panel.setWarpForTest (true);
+        panel.resized();
+        return p;
+    };
+    auto selText = [] (TakeEditorPanel& panel)
+    {
+        juce::StringArray s;
+        const int n = (int) panel.warpMarkersForTest().size();
+        for (int i = 0; i < n; ++i)
+            if (panel.warpSelectedForTest (i))
+                s.add (juce::String (i));
+        return s.joinIntoString (" ");
+    };
+    // The grid line nearest d, stepBeats apart from the grid's downbeat.
+    auto lineOf = [sr] (const Grid& g, double stepBeats, juce::int64 dFrame)
+    {
+        const double step = stepBeats * 60.0 / g.bpm * sr;
+        const double origin = (double) std::llround (g.downbeatSec * sr);
+        return origin + (double) std::llround (((double) dFrame - origin) / step) * step;
+    };
+
+    // 1: selection sets on the panel.
+    {
+        auto pp = fresh();
+        auto& panel = *pp;
+        const auto& wm = panel.warpMarkersForTest();
+        std::printf ("  markers %d:", (int) wm.size());
+        for (const auto& m : wm)
+            std::printf (" %lld", (long long) m.dstFrame);
+        std::printf ("\n");
+        ck (wm.size() >= 5, "1: at least 5 auto markers");
+        if (wm.size() >= 5)
+        {
+            panel.selectWarpMarkerForTest (1, false);
+            const auto a = selText (panel);
+            panel.selectWarpMarkerForTest (3, true);
+            const auto b = selText (panel);
+            panel.selectWarpMarkerForTest (1, true);
+            const auto c = selText (panel);
+            panel.selectWarpMarkerForTest (2, false);
+            const auto e = selText (panel);
+            std::printf ("  1a click 1, Shift 3, Shift 1, click 2: '%s' '%s' '%s' '%s' (want '1' '1 3' '3' '2')\n", a.toRawUTF8(), b.toRawUTF8(), c.toRawUTF8(), e.toRawUTF8());
+            ck (a == "1" && b == "1 3" && c == "3" && e == "2", "1a: click selects one, Shift toggles");
+            const auto d1 = wm[1].dstFrame, d2 = wm[2].dstFrame, d3 = wm[3].dstFrame, d4 = wm[4].dstFrame;
+            const int nb = panel.selectWarpInFramesForTest (d1 - 10, d2 + 10, false);
+            const auto f = selText (panel);
+            panel.selectWarpInFramesForTest (d4 - 10, d4 + 10, true);
+            const auto g = selText (panel);
+            const int nz = panel.selectWarpInFramesForTest (1, 0, false);
+            const int cz = panel.warpSelectedCountForTest();
+            std::printf ("  1b box d1..d2: %d '%s'; add box over 4: '%s'; empty box returns %d, %d selected (want 2 '1 2' '1 2 4' 0 0)\n", nb, f.toRawUTF8(), g.toRawUTF8(), nz, cz);
+            ck (nb == 2 && f == "1 2" && g == "1 2 4" && nz == 0 && cz == 0, "1b: box select, add box, empty box clears");
+            panel.setSnapGridForTest (false);
+            panel.createLoopForTest (d2 - 1000);
+            panel.beginLoopDragForTest (handleEnd);
+            panel.dragToFrameForTest (d3 + 1000);
+            panel.endDragForTest();
+            panel.beginLoopDragForTest (handleStart);
+            panel.dragToFrameForTest (d2 - 1000);
+            panel.endDragForTest();
+            const int nl = panel.clickSelectInLoopForTest();
+            const auto l = selText (panel);
+            std::printf ("  1c loop %lld..%lld (want %lld..%lld): Select in loop returns %d '%s' (want 2 '2 3')\n", (long long) panel.getLoopStartForTest(), (long long) panel.getLoopEndForTest(),
+                         (long long) (d2 - 1000), (long long) (d3 + 1000), nl, l.toRawUTF8());
+            ck (panel.getLoopStartForTest() == d2 - 1000 && panel.getLoopEndForTest() == d3 + 1000, "1c: the loop spans markers 2 and 3");
+            ck (nl == 2 && l == "2 3", "1c: Select in loop selects only the markers inside the loop");
+        }
+        panel.close (false);
+    }
+
+    // 2 and 3: pure quantizeMarkers, 100 % and 50 %.
+    {
+        const int choices[] = { 5, 1, 6 };
+        for (int ch : choices)
+        {
+            const double beats = quantizeChoiceBeats (ch);
+            const double step = beats * 60.0 / det.bpm * sr;
+            for (double pct : { 100.0, 50.0 })
+            {
+                const double off = pct == 100.0 ? 0.3 : 0.4;
+                std::vector<WM> m;
+                std::vector<bool> sel;
+                m.push_back ({ 0, 0 });
+                sel.push_back (false);
+                std::vector<double> lines;
+                for (int k : { 2, 4, 6 })
+                {
+                    const double line = 12000.0 + std::round ((48000.0 * k - 12000.0) / step) * step;
+                    const auto f = (juce::int64) std::llround (line + off * step);
+                    m.push_back ({ f, f });
+                    sel.push_back (true);
+                    lines.push_back (line);
+                }
+                m.push_back ({ len, len });
+                sel.push_back (false);
+                const auto before = m;
+                const int moved = quantizeMarkers (m, sel, det, sr, len, beats, pct);
+                double worst = 0.0, leastMove = 1.0e18;
+                for (std::size_t i = 1; i <= 3; ++i)
+                {
+                    const double want = pct == 100.0 ? lineOf (det, beats, before[i].dstFrame) : 0.5 * ((double) before[i].dstFrame + lineOf (det, beats, before[i].dstFrame));
+                    worst = std::max (worst, std::abs ((double) m[i].dstFrame - want));
+                    leastMove = std::min (leastMove, (double) std::abs (m[i].dstFrame - before[i].dstFrame));
+                }
+                const bool endsKept = m[0].dstFrame == 0 && m[4].dstFrame == len;
+                std::printf ("  %d %s at %.0f%%: step %.2f frames, moved %d, worst off target %.2f frames (want <= 1), least move %.2f frames (want >= %.2f), ends kept %d\n", pct == 100.0 ? 2 : 3,
+                             quantizeChoiceName (ch).toRawUTF8(), pct, step, moved, worst, leastMove, 0.25 * step * (pct == 100.0 ? 1.0 : 0.5), (int) endsKept);
+                if (pct == 100.0)
+                    ck (moved == 3 && worst <= 1.0 && leastMove >= 0.25 * step && endsKept, "2: 100 % puts each selected marker on its grid line within 1 frame");
+                else
+                    ck (moved == 3 && worst <= 1.0 && leastMove >= 0.125 * step && endsKept, "3: 50 % moves each selected marker half way within 1 frame");
+            }
+        }
+    }
+
+    // 4: the panel quantizes on the edited grid, not the detected one.
+    {
+        auto pp = fresh();
+        auto& panel = *pp;
+        panel.gridSetDownbeatForTest (30000);
+        panel.gridBpmStepForTest (1.0);
+        const auto g = panel.gridForTest();
+        const auto& wm = panel.warpMarkersForTest();
+        ck (wm.size() >= 4, "4: markers to quantize");
+        if (wm.size() >= 4)
+        {
+            panel.dragWarpForTest (2, wm[2].dstFrame + 7000);
+            const auto src = wm[2].dstFrame;
+            panel.selectWarpMarkerForTest (2, false);
+            panel.setQuantizeForTest (9, 100.0);
+            const double beats = quantizeChoiceBeats (9);
+            const double wantEdit = lineOf (g, beats, src), wantDet = lineOf (det, beats, src);
+            const int moved = panel.clickQuantizeForTest();
+            const auto now = wm[2].dstFrame;
+            std::printf ("  4 grid %.4f bpm %.4f s; marker 2 at %lld -> %lld, moved %d; edited-grid line %.1f (off %.1f frames, want <= 1), detected line %.1f (lines %.1f frames apart, want > 1000)\n", g.bpm,
+                         g.downbeatSec, (long long) src, (long long) now, moved, wantEdit, std::abs ((double) now - wantEdit), wantDet, std::abs (wantEdit - wantDet));
+            ck (moved == 1 && std::abs ((double) now - wantEdit) <= 1.0 && std::abs (wantEdit - wantDet) > 1000.0, "4: Quantize follows the edited grid");
+        }
+        panel.close (false);
+    }
+
+    // 5: pure, two markers to the same line: the gap and order hold, the unselected one stays.
+    {
+        std::vector<WM> m { { 0, 0 }, { 11000, 11000 }, { 13000, 13000 }, { 50000, 50000 }, { len, len } };
+        std::vector<bool> sel { false, true, true, false, false };
+        quantizeMarkers (m, sel, det, sr, len, quantizeChoiceBeats (9), 100.0);
+        const auto gap = m[2].dstFrame - m[1].dstFrame;
+        std::printf ("  5 11000/13000 to 1/4: now %lld %lld (gap %lld, min %lld, one on 12000), marker 3 %lld (want 50000)\n", (long long) m[1].dstFrame, (long long) m[2].dstFrame, (long long) gap,
+                     (long long) WarpMarkers::kMinGapFrames, (long long) m[3].dstFrame);
+        ck (gap >= WarpMarkers::kMinGapFrames && (m[1].dstFrame == 12000 || m[2].dstFrame == 12000) && m[3].dstFrame == 50000 && m[0].dstFrame == 0 && m[4].dstFrame == len,
+            "5: order and kMinGapFrames kept, unselected markers unmoved");
+    }
+
+    // 6: the lane hint.
+    {
+        auto pp = fresh();
+        const auto h = pp->warpLaneHintForTest();
+        std::printf ("  6 hint '%s'\n", h.toRawUTF8());
+        ck (h == "Shift: free drag", "6: the warp lane hint names Shift free drag");
+        pp->close (false);
+    }
+
+    P::tempoMeasureEnabled = savedMeasure;
+    testMutant = mutNone;
+    d.deleteRecursively();
+    std::printf ("  takequant: %d checks, %d failed\n", checks, failures - failuresBefore);
+}
+
+// Take editor R4: undo and redo. Every edit type is done, undone (exact prior values) and
+// redone (exact edited values); gesture counting, redo clearing, the keys, the buttons and
+// the cap of 100. Teeth (HSLINK_TEETH): UNDO_SKIPS_GRID (mutUndoSkipsGrid),
+// DRAG_STEP_PER_MOVE (mutDragStepPerMove).
+static void testTakeUndo (const juce::File& tmp)
+{
+    std::printf ("Take undo: every edit type undone and redone exactly, one step per gesture, keys, buttons, cap\n");
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&] (bool ok, const char* what) { ++checks; check (ok, what); };
+    using namespace TakeEditorMath;
+    using P = HotStepLinkProcessor;
+    using Snap = TakeEditorPanel::UndoSnapshot;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    testMutant = teethVar == "UNDO_SKIPS_GRID" ? mutUndoSkipsGrid : teethVar == "DRAG_STEP_PER_MOVE" ? mutDragStepPerMove : mutNone;
+    std::printf ("  mutant=%d (0 = none)\n", testMutant.load());
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("takeundo_test");
+    d.createDirectory();
+    const double sr = 48000.0;
+    const juce::int64 len = 384000;
+    juce::AudioBuffer<float> buf (1, (int) len);
+    for (int i = 0; i < (int) len; ++i)
+        buf.setSample (0, i, 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 100.0 * i / sr));
+    const auto bareFile = writeWav (d.getChildFile ("bare.wav"), buf, sr);
+    Grid det;
+    det.bpm = 120.0;
+    det.downbeatSec = 0.25;
+    det.measured = true;
+    auto fresh = [&]() -> std::unique_ptr<TakeEditorPanel>
+    {
+        auto p = std::make_unique<TakeEditorPanel>();
+        auto& panel = *p;
+        panel.setSize (590, 686);
+        panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+        panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+        panel.onReport = [] (juce::uint64, P::TakeEditReport&) { return false; };
+        panel.onSetGrid = [] (const juce::File&, const TakeEdit::GridEdit&) { return true; };
+        panel.onClosed = [] {};
+        TakeEditorPanel::Take take;
+        take.temp = bareFile;
+        take.name = bareFile.getFileName();
+        take.grid = det;
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        panel.tick();
+        panel.setWarpForTest (true);
+        panel.setSnapGridForTest (false);
+        panel.resized();
+        return p;
+    };
+    // Exact equality; bpm and downbeat to 1e-6.
+    auto same = [] (const Snap& a, const Snap& b)
+    {
+        if (a.cropStart != b.cropStart || a.cropEnd != b.cropEnd || a.loopStart != b.loopStart || a.loopEnd != b.loopEnd)
+            return false;
+        if (a.gridEdit.set != b.gridEdit.set || std::abs (a.gridEdit.bpm - b.gridEdit.bpm) > 1e-6 || std::abs (a.gridEdit.downbeatSec - b.gridEdit.downbeatSec) > 1e-6)
+            return false;
+        if (a.markers.size() != b.markers.size() || a.markersEdited != b.markersEdited || std::abs (a.warpTagBpm - b.warpTagBpm) > 1e-6)
+            return false;
+        for (std::size_t i = 0; i < a.markers.size(); ++i)
+            if (a.markers[i].srcFrame != b.markers[i].srcFrame || a.markers[i].dstFrame != b.markers[i].dstFrame)
+                return false;
+        return true;
+    };
+    auto show = [] (const Snap& s)
+    {
+        juce::int64 mSum = 0;
+        for (const auto& m : s.markers)
+            mSum += m.dstFrame;
+        return juce::String::formatted ("crop %lld..%lld loop %lld..%lld grid %d/%.6f/%.6f markers %d sum %lld",
+                                        (long long) s.cropStart, (long long) s.cropEnd, (long long) s.loopStart, (long long) s.loopEnd,
+                                        s.gridEdit.set ? 1 : 0, s.gridEdit.bpm, s.gridEdit.downbeatSec, (int) s.markers.size(), (long long) mSum);
+    };
+    // One edit: exactly one step, the edit changed the state, undo gives the prior state,
+    // redo gives the edited state.
+    auto edit = [&] (TakeEditorPanel& panel, const char* name, const std::function<void()>& fn)
+    {
+        const auto s0 = panel.snapshotForTest();
+        const int u0 = panel.undoDepthForTest();
+        fn();
+        const auto s1 = panel.snapshotForTest();
+        const int u1 = panel.undoDepthForTest();
+        const bool changed = ! same (s0, s1);
+        const bool un = panel.undoForTest();
+        const auto s2 = panel.snapshotForTest();
+        const bool re = panel.redoForTest();
+        const auto s3 = panel.snapshotForTest();
+        const bool okUndo = un && same (s2, s0), okRedo = re && same (s3, s1);
+        std::printf ("  %-14s steps +%d changed %d undo %d redo %d\n    before %s\n    edited %s\n", name, u1 - u0, changed ? 1 : 0, okUndo ? 1 : 0, okRedo ? 1 : 0,
+                     show (s0).toRawUTF8(), show (s1).toRawUTF8());
+        if (! okUndo)
+            std::printf ("    undone %s\n", show (s2).toRawUTF8());
+        if (! okRedo)
+            std::printf ("    redone %s\n", show (s3).toRawUTF8());
+        ck (u1 - u0 == 1, (juce::String (name) + ": exactly one undo step").toRawUTF8());
+        ck (changed, (juce::String (name) + ": the edit changed the state").toRawUTF8());
+        ck (okUndo, (juce::String (name) + ": undo restores the exact prior values").toRawUTF8());
+        ck (okRedo, (juce::String (name) + ": redo restores the exact edited values").toRawUTF8());
+    };
+
+    // 1: every edit type.
+    {
+        auto pp = fresh();
+        auto& panel = *pp;
+        ck (panel.headerReadyForTest() && panel.undoDepthForTest() == 0 && panel.redoDepthForTest() == 0, "1: opened with an empty history");
+        edit (panel, "crop start", [&] { panel.beginDragForTest (handleStart); panel.dragToFrameForTest (20000); panel.dragToFrameForTest (24000); panel.endDragForTest(); });
+        edit (panel, "crop end", [&] { panel.beginDragForTest (handleEnd); panel.dragToFrameForTest (360000); panel.dragToFrameForTest (350000); panel.endDragForTest(); });
+        edit (panel, "loop create", [&] { panel.createLoopForTest (96000); });
+        edit (panel, "loop end", [&] { panel.beginLoopDragForTest (handleEnd); panel.dragToFrameForTest (190000); panel.endDragForTest(); });
+        edit (panel, "loop start", [&] { panel.beginLoopDragForTest (handleStart); panel.dragToFrameForTest (100000); panel.endDragForTest(); });
+        edit (panel, "loop body", [&] { const auto s = panel.getLoopStartForTest(); panel.loopBodyDragForTest (s + 1000, s + 13000); });
+        edit (panel, "loop /2", [&] { panel.scaleLoopLength (false); });
+        edit (panel, "loop x2", [&] { panel.scaleLoopLength (true); });
+        edit (panel, "Set 1", [&] { panel.gridSetDownbeatForTest (30000); });
+        edit (panel, "nudge", [&] { panel.gridNudgeForTest (kGridNudgeShiftSec); });
+        edit (panel, "BPM -", [&] { panel.gridBpmStepForTest (-kGridBpmStep); });
+        edit (panel, "BPM +", [&] { panel.gridBpmStepForTest (kGridBpmShiftStep); });
+        edit (panel, "Grid /2", [&] { panel.gridHalfForTest(); });
+        edit (panel, "Grid x2", [&] { panel.gridDoubleForTest(); });
+        edit (panel, "Reset grid", [&] { panel.gridResetForTest(); });
+        const int nm = (int) panel.warpMarkersForTest().size();
+        ck (nm >= 4, "1: at least 4 markers");
+        if (nm >= 4)
+        {
+            edit (panel, "marker move", [&] { const auto dst = panel.warpMarkersForTest()[2].dstFrame; panel.beginGestureForTest(); panel.dragWarpForTest (2, dst + 3000); panel.endGestureForTest(); });
+            edit (panel, "marker add", [&] { panel.addWarpMarkerAtXForTest (panel.waveAreaForTest().getWidth() * 0.37); });
+            edit (panel, "marker remove", [&] { panel.removeWarpMarkerForTest (1); });
+            edit (panel, "quantize", [&] { panel.selectWarpMarkerForTest (2, false); panel.setQuantizeForTest (9, 100.0); panel.clickQuantizeForTest(); });
+            edit (panel, "Reset markers", [&] { panel.clickResetMarkersForTest(); });
+        }
+        panel.close (false);
+    }
+
+    // 2: a multi-step drag is one step; a still click is none; a new edit clears redo.
+    {
+        auto pp = fresh();
+        auto& panel = *pp;
+        panel.beginDragForTest (handleStart);
+        for (int i = 1; i <= 5; ++i)
+            panel.dragToFrameForTest (4000 * i);
+        panel.endDragForTest();
+        const int afterDrag = panel.undoDepthForTest();
+        panel.beginDragForTest (handleEnd);
+        panel.endDragForTest();
+        panel.beginGestureForTest();
+        panel.endGestureForTest();
+        const int afterStill = panel.undoDepthForTest();
+        std::printf ("  2a 5-move drag: depth %d (want 1); two still clicks: depth %d (want 1)\n", afterDrag, afterStill);
+        ck (afterDrag == 1, "2a: a 5-move drag pushes exactly one undo step");
+        ck (afterStill == 1, "2a: a still click pushes no step");
+        panel.gridNudgeForTest (kGridNudgeShiftSec);
+        panel.undoForTest();
+        panel.undoForTest();
+        const int redoBefore = panel.redoDepthForTest();
+        panel.gridBpmStepForTest (kGridBpmShiftStep);
+        std::printf ("  2b redo depth %d before a new edit, %d after (want 2 0), undo depth %d (want 1)\n", redoBefore, panel.redoDepthForTest(), panel.undoDepthForTest());
+        ck (redoBefore == 2 && panel.redoDepthForTest() == 0 && panel.undoDepthForTest() == 1, "2b: a new edit clears the redo list");
+        panel.close (false);
+    }
+
+    // 3: keys and buttons.
+    {
+        auto pp = fresh();
+        auto& panel = *pp;
+        const bool u0 = panel.undoEnabledForTest(), r0 = panel.redoEnabledForTest();
+        const auto s0 = panel.snapshotForTest();
+        panel.gridNudgeForTest (kGridNudgeShiftSec);
+        const auto s1 = panel.snapshotForTest();
+        const bool u1 = panel.undoEnabledForTest(), r1 = panel.redoEnabledForTest();
+        const auto ctrl = juce::ModifierKeys::commandModifier;
+        const bool kz = panel.keyForTest (juce::KeyPress ('z', ctrl, 0));
+        const bool afterZ = same (panel.snapshotForTest(), s0);
+        const bool u2 = panel.undoEnabledForTest(), r2 = panel.redoEnabledForTest();
+        const bool ky = panel.keyForTest (juce::KeyPress ('y', ctrl, 0));
+        const bool afterY = same (panel.snapshotForTest(), s1);
+        panel.keyForTest (juce::KeyPress ('z', ctrl, 0));
+        const bool ksz = panel.keyForTest (juce::KeyPress ('Z', ctrl | juce::ModifierKeys::shiftModifier, 0));
+        const bool afterSZ = same (panel.snapshotForTest(), s1);
+        const bool plainZ = panel.keyForTest (juce::KeyPress ('z', 0, 0));
+        const bool afterPlain = same (panel.snapshotForTest(), s1);
+        std::printf ("  3 keys: Ctrl+Z %d/%d Ctrl+Y %d/%d Ctrl+Shift+Z %d/%d plain z used %d kept %d (want 1/1 1/1 1/1 0 1)\n",
+                     kz ? 1 : 0, afterZ ? 1 : 0, ky ? 1 : 0, afterY ? 1 : 0, ksz ? 1 : 0, afterSZ ? 1 : 0, plainZ ? 1 : 0, afterPlain ? 1 : 0);
+        ck (kz && afterZ, "3: Ctrl+Z undoes");
+        ck (ky && afterY, "3: Ctrl+Y redoes");
+        ck (ksz && afterSZ, "3: Ctrl+Shift+Z redoes");
+        ck (! plainZ && afterPlain, "3: a plain z is not undo");
+        std::printf ("  3 buttons (undo/redo): fresh %d/%d, after edit %d/%d, after undo %d/%d (want 0/0 1/0 0/1)\n", u0, r0, u1, r1, u2, r2);
+        ck (! u0 && ! r0 && u1 && ! r1 && ! u2 && r2, "3: Undo and Redo enabled follow the depths");
+        panel.close (false);
+    }
+
+    // 4: the cap.
+    {
+        auto pp = fresh();
+        auto& panel = *pp;
+        for (int i = 0; i < TakeEditorPanel::kUndoCap + 7; ++i)
+            panel.gridNudgeForTest (i % 2 == 0 ? kGridNudgeShiftSec : kGridNudgeSec);
+        const int depth = panel.undoDepthForTest();
+        int undone = 0;
+        while (panel.undoForTest() && undone < 1000)
+            ++undone;
+        std::printf ("  4 %d edits: depth %d, undos possible %d (want %d %d)\n", TakeEditorPanel::kUndoCap + 7, depth, undone, TakeEditorPanel::kUndoCap, TakeEditorPanel::kUndoCap);
+        ck (depth == TakeEditorPanel::kUndoCap && undone == TakeEditorPanel::kUndoCap, "4: history capped at 100 steps");
+        panel.close (false);
+    }
+
+    // 5 (C3): the history of a take survives Close and reopen, per take; a deleted take
+    // forgets it. Teeth: UNDO_CLEARED_ON_OPEN.
+    TakeEditorPanel::testUndoClearedOnOpen = teethVar == "UNDO_CLEARED_ON_OPEN";
+    {
+        const auto fileB = writeWav (d.getChildFile ("other.wav"), buf, sr);
+        auto pp = fresh();
+        auto& panel = *pp;
+        auto reopen = [&] (const juce::File& f)
+        {
+            TakeEditorPanel::Take take;
+            take.temp = f;
+            take.name = f.getFileName();
+            take.grid = det;
+            panel.open (take);
+            for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+            {
+                juce::Thread::sleep (10);
+                panel.tick();
+            }
+            panel.tick();
+            panel.setWarpForTest (true);
+        };
+        panel.setWarpForTest (true);
+        const auto s0 = panel.snapshotForTest();
+        panel.beginDragForTest (handleStart);
+        panel.dragToFrameForTest (30000);
+        panel.endDragForTest();
+        const auto s1 = panel.snapshotForTest();
+        panel.addWarpMarkerAtXForTest (panel.waveAreaForTest().getWidth() * 0.41);
+        const auto s2 = panel.snapshotForTest();
+        const int depthA = panel.undoDepthForTest();
+        panel.close (false);
+        reopen (fileB);
+        const int depthB = panel.undoDepthForTest(), redoB = panel.redoDepthForTest();
+        const bool undoB = panel.undoForTest();
+        panel.close (false);
+        reopen (bareFile);
+        const auto sOpen = panel.snapshotForTest(); // the test take carries no stored edit: reopen shows the full take
+        const int depthA2 = panel.undoDepthForTest();
+        const bool u1 = panel.undoForTest();
+        const auto r1 = panel.snapshotForTest();
+        const bool u2 = panel.undoForTest();
+        const auto r2 = panel.snapshotForTest();
+        const int redoDepth = panel.redoDepthForTest();
+        std::printf ("    redo depth after 2 undos %d (want 2)\n", redoDepth);
+        const bool re1 = panel.redoForTest();
+        const auto r3a = panel.snapshotForTest();
+        const int rd1 = panel.redoDepthForTest(), ud1 = panel.undoDepthForTest();
+        const bool re2 = panel.redoForTest();
+        std::printf ("    redo1 %d (depth r%d u%d) %s, redo2 %d\n", re1 ? 1 : 0, rd1, ud1, show (r3a).toRawUTF8(), re2 ? 1 : 0);
+        const bool re = re1 && re2;
+        const auto r3 = panel.snapshotForTest();
+        std::printf ("  5 A depth %d before close, %d after reopen (want 2 2); B depth %d redo %d undo %d (want 0 0 0)\n", depthA, depthA2, depthB, redoB, undoB ? 1 : 0);
+        std::printf ("    s0 %s\n    s1 %s\n    s2 %s\n    undo1 %s\n    undo2 %s\n    redo2 %s\n",
+                     show (s0).toRawUTF8(), show (s1).toRawUTF8(), show (s2).toRawUTF8(), show (r1).toRawUTF8(), show (r2).toRawUTF8(), show (r3).toRawUTF8());
+        ck (depthA == 2 && depthA2 == 2, "5: take A keeps its 2 undo steps across Close and reopen");
+        ck (depthB == 0 && redoB == 0 && ! undoB, "5: take B opened in between has its own empty history");
+        ck (u1 && same (r1, s1) && r1.markers.size() + 1 == s2.markers.size(), "5: Undo after reopen removes the marker (crop and markers as before it)");
+        ck (u2 && same (r2, s0) && r2.cropStart != s2.cropStart, "5: a second Undo restores the prior crop");
+        ck (re && same (r3, sOpen) && same (r3a, s1), "5: Redo after reopen walks back to the state shown at reopen");
+        panel.close (false);
+        panel.forgetHistory (bareFile);
+        reopen (bareFile);
+        const int depthGone = panel.undoDepthForTest();
+        std::printf ("    after forgetHistory: depth %d (want 0), takes kept %d\n", depthGone, panel.historyTakesForTest());
+        ck (depthGone == 0 && panel.redoDepthForTest() == 0, "5: a deleted take forgets its history");
+        panel.close (false);
+    }
+    TakeEditorPanel::testUndoClearedOnOpen = false;
+
+    P::tempoMeasureEnabled = savedMeasure;
+    testMutant = mutNone;
+    d.deleteRecursively();
+    std::printf ("  takeundo: %d checks, %d failed\n", checks, failures - failuresBefore);
 }
 
 // Take editor, slice 4 (o136): the fit row. Real juce::MouseEvent clicks on Fit to bars
@@ -22938,6 +25084,46 @@ static void testNoTempoFit (const juce::File& tmp)
                "take tempo: a WAV set as the source after a capture at 97 has no tempo (0), not the capture's 97");
         captureFile.deleteFile();
         proc.setPlayHead (nullptr);
+    }
+    // 3. The take tempo: the field opens on the take's tempo, else the typed or host value.
+    {
+        const bool mut = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "FIT_TAKE_BPM";
+        const int oldMut = TakeEditorMath::testMutant.load();
+        if (mut)
+            TakeEditorMath::testMutant.store (TakeEditorMath::mutFitIgnoresTakeBpm);
+        Store st;
+        juce::uint32 clock = 100000;
+        TakeEditorPanel panel;
+        wire (panel, st, clock);
+        st.host = 111.0;
+        auto openAt = [&] (double bpm)
+        {
+            TakeEditorPanel::Take take;
+            take.temp = wav;
+            take.name = "bare.wav";
+            take.takeBpm = bpm;
+            panel.open (take);
+        };
+        openAt (120.01);
+        const double a = panel.getFitBpmForTest();
+        const auto aText = panel.tempoFieldTextForTest();
+        openAt (0.0);
+        const double b = panel.getFitBpmForTest();
+        panel.setFitBpmForTest ("97");
+        openAt (120.01);
+        const double c = panel.getFitBpmForTest();
+        const double cUser = panel.userFitBpm();
+        openAt (0.0);
+        const double e = panel.getFitBpmForTest();
+        const auto eText = panel.tempoFieldTextForTest();
+        std::printf ("  take tempo: take 120.01 opens %.4f '%s' (want 120.0100 '120.01'); no tempo, host 111 opens %.4f (want 111); typed 97 then take 120.01: %.4f user %.4f (want 120.01, 97); then no tempo: %.4f '%s' (want 97 '97.00')\n",
+                     a, aText.toRawUTF8(), b, c, cUser, e, eText.toRawUTF8());
+        check (std::abs (a - 120.01) < 1e-9 && aText == "120.01", "take tempo: a take at 120.01 opens Fit to bars at 120.01");
+        check (b == 111.0, "take tempo: a take with no tempo opens on the host tempo (nothing typed)");
+        check (std::abs (c - 120.01) < 1e-9 && cUser == 97.0, "take tempo: a take tempo wins over a typed tempo, which is kept as userFitBpm");
+        check (e == 97.0 && eText == "97.00", "take tempo: a take with no tempo opens on the typed (manual) value");
+        panel.close (false);
+        TakeEditorMath::testMutant.store (oldMut);
     }
     d.deleteRecursively();
 }
@@ -23655,7 +25841,8 @@ static void testTakeFit (const juce::File& tmp)
 
     // 7. The fit row at both panel sizes, filled.
     item = 7;
-    for (const auto size : { juce::Point<int> (590, 686), juce::Point<int> (490, 566) })
+    const auto minPanel = takePanelSizeAtMinWindow();
+    for (const auto size : { juce::Point<int> (590, 686), minPanel })
     {
         Store st;
         st.host = 30.0;
@@ -23696,8 +25883,8 @@ static void testTakeFit (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, fit row filled, Stretch to fit lit=%d: %d areas (%d take the mouse, %d buttons or boxes, %d of the fit row), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d, empty=%d, buttons under 48 x 24=%d (want 0 each)\n",
                      size.x, size.y, (int) panel.stretchEnabledForTest(), (int) areas.size(), hit, buttons, fitAreas, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small);
-        ck (panel.stretchEnabledForTest() && areas.size() == 38 && hit == 29 && buttons == 25 && fitAreas == 4 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
-            size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the fit row filled" : "7: no two areas overlap and none leaves the panel at 490 x 566 with the fit row filled");
+        ck (panel.stretchEnabledForTest() && areas.size() == 72 && hit == 51 && buttons == 47 /* metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas, 5 buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && fitAreas == 4 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+            size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the fit row filled" : "7: no two areas overlap and none leaves the panel at the measured minimum-window size with the fit row filled");
         if (size.x == 490)
         {
             // Long readouts: many bars, and the longest rest.
@@ -24435,6 +26622,408 @@ static void testLoopExport (const juce::File& tmp)
 // real processor and processBlock with a fake play head, no window, no sound device.
 // Items: a idle path, b start and stop fades, c loop wrap, e take rate against host
 // rate, f host transport and channel layouts, d lifecycle and a two thread hammer.
+// F1 level row: render path magnitudes (fades, loop xfade, gain), Normalize, save/load and undo.
+static void testLevelRow (const juce::File& tmp)
+{
+    std::printf ("Level row: fades, loop crossfade, gain, Normalize on the real render path; sidecar and undo\n");
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&checks] (bool ok, const char* what) { ++checks; check (ok, what); };
+    using P = HotStepLinkProcessor;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    TakeEdit::testLevelMutant = teethVar == "LV_NO_FADE" ? TakeEdit::lvMutNoFade : teethVar == "LV_NO_XFADE" ? TakeEdit::lvMutNoXfade
+                              : teethVar == "LV_NO_GAIN" ? TakeEdit::lvMutNoGain : TakeEdit::lvMutNone;
+    TakeEditorPanel::testNormOff = teethVar == "LV_NORM_OFF";
+    TakeEditorPanel::testLevelNotInUndo = teethVar == "LV_NOT_IN_UNDO";
+    std::printf ("  test mutant: %s\n", teethVar.startsWith ("LV_") ? teethVar.toRawUTF8() : "none");
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("levelrow_test");
+    d.createDirectory();
+    const double sr = 48000.0, pi2 = 2.0 * juce::MathConstants<double>::pi;
+    const int len = 96000;
+    using Buf = juce::AudioBuffer<float>;
+    auto readBack = [] (const juce::File& f)
+    {
+        Buf out;
+        if (auto rd = std::unique_ptr<juce::AudioFormatReader> (juce::WavAudioFormat().createReaderFor (new juce::FileInputStream (f), true)))
+        {
+            out.setSize ((int) rd->numChannels, (int) rd->lengthInSamples);
+            rd->read (&out, 0, out.getNumSamples(), 0, true, true);
+        }
+        return out;
+    };
+    auto tone = [&] (double amp, double hz)
+    {
+        Buf b (1, len);
+        for (int i = 0; i < len; ++i)
+            b.setSample (0, i, (float) (amp * std::cos (pi2 * hz * i / sr)));
+        return b;
+    };
+    auto render = [&] (const juce::File& src, const char* name, const TakeEdit::EditData& e, int repeats, double fadeMs)
+    {
+        TakeEdit::EditRequest rq;
+        rq.source = src;
+        rq.dest = d.getChildFile (name);
+        rq.edit = e;
+        rq.options.loopRepeats = repeats;
+        rq.options.fadeMs = fadeMs;
+        const auto r = TakeEdit::renderEditFile (rq);
+        if (! r.ok)
+            std::printf ("  render %s failed: %s\n", name, r.error.toRawUTF8());
+        return r.ok ? readBack (rq.dest) : Buf();
+    };
+    auto peakOf = [] (const Buf& b) { return b.getNumSamples() > 0 ? b.getMagnitude (0, b.getNumSamples()) : 0.0f; };
+    auto db = [] (double g) { return 20.0 * std::log10 (juce::jmax (1.0e-12, g)); };
+
+    // 1. Fade in 100 ms on a full scale 100 Hz cosine (a peak at 0 and at 50 ms).
+    const auto toneFile = writeWav (d.getChildFile ("tone.wav"), tone (0.999, 100.0), sr);
+    {
+        TakeEdit::EditData e;
+        e.cropStart = 0;
+        e.cropEnd = len;
+        e.fadeInMs = 100.0;
+        const auto out = render (toneFile, "fade.wav", e, 0, 0.0);
+        const int at50 = (int) (0.05 * sr);
+        const double first = out.getNumSamples() > at50 ? std::abs (out.getSample (0, 0)) : 1.0;
+        const double mid = out.getNumSamples() > at50 ? std::abs (out.getSample (0, at50)) / 0.999 : 0.0;
+        std::printf ("  fade in 100 ms: first sample abs %.5f (want < 0.01), sample at 50 ms / steady %.4f (want 0.5..0.9)\n", first, mid);
+        ck (first < 0.01 && mid > 0.5 && mid < 0.9, "level: a 100 ms fade in starts silent and is part way up at 50 ms");
+    }
+    // 2. Loop export with a 50 ms crossfade over a step at the seam.
+    {
+        Buf b (1, len);
+        for (int i = 0; i < len; ++i)
+            b.setSample (0, i, i < 48000 ? -0.5f : 0.5f); // loop 24000..72000: start at -0.5, end at +0.5
+        const auto stepFile = writeWav (d.getChildFile ("step.wav"), b, sr);
+        TakeEdit::EditData e;
+        e.loopStart = 24000;
+        e.loopEnd = 72000;
+        auto seamJump = [&] (double xfMs, const char* name)
+        {
+            e.loopXfadeMs = xfMs;
+            const auto out = render (stepFile, name, e, 2, 0.0);
+            const int cell = 48000;
+            double mx = 9.0;
+            if (out.getNumSamples() >= 2 * cell)
+            {
+                mx = 0.0;
+                for (int i = cell - 3000; i < cell + 10; ++i)
+                    mx = juce::jmax (mx, (double) std::abs (out.getSample (0, i + 1) - out.getSample (0, i)));
+            }
+            return mx;
+        };
+        const double j0 = seamJump (0.0, "xf0.wav"), j50 = seamJump (50.0, "xf50.wav");
+        const double red = db (j0) - db (j50);
+        std::printf ("  loop seam: max sample step %.5f at xfade 0, %.5f at xfade 50 ms, reduction %.1f dB (want >= 6)\n", j0, j50, red);
+        ck (j0 > 0.5 && j0 < 2.5 && red >= 6.0, "level: a 50 ms loop crossfade cuts the seam step by at least 6 dB");
+    }
+    // 3. Gain +6 dB.
+    const auto quiet = writeWav (d.getChildFile ("quiet.wav"), tone (0.25, 100.0), sr);
+    {
+        TakeEdit::EditData e;
+        e.cropStart = 0;
+        e.cropEnd = len;
+        const auto a = render (quiet, "g0.wav", e, 0, 0.0);
+        e.gainDb = 6.0;
+        const auto b = render (quiet, "g6.wav", e, 0, 0.0);
+        const double rise = db (peakOf (b)) - db (peakOf (a));
+        std::printf ("  gain +6 dB: peak %.3f dBFS -> %.3f dBFS, rise %.3f dB (want 6.0 +- 0.1)\n", db (peakOf (a)), db (peakOf (b)), rise);
+        ck (std::abs (rise - 6.0) <= 0.1, "level: gain +6 dB raises the peak by 6 dB");
+    }
+    // 4. Normalize in the panel, then the render with its gain. Peak -7.07 dBFS: a gain
+    //    rounded to the nearest 0.1 dB (6.1) would land above -1 dBFS.
+    const auto normFile = writeWav (d.getChildFile ("norm.wav"), tone (std::pow (10.0, -7.07 / 20.0), 100.0), sr);
+    TakeEditorPanel panel;
+    panel.setSize (590, 686);
+    TakeEdit::EditData stored;
+    panel.onSetEdit = [&stored] (const juce::File&, const TakeEdit::EditData& e) { stored = e; return true; };
+    panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+    panel.onReport = [] (juce::uint64, P::TakeEditReport&) { return false; };
+    panel.onSetGrid = [] (const juce::File&, const TakeEdit::GridEdit&) { return true; };
+    panel.onClosed = [] {};
+    {
+        TakeEditorPanel::Take take;
+        take.temp = normFile;
+        take.name = normFile.getFileName();
+        take.grid.bpm = 120.0;
+        take.grid.measured = true;
+        panel.open (take);
+    }
+    for (int i = 0; i < 500 && ! (panel.headerReadyForTest() && panel.peaksReadyForTest()) && ! panel.peaksFailedForTest(); ++i)
+    {
+        juce::Thread::sleep (10);
+        panel.tick();
+    }
+    panel.tick();
+    panel.resized();
+    {
+        panel.normalizeForTest();
+        const double g = panel.levelEditForTest().gainDb;
+        TakeEdit::EditData e;
+        e.cropStart = 0;
+        e.cropEnd = len;
+        e.gainDb = g;
+        const auto out = render (normFile, "norm_out.wav", e, 0, 0.0);
+        const double pk = db (peakOf (out));
+        std::printf ("  Normalize: preview peak %.3f dBFS, gain set %.2f dB, rendered sample peak %.3f dBFS (want -1 +- 0.3 and <= -1.000)\n", panel.previewPeakDbForTest(), g, pk);
+        ck (std::abs (pk + 1.0) <= 0.3 && pk <= -1.0, "level: Normalize puts the sample peak at -1 dBFS and never above");
+    }
+    // 5. Undo of the level fields, readable boxes, Reset clears them.
+    {
+        const auto e0 = panel.levelEditForTest();
+        panel.setLevelForTest (120.0, 300.0, 40.0, 3.5);
+        const auto e1 = panel.levelEditForTest();
+        const bool u = panel.undoForTest();
+        const auto e2 = panel.levelEditForTest();
+        std::printf ("  undo: before gain %.2f, after set in %.0f out %.0f xf %.0f gain %.2f, one undo -> gain %.2f (want %.2f), in %.0f (want 120)\n",
+                     e0.gainDb, e1.fadeInMs, e1.fadeOutMs, e1.loopXfadeMs, e1.gainDb, e2.gainDb, e0.gainDb, e2.fadeInMs);
+        ck (u && e1.fadeInMs == 120.0 && e1.gainDb == 3.5 && e2.gainDb == e0.gainDb && e2.fadeInMs == 120.0, "level: one undo takes back the last level change");
+        const bool r = panel.redoForTest();
+        ck (r && panel.levelEditForTest() == e1, "level: redo puts the level change back");
+        std::printf ("  boxes: '%s' '%s' '%s' '%s'\n", panel.levelTextForTest (0).toRawUTF8(), panel.levelTextForTest (1).toRawUTF8(),
+                     panel.levelTextForTest (2).toRawUTF8(), panel.levelTextForTest (3).toRawUTF8());
+        ck (panel.levelTextForTest (0) == "120 ms" && panel.levelTextForTest (2) == "40 ms" && panel.levelTextForTest (3) == "+3.5 dB",
+            "level: the boxes show the value with its unit");
+        TakeEdit::EditData onlyGain;
+        onlyGain.gainDb = 2.0;
+        panel.clickResetForTest();
+        const auto e4 = panel.levelEditForTest();
+        std::printf ("  Reset: in %.0f out %.0f xf %.0f gain %.2f (want all 0); only gain set isEmpty=%d (want 0)\n", e4.fadeInMs, e4.fadeOutMs, e4.loopXfadeMs, e4.gainDb, (int) onlyGain.isEmpty());
+        ck (! e4.hasLevel() && ! stored.hasLevel() && ! onlyGain.isEmpty(), "level: Reset clears the level fields and isEmpty counts them");
+    }
+    // F2: typing a minus sign into the Gain box (the slider's own text field) gives a cut.
+    {
+        auto& gb = panel.levelBoxForTest (3);
+        juce::Label* lab = nullptr;
+        for (auto* c : gb.getChildren())
+            if (auto* l = dynamic_cast<juce::Label*> (c))
+                lab = l;
+        double got = 99.0;
+        if (lab != nullptr)
+        {
+            lab->showEditor();
+            if (auto* te = lab->getCurrentTextEditor())
+                te->setText (teethVar == "LF_NO_MINUS" ? "3" : "-3");
+            lab->hideEditor (false);
+            got = panel.levelEditForTest().gainDb;
+        }
+        std::printf ("  typed '-3' in Gain: gainDb %.2f (want -3.00), box text '%s'\n", got, gb.getTextFromValue (gb.getValue()).toRawUTF8());
+        ck (std::abs (got + 3.0) < 1.0e-9, "level: typing -3 in the Gain box gives -3 dB");
+    }
+    panel.close (false);
+    // 6. Save and load (sidecar JSON).
+    {
+        CollectionItem item;
+        item.name = "lv";
+        item.edit.fadeInMs = 120.0;
+        item.edit.fadeOutMs = 300.0;
+        item.edit.loopXfadeMs = 40.0;
+        item.edit.gainDb = -3.5;
+        CollectionItem back;
+        const bool ok = CollectionStore::fromJson (CollectionStore::toJson (item), back);
+        std::printf ("  sidecar: read back in %.1f out %.1f xf %.1f gain %.2f (want 120, 300, 40, -3.50)\n", back.edit.fadeInMs, back.edit.fadeOutMs, back.edit.loopXfadeMs, back.edit.gainDb);
+        ck (ok && back.edit.fadeInMs == 120.0 && back.edit.fadeOutMs == 300.0 && back.edit.loopXfadeMs == 40.0 && back.edit.gainDb == -3.5, "level: the level fields survive save and load");
+    }
+    TakeEdit::testLevelMutant = TakeEdit::lvMutNone;
+    TakeEditorPanel::testNormOff = false;
+    TakeEditorPanel::testLevelNotInUndo = false;
+    P::tempoMeasureEnabled = savedMeasure;
+    d.deleteRecursively();
+    std::printf ("  %d checks, %d failed\n", checks, failures - failuresBefore);
+}
+
+// Reverse: the kept region backwards on the real render path; sidecar and undo.
+// Teeth (HSLINK_TEETH): RV_NO_REVERSE (the render ignores the flag).
+static void testReverse (const juce::File& tmp)
+{
+    std::printf ("Reverse: render, sidecar, undo\n");
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&checks] (bool ok, const char* what) { ++checks; check (ok, what); };
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    TakeEdit::testLevelMutant = teethVar == "RV_NO_REVERSE" ? TakeEdit::lvMutNoReverse
+                              : teethVar == "REV_SEAM_FORWARD" ? TakeEdit::lvMutRevSeamForward : TakeEdit::lvMutNone;
+    std::printf ("  test mutant: %s\n", teethVar.startsWith ("RV_") || teethVar.startsWith ("REV_") ? teethVar.toRawUTF8() : "none");
+    const auto d = tmp.getChildFile ("reverse_test");
+    d.createDirectory();
+    const double sr = 48000.0;
+    const int len = 48000, cs = 1000, ce = 41000, imp = 5000;
+    juce::AudioBuffer<float> b (1, len);
+    for (int i = 0; i < len; ++i)
+        b.setSample (0, i, 0.5f * (float) i / (float) len);
+    b.setSample (0, imp, 1.0f);
+    const auto src = writeWav (d.getChildFile ("ramp.wav"), b, sr);
+    TakeEdit::EditRequest rq;
+    rq.source = src;
+    rq.dest = d.getChildFile ("rev.wav");
+    rq.edit.cropStart = cs;
+    rq.edit.cropEnd = ce;
+    rq.edit.reverse = true;
+    rq.options.fadeMs = 0.0;
+    const auto r = TakeEdit::renderEditFile (rq);
+    juce::AudioBuffer<float> out;
+    if (auto rd = std::unique_ptr<juce::AudioFormatReader> (juce::WavAudioFormat().createReaderFor (new juce::FileInputStream (rq.dest), true)))
+    {
+        out.setSize ((int) rd->numChannels, (int) rd->lengthInSamples);
+        rd->read (&out, 0, out.getNumSamples(), 0, true, true);
+    }
+    const int n = out.getNumSamples();
+    int peakAt = -1;
+    float pk = 0.0f;
+    for (int i = 0; i < n; ++i)
+        if (out.getSample (0, i) > pk)
+            pk = out.getSample (0, peakAt = i);
+    const float first = n > 0 ? out.getSample (0, 0) : -1.0f, lastOrig = b.getSample (0, ce - 1);
+    const int want = ce - 1 - imp; // out[j] = in[ce - 1 - j]
+    std::printf ("  render ok=%d len %d (want %d): sample[0] %.6f (want %.6f, the original last kept sample), impulse at %d (want %d)\n",
+                 (int) r.ok, n, ce - cs, first, lastOrig, peakAt, want);
+    ck (r.ok && n == ce - cs && std::abs (first - lastOrig) < 1.0e-4f, "reverse: the first output sample is the last kept sample");
+    ck (std::abs (peakAt - want) <= 1, "reverse: the impulse lands at its mirrored position within 1 sample");
+    {
+        // Reverse plus loop: the seam fades from the reversed audio, the same as plays.
+        const int ls = 10000, le = 30000;
+        TakeEdit::EditRequest lq;
+        lq.source = src;
+        lq.dest = d.getChildFile ("rev_loop.wav");
+        lq.edit.loopStart = ls;
+        lq.edit.loopEnd = le;
+        lq.edit.loopXfadeMs = 30.0;
+        lq.edit.reverse = true;
+        lq.options.fadeMs = 0.0;
+        lq.options.loopRepeats = 1;
+        const auto lr = TakeEdit::renderEditFile (lq);
+        juce::AudioBuffer<float> lo;
+        if (auto rd = std::unique_ptr<juce::AudioFormatReader> (juce::WavAudioFormat().createReaderFor (new juce::FileInputStream (lq.dest), true)))
+        {
+            lo.setSize ((int) rd->numChannels, (int) rd->lengthInSamples);
+            rd->read (&lo, 0, lo.getNumSamples(), 0, true, true);
+        }
+        const int cell = le - ls, x = (int) std::llround (30.0 * sr / 1000.0);
+        const float* sp = b.getReadPointer (0);
+        auto tailA = [&] (int i) { return (double) sp[ls + x - 1 - i]; };  // reversed loop, last x
+        auto preB = [&] (int i) { return (double) sp[le + x - 1 - i]; };   // reversed pre-roll
+        double aa = 0.0, bb = 0.0, ab = 0.0;
+        for (int i = 0; i < x; ++i)
+        {
+            aa += tailA (i) * tailA (i);
+            bb += preB (i) * preB (i);
+            ab += tailA (i) * preB (i);
+        }
+        const double corr = juce::jlimit (0.0, 1.0, ab / std::sqrt (aa * bb));
+        double maxErr = 1.0;
+        if (lr.ok && lo.getNumSamples() == cell)
+        {
+            maxErr = 0.0;
+            for (int i = 0; i < x; ++i)
+            {
+                const double t = ((double) i + 0.5) / (double) x, ga = std::cos (t * 1.5707963267948966), gb = std::sin (t * 1.5707963267948966);
+                const double want = (tailA (i) * ga + preB (i) * gb) / std::sqrt (1.0 + 2.0 * corr * ga * gb);
+                maxErr = juce::jmax (maxErr, std::abs ((double) lo.getSample (0, cell - x + i) - want));
+            }
+        }
+        std::printf ("  reverse loop: ok=%d len %d (want %d), seam %lld (want %d), seam max error %.6g (want < 1e-4)%c",
+                     (int) lr.ok, lo.getNumSamples(), cell, (long long) lr.seamFadeSamples, x, maxErr, 10);
+        ck (lr.ok && lr.seamFadeSamples == x && maxErr < 1.0e-4, "reverse: the loop seam crossfades from the reversed audio");
+    }
+    {
+        CollectionItem item;
+        item.name = "rv";
+        item.edit.reverse = true;
+        CollectionItem back;
+        const auto json = CollectionStore::toJson (item);
+        const bool ok = CollectionStore::fromJson (json, back);
+        std::printf ("  sidecar: has key reverse=%d, read back %d (want 1, 1)\n", (int) json.contains ("\"reverse\""), (int) back.edit.reverse);
+        ck (ok && back.edit.reverse && json.contains ("\"reverse\"") && ! item.edit.isEmpty(), "reverse: the flag survives save and load and counts in isEmpty");
+    }
+    {
+        TakeEditorPanel panel;
+        panel.setSize (590, 686);
+        TakeEdit::EditData stored;
+        panel.onSetEdit = [&stored] (const juce::File&, const TakeEdit::EditData& e) { stored = e; return true; };
+        panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+        panel.onReport = [] (juce::uint64, HotStepLinkProcessor::TakeEditReport&) { return false; };
+        panel.onSetGrid = [] (const juce::File&, const TakeEdit::GridEdit&) { return true; };
+        panel.onClosed = [] {};
+        TakeEditorPanel::Take take;
+        take.temp = src;
+        take.name = src.getFileName();
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        panel.resized();
+        panel.clickReverseForTest();
+        const bool on = panel.levelEditForTest().reverse, shown = panel.reverseShownForTest(), st = stored.reverse;
+        const bool u = panel.undoForTest();
+        const bool afterUndo = panel.levelEditForTest().reverse;
+        const bool re = panel.redoForTest();
+        const bool afterRedo = panel.levelEditForTest().reverse;
+        panel.clickResetForTest();
+        const bool afterReset = panel.levelEditForTest().reverse;
+        std::printf ("  panel: click -> %d shown %d stored %d; undo(%d) -> %d; redo(%d) -> %d; Reset -> %d; button %dx%d\n", (int) on, (int) shown, (int) st,
+                     (int) u, (int) afterUndo, (int) re, (int) afterRedo, (int) afterReset, panel.reverseBoundsForTest().getWidth(), panel.reverseBoundsForTest().getHeight());
+        ck (on && shown && st, "reverse: the toggle sets the flag and writes it");
+        ck (u && ! afterUndo && re && afterRedo, "reverse: undo and redo take the toggle back and forth");
+        ck (! afterReset, "reverse: Reset clears it");
+        panel.close (false);
+    }
+    TakeEdit::testLevelMutant = TakeEdit::lvMutNone;
+    d.deleteRecursively();
+    std::printf ("  %d checks, %d failed\n", checks, failures - failuresBefore);
+}
+
+// F2 levelfit: at the default editor size every level value box shows its longest legal
+// value with the unit. Teeth (HSLINK_TEETH): LF_OLD_LAYOUT (the F1 one-line 62 px boxes).
+static void testLevelFit()
+{
+    std::printf ("Level fit: the level value boxes show the whole value with its unit\n");
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&checks] (bool ok, const char* what) { ++checks; check (ok, what); };
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    TakeEditorPanel::testOldLevelLayout = teethVar == "LF_OLD_LAYOUT";
+    std::printf ("  test mutant: %s\n", teethVar.startsWith ("LF_") ? teethVar.toRawUTF8() : "none");
+    {
+        HotStepLinkProcessor p;
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        auto& panel = ed->getTakeEditorForTest();
+        panel.resized();
+        std::printf ("  editor %dx%d, panel %dx%d\n", ed->getWidth(), ed->getHeight(), panel.getWidth(), panel.getHeight());
+        const char* names[] = { "In", "Out", "Xf", "Gain" };
+        const double vals[4][3] = { { 50.0, 2000.0, 120.0 }, { 30.0, 2000.0, 500.0 }, { 30.0, 500.0, 120.0 }, { -10.0, 24.0, -24.0 } };
+        for (int i = 0; i < 4; ++i)
+        {
+            auto& box = panel.levelBoxForTest (i);
+            juce::Label* lab = nullptr;
+            for (auto* c : box.getChildren())
+                if (auto* l = dynamic_cast<juce::Label*> (c))
+                    lab = l;
+            if (lab == nullptr)
+            {
+                ck (false, "levelfit: value box has a text label");
+                continue;
+            }
+            const auto font = lab->getLookAndFeel().getLabelFont (*lab);
+            const int area = lab->getBorderSize().subtractedFrom (lab->getLocalBounds()).getWidth();
+            float worst = 0.0f;
+            juce::String worstText;
+            for (double v : vals[i])
+            {
+                const auto t = box.getTextFromValue (v);
+                const float w = juce::GlyphArrangement::getStringWidth (font, t);
+                if (w > worst) { worst = w; worstText = t; }
+            }
+            std::printf ("  %s: longest '%s' needs %.1f px, text area %d px (box %d px)\n", names[i], worstText.toRawUTF8(), worst, area, box.getWidth());
+            ck (worst <= (float) area && area > 0, (juce::String ("levelfit: the ") + names[i] + " box shows its longest value whole").toRawUTF8());
+        }
+    }
+    TakeEditorPanel::testOldLevelLayout = false;
+    std::printf ("  %d checks, %d failed\n", checks, failures - failuresBefore);
+}
+
 static void testEditorAudition (const juce::File& tmp)
 {
     using P = HotStepLinkProcessor;
@@ -24839,6 +27428,81 @@ static void testEditorAudition (const juce::File& tmp)
             guard (playing && steady < 1.0e-6, "c1: between the fades the output is the region of the file sample for sample (1e-6)");
             ck (step <= bound, "c1: loop wrap with pre roll: largest step under 1.5 x end to start difference / fade length");
             ck (lowest >= floorWant && model < 1.0e-5 && after < 1.0e-6, "c1: loop wrap with pre roll: no dip, the end fades into the audio before the start (1e-5) and runs on into the start (1e-6)");
+        }
+        // c1r: reverse plus loop, crop = the loop region: the seam fades from the same
+        // reversed audio as the render (TakeEdit::renderEditFile mirrors [ls - x, le + x)),
+        // so the pre-roll is the audio after the loop end, backwards.
+        // Teeth (HSLINK_TEETH=AUD_REV_SEAM_CROP): the reads mirror in the crop only.
+        {
+            const int s0 = 6000, e0 = 18000, L = e0 - s0;
+            const double xMs = 20.0;
+            const int xf = (int) std::lround (xMs * 48000.0 / 1000.0);
+            // Teeth (HSLINK_TEETH=AUD_SEAM_NO_CORR): the audition seam without the render's
+            // correlation law (plain equal power), as before 0.5.20: the seam differs by ~0.25.
+            const bool noCorr = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "AUD_SEAM_NO_CORR";
+            for (const bool rev : { true, false })
+            {
+            const juce::String tg = rev ? "reversed" : "forward";
+            Rig r (d, rev ? "c1r" : "c1f", 48000.0);
+            r.p->editorAudition.revSeamCropForTest = rev && juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "AUD_REV_SEAM_CROP";
+            r.p->editorAudition.seamNoCorrForTest = noCorr;
+            r.p->editorAudition.setLevel (s0, e0, kLen, 0.0, 0.0, xMs, 0.0, rev);
+            const bool playing = r.play (rampFile, s0, e0, kLen, true);
+            const auto o = r.run (L + 2048);
+            // The render's seam sources (reversed: the mirrored window) for frames i of the seam.
+            auto tailA = [&] (int i) { return rev ? (double) x[s0 + xf - 1 - i] : (double) x[e0 - xf + i]; };
+            auto preB = [&] (int i) { return rev ? (double) x[e0 + xf - 1 - i] : (double) x[s0 - xf + i]; };
+            double aa = 0.0, bb = 0.0, ab = 0.0;
+            for (int i = 0; i < xf; ++i)
+            {
+                aa += tailA (i) * tailA (i);
+                bb += preB (i) * preB (i);
+                ab += tailA (i) * preB (i);
+            }
+            const double corr = juce::jlimit (0.0, 1.0, TakeEdit::seamRawCorrelation (aa, bb, ab));
+            double srcErr = 0.0, fwd = 0.0;
+            for (int tail = 0; tail < xf; ++tail)
+            {
+                double ga = 0.0, gb = 0.0;
+                TakeEdit::seamGains (tail, xf, corr, ga, gb);
+                const double want = tailA (tail) * ga + preB (tail) * gb; // the render's law on the render's sources
+                srcErr = juce::jmax (srcErr, std::abs ((double) o[0][(size_t) (L - xf + tail)] - want));
+                fwd = juce::jmax (fwd, std::abs ((double) x[e0 + xf - 1 - tail] - (double) x[s0 - xf + tail]));
+            }
+            // Render the same loop and compare its seam sample for sample with the audition's.
+            TakeEdit::EditRequest lq;
+            lq.source = rampFile;
+            lq.dest = d.getChildFile (rev ? "c1r_render.wav" : "c1f_render.wav");
+            lq.edit.loopStart = s0;
+            lq.edit.loopEnd = e0;
+            lq.edit.loopXfadeMs = xMs;
+            lq.edit.reverse = rev;
+            lq.options.fadeMs = 0.0;
+            lq.options.loopRepeats = 1;
+            const auto lr = TakeEdit::renderEditFile (lq);
+            juce::AudioBuffer<float> lo;
+            if (auto rdr = std::unique_ptr<juce::AudioFormatReader> (juce::WavAudioFormat().createReaderFor (new juce::FileInputStream (lq.dest), true)))
+            {
+                lo.setSize ((int) rdr->numChannels, (int) rdr->lengthInSamples);
+                rdr->read (&lo, 0, lo.getNumSamples(), 0, true, true);
+            }
+            double renderErr = -1.0, bodyErr = -1.0;
+            if (lr.ok && lo.getNumSamples() == L)
+            {
+                renderErr = bodyErr = 0.0;
+                for (int i = 0; i < xf; ++i)
+                    renderErr = juce::jmax (renderErr, std::abs ((double) lo.getSample (0, L - xf + i) - (double) o[0][(size_t) (L - xf + i)]));
+                for (int i = 2 * xf; i < L - xf; ++i)
+                    bodyErr = juce::jmax (bodyErr, std::abs ((double) lo.getSample (0, i) - (double) o[0][(size_t) i]));
+            }
+            std::printf ("  c1r. %s loop %d..%d, xfade %d: playing %d; r %.4f (render %.4f); seam against the render's law on its sources max err %.3e (want < 1e-4; a forward pre-roll differs by up to %.4f); render ok=%d, audition vs render: body %.3e, seam %.3e (want < 1e-4)%c",
+                         tg.toRawUTF8(), s0, e0, xf, (int) playing, corr, lr.seamCorrelationUsed, srcErr, fwd, (int) lr.ok, bodyErr, renderErr, 10);
+            ck (playing && (! rev || fwd > 1.0e-2) && srcErr < 1.0e-4, "c1r: " + tg + " loop audition: the seam is the render's law on the render's sources (1e-4)");
+            ck (bodyErr >= 0.0 && bodyErr < 1.0e-4, "c1r: " + tg + " loop audition: between the seams it plays the render's samples (1e-4)");
+            ck (renderErr >= 0.0 && renderErr < 1.0e-4, "c1r: " + tg + " loop audition: the seam matches the render sample for sample (1e-4)");
+            r.p->editorAudition.revSeamCropForTest = false;
+            r.p->editorAudition.seamNoCorrForTest = false;
+            }
         }
         // c2: nothing before the loop start: fade out to zero, then in again.
         struct NoPre { const char* name; int s, e, len; };
@@ -26952,6 +29616,91 @@ static void testEditorAudition (const juce::File& tmp)
         r.p->editorAudition.stop();
     }
 
+    // s. Metronome: Click on a silent take, onsets on the grid beats within 1 ms; off =
+    // silence; a render to file of the same take with Click on is silent.
+    // Teeth: HSLINK_TEETH=CLICK_NO_DOWNBEAT (the click ignores the grid offset).
+    {
+        const double bpm = 120.0, db = 0.137, sr = 48000.0;
+        const int len = (int) (sr * 2.5);
+        Buf sil (2, len);
+        sil.clear();
+        const auto silFile = writeWav (d.getChildFile ("silent_click.wav"), sil, sr);
+        Rig r (d, "s", sr);
+        r.p->editorAudition.clickNoDownbeatForTest = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "CLICK_NO_DOWNBEAT";
+        r.p->editorAudition.setClick (true, bpm, db);
+        const bool playing = r.play (silFile, 0, len, len, false);
+        const auto o = r.runExact ((int) (sr * 2.0));
+        std::vector<int> onsets;
+        int lastLoud = -100000;
+        for (int i = 0; i < (int) o[0].size(); ++i)
+            if (std::abs (o[0][(size_t) i]) > 1.0e-3f)
+            {
+                if (i - lastLoud > 2400)
+                    onsets.push_back (i);
+                lastLoud = i;
+            }
+        std::vector<int> want;
+        for (int m = 0;; ++m)
+        {
+            const int e = (int) std::ceil ((db + m * 60.0 / bpm) * sr);
+            if (e >= (int) o[0].size())
+                break;
+            want.push_back (e);
+        }
+        double worstMs = onsets.size() == want.size() ? 0.0 : 1.0e9;
+        juce::String got, exp;
+        for (size_t k = 0; k < onsets.size(); ++k)
+            got << juce::String ((double) onsets[k] * 1000.0 / sr, 3) << " ";
+        for (size_t k = 0; k < want.size(); ++k)
+        {
+            exp << juce::String ((double) want[k] * 1000.0 / sr, 3) << " ";
+            if (k < onsets.size())
+                worstMs = juce::jmax (worstMs, std::abs ((double) (onsets[k] - want[k])) * 1000.0 / sr);
+        }
+        float peakOn = 0.0f;
+        for (const auto& ch : o)
+            for (auto v : ch)
+                peakOn = juce::jmax (peakOn, std::abs (v));
+        std::printf ("  s. click: playing %d, onsets ms [%s] want [%s], worst %.3f ms (limit 1), peak %.3f%c", (int) playing, got.toRawUTF8(), exp.toRawUTF8(), worstMs, (double) peakOn, 10);
+        ck (playing && ! want.empty() && worstMs <= 1.0 && peakOn > 0.1f, "s: Click on a silent take lands on every grid beat within 1 ms");
+        r.p->editorAudition.setClick (false, bpm, db);
+        const auto off = r.runExact ((int) (sr * 0.5));
+        float peakOff = 0.0f;
+        for (const auto& ch : off)
+            for (auto v : ch)
+                peakOff = juce::jmax (peakOff, std::abs (v));
+        std::printf ("    click off: peak %.6f (want 0)%c", (double) peakOff, 10);
+        ck (playing && peakOff == 0.0f, "s: Click off = no click");
+        r.p->editorAudition.setClick (true, bpm, db);
+        r.p->editorAudition.stop();
+        // A render to file with Click on: silent.
+        TakeEdit::EditRequest rq;
+        rq.source = silFile;
+        rq.dest = d.getChildFile ("silent_click_out.wav");
+        rq.edit.cropStart = 1000;
+        rq.edit.cropEnd = len - 1000;
+        rq.options.gridBpm = bpm;
+        rq.options.gridDownbeatSec = db;
+        const auto rr = TakeEdit::renderEditFile (rq);
+        float peakFile = 1.0f;
+        int fileLen = 0;
+        {
+            juce::WavAudioFormat wf;
+            if (auto reader = std::unique_ptr<juce::AudioFormatReader> (wf.createReaderFor (rq.dest.createInputStream().release(), true)))
+            {
+                fileLen = (int) reader->lengthInSamples;
+                Buf fb ((int) reader->numChannels, fileLen);
+                reader->read (&fb, 0, fileLen, 0, true, true);
+                peakFile = 0.0f;
+                for (int c = 0; c < fb.getNumChannels(); ++c)
+                    peakFile = juce::jmax (peakFile, fb.getMagnitude (c, 0, fileLen));
+            }
+        }
+        std::printf ("    render with Click on: ok %d, %d frames, peak %.6f (want 0)%c", (int) rr.ok, fileLen, (double) peakFile, 10);
+        ck (rr.ok && fileLen > 0 && peakFile == 0.0f, "s: a render to file never carries the click");
+        r.p->editorAudition.setClick (false, 0.0, 0.0);
+    }
+
     P::tempoMeasureEnabled = savedMeasure;
     d.deleteRecursively(); // this group's own folder under the run's temp folder
     std::printf ("  editoraudition: %d checks counted (%d guards), %d failed\n", checks, guards, failures - failuresBefore);
@@ -27301,6 +30050,154 @@ static void gsSetParam (HotStepLinkProcessor& p, const char* id, float v)
         prm->setValueNotifyingHost (prm->convertTo0to1 (v));
 }
 
+// Peak guard (round 1b). HSLINK_TEETH_PEAKGUARD=1 runs the pre-change behaviour:
+// guard disabled for 1-5 and the export path guarding dest even when dest == src.
+static juce::File pgWriteWav (const juce::File& f, double sr, int bits, bool isFloat,
+                              const juce::AudioBuffer<float>& buf, const juce::String& desc)
+{
+    f.deleteFile();
+    juce::WavAudioFormat wav;
+    std::unordered_map<juce::String, juce::String> meta;
+    meta[juce::WavAudioFormat::bwavDescription] = desc;
+    std::unique_ptr<juce::OutputStream> os (f.createOutputStream().release());
+    auto w = wav.createWriterFor (os, juce::AudioFormatWriterOptions{}
+                                          .withSampleRate (sr).withNumChannels (buf.getNumChannels())
+                                          .withBitsPerSample (bits).withMetadataValues (meta)
+                                          .withSampleFormat (isFloat ? juce::AudioFormatWriterOptions::SampleFormat::floatingPoint
+                                                                     : juce::AudioFormatWriterOptions::SampleFormat::integral));
+    if (w != nullptr) w->writeFromAudioSampleBuffer (buf, 0, buf.getNumSamples());
+    return f;
+}
+
+static juce::AudioBuffer<float> pgSine (double sr, double hz, double phase, float amp, int n)
+{
+    juce::AudioBuffer<float> b (2, n);
+    for (int i = 0; i < n; ++i)
+    {
+        const float v = amp * (float) std::sin (juce::MathConstants<double>::twoPi * hz * i / sr + phase);
+        b.setSample (0, i, v); b.setSample (1, i, v);
+    }
+    return b;
+}
+
+static float pgFileTp (const juce::File& f)
+{
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatReader> rd (wav.createReaderFor (f.createInputStream().release(), true));
+    if (rd == nullptr) return -999.0f;
+    juce::AudioBuffer<float> b ((int) rd->numChannels, (int) rd->lengthInSamples);
+    rd->read (&b, 0, b.getNumSamples(), 0, true, true);
+    return PeakGuard::truePeakDb (b);
+}
+
+// KNOWN_ISSUES row 15: Level mode. A -20 dBFS sine through applyToFile: Normalise
+// brings it to about -1 dBTP, Guard and Off leave it at -20. Teeth: HSLINK_TEETH=NO_NORMALISE.
+static void testPeakNormalise (const juce::File& tmp)
+{
+    std::printf ("Level mode normalise (row 15)%c", 10);
+    auto dir = tmp.getChildFile ("peaknorm"); dir.createDirectory();
+    const double sr = 48000.0;
+    PeakGuard::enabled.store (true);
+    const int saved = PeakGuard::mode.load();
+    const int modes[] = { PeakGuard::kNormalise, PeakGuard::kGuard, PeakGuard::kOff };
+    const float want[] = { -1.0f, -20.0f, -20.0f };
+    for (int k = 0; k < 3; ++k)
+    {
+        auto f = pgWriteWav (dir.getChildFile ("quiet" + juce::String (k) + ".wav"), sr, 24, false,
+                             pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-20.0f), 48000), "quiet");
+        const float tp0 = pgFileTp (f);
+        PeakGuard::mode.store (modes[k]);
+        const float g = PeakGuard::applyToFile (f);
+        const float tp1 = pgFileTp (f);
+        std::printf ("  mode %d: before %.2f dBTP, gain %.2f dB, after %.2f dBTP (want %.1f +-0.3)%c", modes[k], tp0, g, tp1, want[k], 10);
+        check (std::abs (tp1 - want[k]) <= 0.3f, (juce::String ("row 15: level mode ") + juce::String (modes[k]) + " lands at the expected true peak").toRawUTF8());
+    }
+    PeakGuard::mode.store (saved);
+}
+
+static void testPeakGuard (const juce::File& tmp)
+{
+    std::printf ("Peak guard (round 1b)%c", 10);
+    const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH_PEAKGUARD", {}) == "1";
+    if (teeth) std::printf ("  TEETH MODE: guard off, export guards dest == src%c", 10);
+    PeakGuard::enabled.store (! teeth);
+    auto dir = tmp.getChildFile ("peakguard"); dir.createDirectory();
+    const double sr = 48000.0;
+    const int n = 48000;
+
+    // 1. +1.17 dBTP float WAV. 3. Second pass applies 0 dB.
+    {
+        auto f = pgWriteWav (dir.getChildFile ("hot.wav"), sr, 32, true,
+                             pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (1.17f), n), "hot");
+        const float tp0 = pgFileTp (f);
+        const float g = PeakGuard::applyToFile (f);
+        const float tp1 = pgFileTp (f);
+        const float want = -1.05f - tp0;
+        std::printf ("  1. in %.3f dBTP, gain %.3f dB (want %.3f), out %.3f dBTP%c", tp0, g, want, tp1, 10);
+        check (tp1 <= -1.0f, "peak guard: +1.17 dBTP take comes out at or under -1.0 dBTP");
+        check (std::abs (g - want) < 0.3f && g < -1.9f && g > -2.5f, "peak guard: gain about -2.2 dB (within 0.3 dB)");
+        const float g2 = PeakGuard::applyToFile (f);
+        std::printf ("  3. second pass gain %.3f dB, out %.3f dBTP%c", g2, pgFileTp (f), 10);
+        check (g2 == 0.0f && tp1 <= -1.0f, "peak guard: a guarded file is left alone on a second pass (0 dB, under ceiling)");
+    }
+    // 2. -3 dBTP file left byte-identical.
+    {
+        auto f = pgWriteWav (dir.getChildFile ("quiet.wav"), sr, 24, false,
+                             pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-3.0f), n), "quiet");
+        juce::MemoryBlock before; f.loadFileAsData (before);
+        const float g = PeakGuard::applyToFile (f);
+        juce::MemoryBlock after; f.loadFileAsData (after);
+        std::printf ("  2. in %.3f dBTP, gain %.3f dB, bytes %s (%d)%c", pgFileTp (f), g,
+                     before == after ? "identical" : "CHANGED", (int) after.getSize(), 10);
+        guardCheck (g == 0.0f && before == after, "peak guard: -3 dBTP file left byte-identical");
+    }
+    // 4 + 5. fs/4 sine, 45 deg phase: samples at +-1.0, true peak +3.01 dBTP. 24-bit int, 44.1k, metadata.
+    {
+        const double sr4 = 44100.0;
+        auto b = pgSine (sr4, sr4 / 4.0, juce::MathConstants<double>::pi / 4.0, std::sqrt (2.0f), 44100);
+        b.applyGain (0.999f); // 24-bit int cannot hold +1.0 exactly
+        auto f = pgWriteWav (dir.getChildFile ("isp.wav"), sr4, 24, false, b, "isp take");
+        const float sp = juce::Decibels::gainToDecibels (b.getMagnitude (0, b.getNumSamples()));
+        const float tp0 = pgFileTp (f);
+        const float g = PeakGuard::applyToFile (f);
+        const float tp1 = pgFileTp (f);
+        std::printf ("  4. sample peak %.3f dBFS, true peak %.3f dBTP, gain %.3f dB, out %.3f dBTP%c", sp, tp0, g, tp1, 10);
+        check (tp0 > 2.5f && tp0 < 3.2f, "peak guard: fs/4 45-degree sine measures near +3 dBTP (sample peak 0 dBFS)");
+        check (tp1 <= -1.0f && std::abs (g - (-1.05f - tp0)) < 0.3f, "peak guard: inter-sample over caught, out at or under -1.0 dBTP");
+
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatReader> rd (wav.createReaderFor (f.createInputStream().release(), true));
+        const bool ok = rd != nullptr;
+        std::printf ("  5. sr %.0f, bits %d, float %d, ch %d, len %lld, desc '%s'%c",
+                     ok ? rd->sampleRate : 0.0, ok ? (int) rd->bitsPerSample : 0, ok ? (int) rd->usesFloatingPointData : -1,
+                     ok ? (int) rd->numChannels : 0, ok ? (long long) rd->lengthInSamples : 0LL,
+                     ok ? rd->metadataValues[juce::WavAudioFormat::bwavDescription].toRawUTF8() : "", 10);
+        check (ok && g < -3.0f && rd->sampleRate == sr4 && rd->bitsPerSample == 24 && ! rd->usesFloatingPointData
+                   && rd->numChannels == 2 && rd->lengthInSamples == 44100
+                   && rd->metadataValues[juce::WavAudioFormat::bwavDescription] == "isp take",
+               "peak guard: rewrite keeps sample rate, bit depth, int format, channels, length and metadata");
+    }
+    // 6. Export with dest == src leaves src bytes unchanged.
+    {
+        auto f = pgWriteWav (dir.getChildFile ("take.wav"), sr, 32, true,
+                             pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (1.17f), n), "take");
+        juce::MemoryBlock before; f.loadFileAsData (before);
+        PeakGuard::enabled.store (true);
+        const juce::File same (f.getFullPathName());
+        const float g = teeth ? PeakGuard::applyToFile (same) : PeakGuard::applyToExport (f, same);
+        juce::MemoryBlock after; f.loadFileAsData (after);
+        std::printf ("  6. export dest == src: gain %.3f dB, src bytes %s%c", g, before == after ? "unchanged" : "REWRITTEN", 10);
+        check (g == 0.0f && before == after, "peak guard: export with dest == src never rewrites the take");
+        auto d = dir.getChildFile ("out.wav");
+        f.copyFileTo (d);
+        const float gd = PeakGuard::applyToExport (f, d);
+        const float tpd = pgFileTp (d);
+        std::printf ("     distinct dest: gain %.3f dB, out %.3f dBTP%c", gd, tpd, 10);
+        guardCheck (teeth || (gd < -1.9f && tpd <= -1.0f), "peak guard: export to a distinct dest is still guarded");
+    }
+    PeakGuard::enabled.store (true);
+}
+
 static void testGuidanceStepsState()
 {
     std::printf ("v0.5.14 state: pre-v0.5.14 sessions load as Auto, set values round-trip\n");
@@ -27395,6 +30292,35 @@ static void testParamTextRoundTrip()
 }
 
 // clap-validator state-invalid-random: malformed state must be rejected, change nothing, not throw.
+static void testMoreLikeFits()
+{
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    std::printf ("more-like button: label fits the button at its drawn font (12 pt bold, 4 px side margins)%s\n",
+                 teethVar == "MORELIKE_NO_FIT" ? "  [TEETH: MORELIKE_NO_FIT]" : "");
+    HotStepLinkProcessor p;
+    auto ed = std::make_unique<HotStepLinkEditor> (p);
+    ed->setSize (HotStepLinkEditor::kMinWindowW, HotStepLinkEditor::kMinWindowH);
+    auto& b = ed->getMoreLikeButtonForTest();
+    const float avail = (float) b.getWidth() - 8.0f;
+    std::printf ("  window %dx%d, button width=%d, text area=%.1f\n", ed->getWidth(), ed->getHeight(), b.getWidth(), avail);
+    float worst = 0.0f;
+    int idKept = 0;
+    for (auto lbl : { juce::String(), juce::String ("take3"), juce::String ("take12"), juce::String ("take128"),
+                      juce::String ("T1"), juce::String ("T12"), juce::String ("T123") })
+    {
+        const auto t = HotStepLinkEditor::moreLikeTextFor (lbl, avail);
+        const float w = HotStepLinkEditor::moreLikeLabelWidth (t);
+        worst = juce::jmax (worst, w);
+        idKept += t.startsWith ("+4 LIKE T") ? 1 : 0;
+        std::printf ("  '%s' -> '%s' width=%.1f avail=%.1f %s\n", lbl.toRawUTF8(), t.toRawUTF8(), w, avail, w <= avail ? "fits" : "CLIPS");
+    }
+    check (avail > 20.0f && worst <= avail, "every +4 more-like label fits its button at the min window without shrinking");
+    // A wide button keeps the id.
+    const auto wide = HotStepLinkEditor::moreLikeTextFor ("T1", 400.0f);
+    std::printf ("  at 400 px: '%s' (ids kept at min window: %d)\n", wide.toRawUTF8(), idKept);
+    check (wide == "+4 LIKE T1", "a wide button keeps the take id");
+}
+
 static void testStateRejectsGarbage()
 {
     std::printf ("state load: random and truncated blobs are rejected, state unchanged\n");
@@ -27474,6 +30400,692 @@ static LONG WINAPI hslinkCrashFilter (EXCEPTION_POINTERS* ep)
     }
     std::fflush (stderr);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// takestate (C1): the take list, its edits, grid, warp and stars survive a plugin
+// state round trip; a missing WAV is flagged; bad Takes children are ignored; the warp
+// survives a take editor close and reopen. Teeth: TS_NO_WRITE, TS_OPEN_WIPES_WARP.
+static void testTakeState (const juce::File& tmp)
+{
+    using P = HotStepLinkProcessor;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    std::printf ("Take state: Takes child round trip, missing file, bad children, warp after close (teeth: %s)%c",
+                 teethVar.isEmpty() ? "none" : teethVar.toRawUTF8(), 10);
+    P::testNoTakesWrite = teethVar == "TS_NO_WRITE";
+    P::testSkipExternalTakes = teethVar == "TS_SKIP_EXTERNAL";
+    TakeEditorPanel::testOpenWipesWarp = teethVar == "TS_OPEN_WIPES_WARP";
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto root = tmp.getChildFile ("takestate_test");
+    root.createDirectory();
+    auto waitFor = [] (std::function<bool()> done, double limitS)
+    {
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        while (! done())
+        {
+            if (juce::Time::getMillisecondCounterHiRes() - t0 > limitS * 1000.0)
+                return false;
+            juce::Thread::sleep (10);
+        }
+        return true;
+    };
+    // A processor with 3 saved takes, each with its own edit; take 0 a hand grid,
+    // take 1 hand warp markers, take 2 a star.
+    auto make = [&] (const char* name, juce::File& dir)
+    {
+        dir = root.getChildFile (name);
+        dir.createDirectory();
+        auto p = std::make_unique<P>();
+        p->setStableRoot (dir.getChildFile ("stable"));
+        p->setCollectionRoot (dir.getChildFile ("coll"));
+        DawJob j;
+        j.localId = 700;
+        j.request.caption = juce::String ("state case ") + name;
+        j.request.expectedBackend = "sa3";
+        j.request.bpm = 120.0;
+        j.request.seed = 7000;
+        j.request.durationS = 1.0;
+        for (int k = 0; k < 3; ++k)
+        {
+            const auto f = dir.getChildFile ("dl").getChildFile ("take" + juce::String (k) + ".wav");
+            collWriteWav (f, 0.5);
+            j.takeFiles.add (f);
+            j.takeSeeds.add (7000 + k);
+            p->registerTakeAndWait (j, k);
+        }
+        waitFor ([&]
+                 {
+                     auto l = p->getTakes();
+                     if (l.size() != 3)
+                         return false;
+                     for (auto& e : l)
+                         if (e.stable == juce::File())
+                             return false;
+                     return true;
+                 }, 10.0);
+        const auto l = p->getTakes();
+        for (size_t k = 0; k < l.size(); ++k)
+        {
+            TakeEdit::EditData ed;
+            ed.cropStart = 1000 + 100 * (juce::int64) k;
+            ed.cropEnd = 20000 - 100 * (juce::int64) k;
+            ed.loopStart = 2000 + 10 * (juce::int64) k;
+            ed.loopEnd = 12000 + 10 * (juce::int64) k;
+            p->setTakeEdit (l[k].temp, ed);
+        }
+        if (l.size() == 3)
+        {
+            TakeEdit::GridEdit g;
+            g.set = true;
+            g.bpm = 128.0;
+            g.downbeatSec = 0.05;
+            p->setTakeGrid (l[0].temp, g);
+            std::vector<WarpMarkers::Marker> w { { 0, 0 }, { 12000, 11000 }, { 24000, 24000 } };
+            p->setTakeWarp (l[1].temp, w, true, 0.0);
+            p->setStarred (l[2].stable, true);
+        }
+        p->apvts.getParameter ("levelMatch")->setValueNotifyingHost (1.0f);
+        return p;
+    };
+    auto load = [&] (const juce::File& dir, const void* data, int size)
+    {
+        auto q = std::make_unique<P>();
+        q->setStableRoot (dir.getChildFile ("stable_q"));
+        q->setCollectionRoot (dir.getChildFile ("coll_q"));
+        q->setStateInformation (data, size);
+        return q;
+    };
+    auto warpText = [] (const std::vector<WarpMarkers::Marker>& w)
+    {
+        juce::String s;
+        for (auto& m : w)
+            s << "(" << (juce::int64) m.srcFrame << "," << (juce::int64) m.dstFrame << ")";
+        return s.isEmpty() ? juce::String ("none") : s;
+    };
+
+    // (a) round trip
+    {
+        juce::File dir;
+        auto p = make ("a", dir);
+        const auto before = p->getTakes();
+        juce::MemoryBlock state;
+        p->getStateInformation (state);
+        auto q = load (dir, state.getData(), (int) state.getSize());
+        const auto after = q->getTakes();
+        bool order = before.size() == 3 && after.size() == 3, edits = order, grid = false, warp = false, star = false, flags = order;
+        for (size_t k = 0; order && k < 3; ++k)
+        {
+            order = order && after[k].stable == before[k].stable && after[k].name == before[k].name;
+            edits = edits && after[k].edit.cropStart == before[k].edit.cropStart && after[k].edit.cropEnd == before[k].edit.cropEnd
+                    && after[k].edit.loopStart == before[k].edit.loopStart && after[k].edit.loopEnd == before[k].edit.loopEnd
+                    && before[k].edit.cropStart == 1000 + 100 * (juce::int64) k;
+            flags = flags && ! after[k].missing;
+        }
+        if (after.size() == 3)
+        {
+            grid = after[0].gridEdit.set && after[0].gridEdit.bpm == 128.0 && after[0].gridEdit.downbeatSec == 0.05;
+            warp = after[1].warpMarkers.size() == 3 && after[1].warpMarkers[1].srcFrame == 12000 && after[1].warpMarkers[1].dstFrame == 11000
+                   && after[1].warpMarkersEdited;
+            star = q->isStarred (after[2].stable) && ! q->isStarred (after[0].stable);
+        }
+        const auto w1 = after.size() > 1 ? warpText (after[1].warpMarkers) : juce::String ("none");
+        std::printf ("  (a) takes before=%d after=%d (want 3) order=%d edits=%d (crop0 %lld..%lld) grid=%d (bpm %.2f) warp=%s (want (0,0)(12000,11000)(24000,24000)) edited=%d star=%d not missing=%d%c",
+                     (int) before.size(), (int) after.size(), (int) order, (int) edits,
+                     after.empty() ? -1LL : (long long) after[0].edit.cropStart, after.empty() ? -1LL : (long long) after[0].edit.cropEnd,
+                     (int) grid, after.empty() ? 0.0 : after[0].gridEdit.bpm, w1.toRawUTF8(),
+                     after.size() > 1 ? (int) after[1].warpMarkersEdited : 0, (int) star, (int) flags, 10);
+        check (before.size() == 3 && after.size() == 3 && order, "takestate (a): a fresh processor lists the same 3 takes in the same order");
+        check (edits && grid, "takestate (a): crop/loop points and the hand grid come back");
+        check (warp && star && flags, "takestate (a): hand warp markers (frames) and the star come back; no take flagged missing");
+    }
+
+    // (b) one WAV deleted before the load
+    {
+        juce::File dir;
+        auto p = make ("b", dir);
+        const auto before = p->getTakes();
+        juce::MemoryBlock state;
+        p->getStateInformation (state);
+        p.reset();
+        const auto gone = before.size() == 3 ? before[1].stable : juce::File();
+        const bool deleted = gone.deleteFile() && ! gone.existsAsFile();
+        auto q = load (dir, state.getData(), (int) state.getSize());
+        const auto after = q->getTakes();
+        int missingAt = -1, missingN = 0;
+        for (size_t k = 0; k < after.size(); ++k)
+            if (after[k].missing)
+            {
+                ++missingN;
+                missingAt = (int) k;
+            }
+        std::printf ("  (b) deleted=%d takes after=%d (want 3) missing=%d (want 1) at index %d (want 1)%c",
+                     (int) deleted, (int) after.size(), missingN, missingAt, 10);
+        check (deleted && after.size() == 3 && missingN == 1 && missingAt == 1 && after[1].stable == gone,
+               "takestate (b): a take whose WAV is gone comes back flagged missing, no crash");
+    }
+
+    // (c) bad Takes children: truncated XML, v=99, a foreign child
+    {
+        juce::File dir;
+        auto p = make ("c", dir);
+        juce::MemoryBlock state;
+        p->getStateInformation (state);
+        auto xml = juce::AudioProcessor::getXmlFromBinary (state.getData(), (int) state.getSize());
+        const bool parsed = xml != nullptr && xml->getChildByName ("Takes") != nullptr;
+        auto qT = load (dir, state.getData(), (int) state.getSize() / 2); // truncated: half the bytes
+        const int nT = (int) qT->getTakes().size();
+        auto variant = [&] (int mode)
+        {
+            juce::MemoryBlock mb;
+            if (xml != nullptr)
+            {
+                auto x = std::make_unique<juce::XmlElement> (*xml);
+                auto* t = x->getChildByName ("Takes");
+                if (mode == 0 && t != nullptr)
+                    t->setAttribute ("v", 99);
+                if (mode == 1 && t != nullptr)
+                {
+                    t->deleteAllChildElements();
+                    auto* f = t->createNewChildElement ("Foreign");
+                    f->setAttribute ("path", dir.getChildFile ("nope.wav").getFullPathName());
+                    f->setAttribute ("info", "{not json");
+                    auto* bad = t->createNewChildElement ("T");
+                    bad->setAttribute ("path", "relative/x.wav");
+                    bad->setAttribute ("info", "{\"trunc");
+                }
+                juce::AudioProcessor::copyXmlToBinary (*x, mb);
+            }
+            auto q = load (dir, mb.getData(), (int) mb.getSize());
+            const int n = (int) q->getTakes().size();
+            const float lm = q->apvts.getRawParameterValue ("levelMatch")->load();
+            return std::make_pair (n, lm);
+        };
+        const auto v99 = variant (0), foreign = variant (1);
+        std::printf ("  (c) parsed=%d truncated: takes=%d (want 0); v=99: takes=%d (want 0) levelMatch=%.1f (want 1.0); foreign: takes=%d (want 0) levelMatch=%.1f (want 1.0)%c",
+                     (int) parsed, nT, v99.first, v99.second, foreign.first, foreign.second, 10);
+        check (parsed && nT == 0, "takestate (c): truncated state loads no takes, no crash");
+        check (v99.first == 0 && v99.second > 0.5f, "takestate (c): Takes v=99 is ignored and the parameters still load");
+        check (foreign.first == 0 && foreign.second > 0.5f, "takestate (c): foreign and broken Takes children are ignored and the parameters still load");
+    }
+
+    // (d) warp survives a take editor close and reopen in one session
+    {
+        juce::File dir;
+        auto p = make ("d", dir);
+        auto ed = std::make_unique<HotStepLinkEditor> (*p);
+        ed->setSize (1280, 860);
+        ed->forceStandaloneForTest = true;
+        ed->resized();
+        ed->runRefreshForTest();
+        const auto l = p->getTakes();
+        std::vector<WarpMarkers::Marker> first, reopened, stored;
+        auto& tp = ed->getTakeEditorForTest();
+        auto openAndWait = [&]
+        {
+            bool sel = false;
+            for (const auto& cell : ed->getTakeGridForTest().cells)
+                sel = sel || (cell.selected && l.size() == 3 && cell.temp == l[1].temp);
+            if (! sel) // a second select of the selected take would unselect it
+                ed->selectTakeForTest (l.size() == 3 ? TakeGrid::keyOf (l[1]) : juce::String());
+            ed->runRefreshForTest();
+            const bool ok = ed->openTakeEditorForTest();
+            for (int i = 0; i < 500 && ok && ! tp.headerReadyForTest() && ! tp.peaksFailedForTest(); ++i)
+            {
+                juce::Thread::sleep (10);
+                ed->runRefreshForTest();
+            }
+            return ok; // the second open may find the header already read (headerReady not waited on)
+        };
+        const bool opened = openAndWait();
+        first = tp.warpMarkersForTest();
+        if (opened && first.size() == 3)
+            tp.dragWarpForTest (1, 13000); // a hand move in the panel
+        tp.close (false);
+        for (auto& e : p->getTakes())
+            if (l.size() == 3 && e.temp == l[1].temp)
+                stored = e.warpMarkers;
+        const bool reopenOk = openAndWait();
+        reopened = tp.warpMarkersForTest();
+        tp.close (false);
+        std::printf ("  (d) opened=%d at open: %s; stored after close: %s; reopened=%d: %s (want (0,0)(12000,13000)(24000,24000))%c",
+                     (int) opened, warpText (first).toRawUTF8(), warpText (stored).toRawUTF8(), (int) reopenOk, warpText (reopened).toRawUTF8(), 10);
+        const bool want = reopened.size() == 3 && reopened[1].srcFrame == 12000 && reopened[1].dstFrame == 13000;
+        check (opened && stored.size() == 3 && stored[1].dstFrame == 13000, "takestate (d): the warp moved in the editor is stored on the take at close");
+        check (reopenOk && want, "takestate (d): the warp moved in the editor survives close and reopen");
+        ed.reset();
+    }
+
+    // (e) takes added by the real Add as take path (addShotTake: external, the user's WAV)
+    // survive a save and a fresh processor load, with crop and hand warp, still external,
+    // and a second save writes no new file (no copy per save).
+    {
+        const auto dir = root.getChildFile ("e");
+        dir.createDirectory();
+        const auto userDir = dir.getChildFile ("user wavs");
+        const auto w0 = userDir.getChildFile ("shot_a.wav"), w1 = userDir.getChildFile ("shot_b.wav");
+        collWriteWav (w0, 0.5);
+        collWriteWav (w1, 0.5);
+        auto p = std::make_unique<P>();
+        p->setStableRoot (dir.getChildFile ("stable"));
+        p->setCollectionRoot (dir.getChildFile ("coll"));
+        const bool added = p->addShotTake (w0) && p->addShotTake (w1);
+        auto l = p->getTakes();
+        if (l.size() == 2)
+        {
+            TakeEdit::EditData ed;
+            ed.cropStart = 1500;
+            ed.cropEnd = 18000;
+            p->setTakeEdit (w0, ed);
+            std::vector<WarpMarkers::Marker> w { { 0, 0 }, { 12000, 11500 }, { 24000, 24000 } };
+            p->setTakeWarp (w0, w, true, 0.0);
+        }
+        juce::MemoryBlock state, state2;
+        p->getStateInformation (state);
+        const int filesBefore = dir.findChildFiles (juce::File::findFiles, true, "*.wav").size();
+        p->getStateInformation (state2);
+        const int filesAfter = dir.findChildFiles (juce::File::findFiles, true, "*.wav").size();
+        auto q = load (dir, state.getData(), (int) state.getSize());
+        const auto after = q->getTakes();
+        bool paths = after.size() == 2, ext = paths, crop = false, warp = false;
+        for (auto& t : after)
+        {
+            paths = paths && (t.stable == w0 || t.stable == w1) && ! t.missing;
+            ext = ext && t.external;
+            if (t.stable == w0)
+            {
+                crop = t.edit.cropStart == 1500 && t.edit.cropEnd == 18000;
+                warp = t.warpMarkers.size() == 3 && t.warpMarkers[1].dstFrame == 11500 && t.warpMarkersEdited;
+            }
+        }
+        std::printf ("  (e) addShotTake added=%d before=%d after=%d (want 2) paths=%d external=%d crop=%d warp=%d wavs %d -> %d after 2nd save (want same)%c",
+                     (int) added, (int) l.size(), (int) after.size(), (int) paths, (int) ext, (int) crop, (int) warp, filesBefore, filesAfter, 10);
+        check (added && l.size() == 2 && after.size() == 2 && paths, "takestate (e): 2 takes added by Add as take come back after a save and load");
+        check (ext && crop && warp, "takestate (e): they stay external (user's file) with crop and hand warp intact");
+        check (filesBefore == 2 && filesAfter == 2, "takestate (e): saving again makes no new copy");
+    }
+
+    // (f) the saved ext flag is not trusted: a take saved without ext whose file sits
+    // outside the loading processor's takes root is the user's file, and deleting it
+    // leaves the WAV in place. A take inside the root stays plugin-owned. Teeth: TS_TRUST_EXT.
+    {
+        P::testTrustExt = teethVar == "TS_TRUST_EXT";
+        juce::File dir;
+        auto p = make ("f", dir);
+        const auto before = p->getTakes();
+        juce::MemoryBlock state;
+        p->getStateInformation (state);
+        p.reset();
+        auto q = load (dir, state.getData(), (int) state.getSize()); // root stable_q: the files are outside it
+        auto after = q->getTakes();
+        const auto victim = after.empty() ? juce::File() : after[0].stable;
+        const bool wasExt = ! after.empty() && after[0].external;
+        const bool savedOwn = ! before.empty() && ! before[0].external;
+        const auto r = after.empty() ? HotStepLinkProcessor::TakeDelete::notFound : q->deleteTake (after[0].temp.getFullPathName());
+        q->commitTakeDelete();
+        waitFor ([&] { return ! victim.existsAsFile(); }, 2.0);
+        const bool inPlace = victim.existsAsFile();
+        const bool deletedDir = victim.getParentDirectory().getChildFile ("Deleted").getChildFile (victim.getFileName()).existsAsFile();
+        q.reset();
+        // control: loaded with the root the files live under, the take stays plugin-owned
+        auto q2 = std::make_unique<P>();
+        q2->setStableRoot (dir.getChildFile ("stable"));
+        q2->setCollectionRoot (dir.getChildFile ("coll_q2"));
+        q2->setStateInformation (state.getData(), (int) state.getSize());
+        const auto inRoot = q2->getTakes();
+        int ownN = 0;
+        for (auto& t : inRoot)
+            ownN += t.external ? 0 : 1;
+        std::printf ("  (f) saved own=%d loaded outside root: ext=%d (want 1) delete=%d file in place=%d (want 1) in Deleted=%d (want 0); inside root own=%d of %d (want 3)%c",
+                     (int) savedOwn, (int) wasExt, (int) r, (int) inPlace, (int) deletedDir, ownN, (int) inRoot.size(), 10);
+        check (savedOwn && wasExt, "takestate (f): a non-ext take outside the takes root loads as the user's file");
+        check (r == HotStepLinkProcessor::TakeDelete::deleted && inPlace && ! deletedDir, "takestate (f): deleting it leaves the WAV in place, nothing in Deleted/");
+        check (ownN == 3 && inRoot.size() == 3, "takestate (f): takes inside the root stay plugin-owned");
+        P::testTrustExt = false;
+    }
+
+    P::testNoTakesWrite = false;
+    P::testSkipExternalTakes = false;
+    TakeEditorPanel::testOpenWipesWarp = false;
+    P::tempoMeasureEnabled = savedMeasure;
+    root.deleteRecursively();
+}
+
+// focusselect (v0.5.19): a click on a child of the take editor gives the panel keyboard
+// focus so a real Ctrl+Z / Ctrl+Y (dispatched from the peer to the focused component)
+// undoes and redoes an edit; a newly added take is selected at once and the TAKES count
+// matches the list in the same refresh. Teeth: HSLINK_TEETH=NO_FOCUS_GRAB, NO_AUTO_SELECT.
+static void testFocusSelect (const juce::File& tmp)
+{
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    std::printf ("Focus select: click focuses the take editor, real Ctrl+Z/Ctrl+Y, new take selected (teeth: %s)%c",
+                 teethVar.isEmpty() ? "none" : teethVar.toRawUTF8(), 10);
+    TakeEditorPanel::testNoFocusGrab = teethVar == "NO_FOCUS_GRAB";
+    TakeEditorPanel::testNoCtrlCharMap = teethVar == "NO_CTRL_CHAR";
+    using P = HotStepLinkProcessor;
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto dir = tmp.getChildFile ("focusselect");
+    dir.createDirectory();
+    const double sr = 48000.0;
+    juce::AudioBuffer<float> buf (2, 384000);
+    for (int i = 0; i < buf.getNumSamples(); ++i)
+    {
+        const float v = 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 110.0 * i / sr);
+        buf.setSample (0, i, v);
+        buf.setSample (1, i, v);
+    }
+    const auto wav = writeWav (dir.getChildFile ("fs_take.wav"), buf, sr);
+    {
+        // (1)+(2) a holder window with the panel and a focusable sibling outside it.
+        juce::Component holder, other;
+        TakeEditorPanel panel;
+        panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+        panel.onApply = [] (const juce::File&, const TakeEdit::EditData&, const TakeEdit::EditOptions&, juce::String&) { return (juce::uint64) 0; };
+        panel.onReport = [] (juce::uint64, P::TakeEditReport&) { return false; };
+        panel.onSetGrid = [] (const juce::File&, const TakeEdit::GridEdit&) { return true; };
+        panel.onClosed = [] {};
+        other.setWantsKeyboardFocus (true);
+        holder.addAndMakeVisible (panel);
+        holder.addAndMakeVisible (other);
+        panel.setBounds (0, 0, 590, 686);
+        other.setBounds (600, 0, 100, 100);
+        holder.setBounds (-4000, -4000, 720, 700); // off screen: on the desktop, never in view
+        holder.addToDesktop (0);
+        holder.setVisible (true);
+        TakeEditorPanel::Take take;
+        take.temp = wav;
+        take.name = wav.getFileName();
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        panel.tick();
+        panel.resized();
+        auto* peer = holder.getPeer();
+        // A visible child that does not take focus itself (so only the panel's grabber can).
+        juce::Component* child = nullptr;
+        for (auto* c : panel.getChildren())
+            if (c->isVisible() && ! c->getBounds().isEmpty() && dynamic_cast<juce::TextEditor*> (c) == nullptr
+                && (! c->getWantsKeyboardFocus() || ! c->getMouseClickGrabsKeyboardFocus()) && c->isEnabled())
+            {
+                child = c;
+                break;
+            }
+        other.grabKeyboardFocus();
+        const bool otherHad = other.hasKeyboardFocus (false);
+        bool clicked = false;
+        if (peer != nullptr && child != nullptr)
+        {
+            const auto pos = holder.getLocalPoint (child, child->getLocalBounds().getCentre()).toFloat();
+            const auto t = juce::Time::currentTimeMillis();
+            peer->handleMouseEvent (juce::MouseInputSource::InputSourceType::mouse, pos, juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier),
+                                    juce::MouseInputSource::defaultPressure, 0.0f, t);
+            peer->handleMouseEvent (juce::MouseInputSource::InputSourceType::mouse, pos, juce::ModifierKeys(),
+                                    juce::MouseInputSource::defaultPressure, 0.0f, t + 20);
+            clicked = true;
+        }
+        auto* focused = juce::Component::getCurrentlyFocusedComponent();
+        const bool reach = focused != nullptr && (focused == &panel || panel.isParentOf (focused));
+        std::printf ("  (1) child '%s' %s click=%d; sibling focused first=%d; after the click panel focus=%d, focused is panel or inside=%d (want 1, 1)%c",
+                     child != nullptr ? child->getName().toRawUTF8() : "none", child != nullptr ? typeid (*child).name() : "", (int) clicked, (int) otherHad,
+                     (int) panel.hasKeyboardFocus (false), (int) reach, 10);
+        check (clicked && otherHad && panel.hasKeyboardFocus (false) && reach,
+               "focusselect (1): a click on a child of the take editor gives the panel keyboard focus");
+        // (2) a real edit, then Ctrl+Z / Ctrl+Y through the peer's key dispatch.
+        const auto s0 = panel.getCropStartForTest();
+        panel.beginDragForTest (TakeEditorMath::handleStart);
+        panel.dragToFrameForTest (s0 + 48000);
+        panel.endDragForTest();
+        const auto s1 = panel.getCropStartForTest();
+        const bool undoKey = peer != nullptr && peer->handleKeyPress (juce::KeyPress (0x1A, juce::ModifierKeys::commandModifier, 0)); // real Win32 Ctrl+Z code
+        const auto s2 = panel.getCropStartForTest();
+        const bool redoKey = peer != nullptr && peer->handleKeyPress (juce::KeyPress (0x19, juce::ModifierKeys::commandModifier, 0)); // real Win32 Ctrl+Y code
+        const auto s3 = panel.getCropStartForTest();
+        std::printf ("  (2) crop start %lld -> edit %lld (%lld frames), Ctrl+Z handled=%d -> %lld (want %lld), Ctrl+Y handled=%d -> %lld (want %lld)%c",
+                     (long long) s0, (long long) s1, (long long) (s1 - s0), (int) undoKey, (long long) s2, (long long) s0, (int) redoKey, (long long) s3, (long long) s1, 10);
+        check (s1 - s0 > 24000 && undoKey && s2 == s0, "focusselect (2): a real Ctrl+Z after the click undoes the crop edit");
+        check (redoKey && s3 == s1, "focusselect (2): a real Ctrl+Y redoes it");
+        panel.close (false);
+        holder.removeFromDesktop();
+    }
+    TakeEditorPanel::testNoCtrlCharMap = false;
+    TakeEditorPanel::testNoFocusGrab = false;
+    {
+        // (3) a newly added take is selected at once, the TAKES count equals the list.
+        auto p = std::make_unique<HotStepLinkProcessor>();
+        p->setStableRoot (dir.getChildFile ("stable"));
+        p->setCollectionRoot (dir.getChildFile ("coll"));
+        auto ed = std::make_unique<HotStepLinkEditor> (*p);
+        ed->setSize (1280, 860);
+        ed->noAutoSelectForTest = teethVar == "NO_AUTO_SELECT";
+        ed->forceStandaloneForTest = true;
+        ed->resized();
+        ed->runRefreshForTest(); // first refresh: records the keys, selects nothing
+        const auto selBefore = p->audition.getSelected();
+        const bool added = ed->addTakeFromFileForTest (wav);
+        ed->runRefreshForTest();
+        juce::String selKey;
+        for (const auto& cell : ed->getTakeGridForTest().cells)
+            if (cell.selected && cell.shown)
+                selKey = cell.key;
+        bool selIsNew = false;
+        for (const auto& cell : ed->getTakeGridForTest().cells)
+            if (cell.key == selKey && cell.temp != juce::File() && selKey.isNotEmpty())
+                selIsNew = true;
+        const int listN = (int) p->getTakes().size();
+        std::printf ("  (3) added=%d, selected before '%s', after '%s' (new=%d), Edit take enabled=%d, TAKES count shown %d, cells %d, list %d (want equal, 1)%c",
+                     (int) added, selBefore.getFileName().toRawUTF8(), selKey.toRawUTF8(), (int) selIsNew, (int) ed->editTakeEnabledForTest(),
+                     ed->takeCountShownForTest(), ed->takeCellCountForTest(), listN, 10);
+        check (added && selKey.isNotEmpty() && selIsNew && ed->editTakeEnabledForTest(), "focusselect (3): a newly added take is selected at once and Edit take is on");
+        check (listN == 1 && ed->takeCountShownForTest() == listN && ed->takeCellCountForTest() == listN, "focusselect (3): the TAKES count equals the list size in the same refresh");
+
+        // (4) the editor-level fallback: focus on a plain component outside the take
+        // editor, a real Ctrl+Z (code 0x1A) still undoes the crop edit. Teeth: NO_TOP_KEYS.
+        HotStepLinkEditor::testNoTopLevelKeys = teethVar == "NO_TOP_KEYS";
+        juce::Component holder, other;
+        other.setWantsKeyboardFocus (true);
+        holder.addAndMakeVisible (*ed);
+        holder.addAndMakeVisible (other);
+        other.setBounds (1290, 0, 100, 100);
+        holder.setBounds (-4000, -4000, 1400, 870);
+        holder.addToDesktop (0);
+        holder.setVisible (true);
+        auto& tp = ed->getTakeEditorForTest();
+        const bool opened = ed->openTakeEditorForTest();
+        for (int i = 0; i < 500 && opened && ! tp.headerReadyForTest() && ! tp.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            ed->runRefreshForTest();
+        }
+        ed->runRefreshForTest();
+        const auto c0 = tp.getCropStartForTest();
+        tp.beginDragForTest (TakeEditorMath::handleStart);
+        tp.dragToFrameForTest (c0 + 48000);
+        tp.endDragForTest();
+        const auto c1 = tp.getCropStartForTest();
+        other.grabKeyboardFocus();
+        auto* f4 = juce::Component::getCurrentlyFocusedComponent();
+        const bool outside = f4 == &other && ! tp.isParentOf (f4) && dynamic_cast<juce::TextEditor*> (f4) == nullptr;
+        auto* peer4 = holder.getPeer();
+        const bool key4 = peer4 != nullptr && peer4->handleKeyPress (juce::KeyPress (0x1A, juce::ModifierKeys::commandModifier, 0));
+        const auto c2 = tp.getCropStartForTest();
+        std::printf ("  (4) take editor opened=%d showing=%d; crop %lld -> %lld (%lld frames); focus outside the panel=%d; Ctrl+Z (0x1A) handled=%d -> %lld (want %lld)%c",
+                     (int) opened, (int) tp.isShowing(), (long long) c0, (long long) c1, (long long) (c1 - c0), (int) outside, (int) key4, (long long) c2, (long long) c0, 10);
+        check (opened && c1 - c0 > 24000 && outside && key4 && c2 == c0, "focusselect (4): Ctrl+Z with focus outside the take editor undoes the crop edit (editor-level fallback)");
+        HotStepLinkEditor::testNoTopLevelKeys = false;
+        // (5) Apply crop with the take editor open: the new take is selected (checked by
+        // key, which is the temp path, not by index). Teeth: OPEN_BLOCKS_SELECT.
+        ed->openEditorBlocksSelectForTest = teethVar == "OPEN_BLOCKS_SELECT";
+        juce::StringArray keysBefore;
+        for (const auto& cell : ed->getTakeGridForTest().cells)
+            keysBefore.add (cell.key);
+        const auto editedTemp = tp.getTemp();
+        tp.beginDragForTest (TakeEditorMath::handleStart);
+        tp.dragToFrameForTest (c0 + 48000);
+        tp.endDragForTest();
+        tp.clickApplyForTest();
+        p->waitTakeEditIdle();
+        juce::String newKey, selKey5;
+        for (int i = 0; i < 300 && newKey.isEmpty(); ++i)
+        {
+            ed->runRefreshForTest();
+            for (const auto& cell : ed->getTakeGridForTest().cells)
+                if (! keysBefore.contains (cell.key))
+                    newKey = cell.key;
+            if (newKey.isEmpty())
+                juce::Thread::sleep (10);
+        }
+        ed->runRefreshForTest();
+        for (const auto& cell : ed->getTakeGridForTest().cells)
+            if (cell.selected && cell.shown)
+                selKey5 = cell.key;
+        std::printf ("  (5) takes before %d after %d; new take '%s'; selected '%s' (want the new one); editor open=%d on '%s' (want 1, the edited take)%c",
+                     keysBefore.size(), ed->getTakeGridForTest().cells.size() > 0 ? (int) ed->getTakeGridForTest().cells.size() : 0,
+                     juce::File (newKey).getFileName().toRawUTF8(), juce::File (selKey5).getFileName().toRawUTF8(),
+                     (int) tp.isOpen(), tp.getTemp().getFileName().toRawUTF8(), 10);
+        check (newKey.isNotEmpty() && selKey5 == newKey, "focusselect (5): Apply crop with the editor open selects the new take");
+        check (tp.isOpen() && tp.getTemp() == editedTemp, "focusselect (5): the open take editor stays on the take it edits");
+        ed->openEditorBlocksSelectForTest = false;
+        holder.removeChildComponent (ed.get());
+        holder.removeFromDesktop();
+    }
+    P::tempoMeasureEnabled = savedMeasure;
+}
+
+// offlinelocal: with the server offline, the banner covers only the Generate controls,
+// the take side stays usable, and a WAV added as a take keeps the file's own length.
+static void testOfflineLocal (const juce::File& tmp)
+{
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    const bool mFull = teethVar == "OFFLINE_FULL_WINDOW", mRate = teethVar == "ADDTAKE_WRONG_RATE";
+    std::printf ("Offline local: banner over Generate only, Add as take (teeth: %s)%c", teethVar.isEmpty() ? "none" : teethVar.toRawUTF8(), 10);
+    HotStepLinkProcessor::addTakeMutantForTest = mRate ? HotStepLinkProcessor::mutAddTakeWrongRate : HotStepLinkProcessor::mutAddTakeNone;
+    const auto dir = tmp.getChildFile ("offlinelocal");
+    dir.createDirectory();
+    auto p = std::make_unique<HotStepLinkProcessor>();
+    p->setStableRoot (dir.getChildFile ("stable"));
+    p->setCollectionRoot (dir.getChildFile ("coll"));
+    {
+        auto ed = std::make_unique<HotStepLinkEditor> (*p);
+        ed->setSize (1280, 860);
+        ed->offlineMutantForTest = mFull ? HotStepLinkEditor::mutOverlayFullWindow : HotStepLinkEditor::mutOfflineNone;
+        ed->resized();
+        ed->forceStandaloneForTest = true;
+
+        // (iii) WAVs at 44100 and 48000 Hz, 15.000 s each.
+        const double rates[] = { 44100.0, 48000.0 };
+        juce::String firstName;
+        for (double sr : rates)
+        {
+            juce::AudioBuffer<float> buf (2, (int) (15.0 * sr));
+            for (int i = 0; i < buf.getNumSamples(); ++i)
+                buf.setSample (0, i, 0.25f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / sr)), buf.setSample (1, i, buf.getSample (0, i));
+            const auto name = juce::String ("ol_take_") + juce::String ((int) sr) + ".wav";
+            const auto f = pgWriteWav (dir.getChildFile (name), sr, 24, false, buf, "offlinelocal");
+            const bool added = ed->addTakeFromFileForTest (f);
+            double dur = -1.0, fileRate = 0.0;
+            juce::String gotName;
+            for (const auto& t : p->getTakes())
+                if (t.temp == f)
+                {
+                    dur = t.durationS;
+                    gotName = t.name;
+                    juce::AudioFormatManager fm;
+                    fm.registerBasicFormats();
+                    if (std::unique_ptr<juce::AudioFormatReader> r (fm.createReaderFor (t.temp)); r != nullptr)
+                        fileRate = r->sampleRate;
+                }
+            std::printf ("  (iii) %s: added=%d length %.4f s (want 15.0000 +-0.001) take file rate %.0f Hz (want %.0f) name '%s'%c",
+                         name.toRawUTF8(), (int) added, dur, fileRate, sr, gotName.toRawUTF8(), 10);
+            check (added && std::abs (dur - 15.0) < 0.001 && fileRate == sr && gotName == name,
+                   "offlinelocal (iii): a WAV added as a take has the file's length at the file's rate and the file's name");
+            if (firstName.isEmpty())
+                firstName = name;
+        }
+
+        // Offline: the test exe never reaches a server; wait for the banner.
+        int waited = 0;
+        for (; waited < 8000 && ! ed->offlineBannerVisibleForTest(); waited += 20)
+        {
+            ed->runRefreshForTest();
+            juce::Thread::sleep (20);
+        }
+        ed->selectTakeForTest (firstName);
+        ed->runRefreshForTest();
+        ed->runRefreshForTest();
+        const auto banner = ed->offlineBannerBoundsForTest(), gen = ed->genPlateForTest();
+        std::printf ("  (ii) banner visible=%d after %d ms, Generate enabled=%d (want 1, 0)%c", (int) ed->offlineBannerVisibleForTest(), waited,
+                     (int) ed->generateEnabledForTest(), 10);
+        check (ed->offlineBannerVisibleForTest() && ! ed->generateEnabledForTest(), "offlinelocal (ii): offline, the banner shows and Generate is disabled");
+        std::printf ("  (i) banner %d,%d %dx%d; Generate plate %d,%d %dx%d; inside=%d%c", banner.getX(), banner.getY(), banner.getWidth(), banner.getHeight(),
+                     gen.getX(), gen.getY(), gen.getWidth(), gen.getHeight(), (int) gen.contains (banner), 10);
+        check (! banner.isEmpty() && gen.contains (banner), "offlinelocal (i): the banner lies inside the Generate plate");
+        const char* names[] = { "take list", "Edit take", "audition Play", "Export WAV", "collection" };
+        ed->setVisible (true); // getComponentAt skips an invisible component; still not on the desktop
+        for (int w = 0; w < 5; ++w)
+        {
+            auto* c = ed->offlineTargetForTest (w);
+            const auto b = c->getBounds();
+            const auto overlap = b.getIntersection (banner);
+            auto* hit = ed->getComponentAt (b.getCentre());
+            const bool hitOk = hit != nullptr && (hit == c || c->isParentOf (hit));
+            std::printf ("    %s %d,%d %dx%d: overlap with banner %d x %d px (want 0), enabled=%d, hit at centre=%d (%s)%c", names[w], b.getX(), b.getY(),
+                         b.getWidth(), b.getHeight(), overlap.getWidth(), overlap.getHeight(), (int) c->isEnabled(), (int) hitOk,
+                         hit == nullptr ? "none" : hit->getName().isNotEmpty() ? hit->getName().toRawUTF8() : typeid (*hit).name(), 10);
+            check (! b.isEmpty() && overlap.isEmpty() && c->isEnabled() && hitOk,
+                   (juce::String ("offlinelocal (i): ") + names[w] + " is clear of the banner, enabled and hit-testable while offline").toRawUTF8());
+        }
+
+        // (iv) drop on the TAKES plate makes a take; elsewhere sets Source only.
+        juce::AudioBuffer<float> b2 (1, 48000 * 2);
+        b2.clear();
+        const auto dropT = pgWriteWav (dir.getChildFile ("ol_drop_takes.wav"), 48000.0, 16, false, b2, "drop");
+        const auto dropS = pgWriteWav (dir.getChildFile ("ol_drop_source.wav"), 48000.0, 16, false, b2, "drop");
+        const auto plate = ed->takesPlateForTest();
+        const auto gc = ed->genPlateForTest().getCentre();
+        auto hasTake = [&] (const juce::File& f) { for (const auto& t : p->getTakes()) if (t.temp == f) return true; return false; };
+        const int n0 = (int) p->getTakes().size();
+        ed->filesDropped (juce::StringArray (dropT.getFullPathName()), plate.getCentreX(), plate.getCentreY());
+        const int n1 = (int) p->getTakes().size();
+        ed->filesDropped (juce::StringArray (dropS.getFullPathName()), gc.x, gc.y);
+        const int n2 = (int) p->getTakes().size();
+        std::printf ("  (iv) drop on TAKES (%d,%d): takes %d -> %d (want +1), listed=%d; drop at (%d,%d): takes %d -> %d (want +0), listed=%d (want 0), Source '%s'%c",
+                     plate.getCentreX(), plate.getCentreY(), n0, n1, (int) hasTake (dropT), gc.x, gc.y, n1, n2, (int) hasTake (dropS),
+                     p->getSourceFile().getFileName().toRawUTF8(), 10);
+        check (n1 == n0 + 1 && hasTake (dropT), "offlinelocal (iv): a WAV dropped on the TAKES plate becomes a take");
+        check (n2 == n1 && ! hasTake (dropS) && p->getSourceFile() == dropS, "offlinelocal (iv): a WAV dropped elsewhere sets the Source only");
+    }
+    // (v) plugin wrapper (VST3): the test exe is not a standalone app, so an editor without
+    // forceStandaloneForTest runs as the plugin does. Add as take shows and a TAKES drop lands.
+    // Teeth: HSLINK_TEETH=ADDTAKE_STANDALONE_ONLY = the pre-E1 Standalone-only gate.
+    {
+        const bool teethGate = teethVar == "ADDTAKE_STANDALONE_ONLY";
+        auto ed = std::make_unique<HotStepLinkEditor> (*p);
+        ed->addTakeStandaloneOnlyForTest = teethGate;
+        ed->setSize (1280, 860);
+        ed->applyAddTakeGateForTest();
+        const auto bb = ed->addTakeBoundsForTest();
+        juce::AudioBuffer<float> b3 (1, 48000);
+        b3.clear();
+        const auto dropV = pgWriteWav (dir.getChildFile ("ol_drop_vst3.wav"), 48000.0, 16, false, b3, "drop");
+        const juce::StringArray files (dropV.getFullPathName());
+        const bool interested = ed->isInterestedInFileDrag (files);
+        const int n0 = (int) p->getTakes().size();
+        const auto plate = ed->takesPlateForTest();
+        ed->filesDropped (files, plate.getCentreX(), plate.getCentreY());
+        const int n1 = (int) p->getTakes().size();
+        std::printf ("  (v) plugin wrapper (not a standalone app, want 0) standaloneApp=%d: Add as take visible=%d bounds %dx%d (want 1, >0); drop interested=%d (want 1); takes %d -> %d (want +1)%c",
+                     (int) juce::JUCEApplicationBase::isStandaloneApp(), (int) ed->addTakeVisibleForTest(), bb.getWidth(), bb.getHeight(),
+                     (int) interested, n0, n1, 10);
+        check (ed->addTakeVisibleForTest() && bb.getWidth() > 40 && bb.getHeight() > 10,
+               "offlinelocal (v): in a VST3 wrapper the Add as take button is visible with real bounds");
+        check (interested && n1 == n0 + 1, "offlinelocal (v): in a VST3 wrapper a WAV dropped on the TAKES plate becomes a take");
+    }
+    p.reset();
+    HotStepLinkProcessor::addTakeMutantForTest = HotStepLinkProcessor::mutAddTakeNone;
+    dir.deleteRecursively();
 }
 
 int main (int argc, char** argv)
@@ -27630,6 +31242,14 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && juce::String (argv[1]) == "peakguard")
+    {
+        testPeakGuard (tmp);
+        testPeakNormalise (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "gs")
     {
         testGuidanceStepsPure();
@@ -27643,6 +31263,8 @@ int main (int argc, char** argv)
     if (argc > 1 && juce::String (argv[1]) == "pill")
     {
         testPillAndSeedText();
+        testTakeSeedsDerived();
+        testPillSelectedBackend();
         tmp.deleteRecursively();
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
@@ -27717,6 +31339,20 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && juce::String (argv[1]) == "missingtake")
+    {
+        testMissingTakeUi (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "d2rules")
+    {
+        testD2Rules (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "collection")
     {
         testCollection (tmp);
@@ -27727,6 +31363,20 @@ int main (int argc, char** argv)
     if (argc > 1 && juce::String (argv[1]) == "deletedfolder")
     {
         testDeletedFolder (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "temporestore")
+    {
+        testTempoRestore (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "derivedtempo")
+    {
+        testDerivedTempo (tmp);
         tmp.deleteRecursively();
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
@@ -27771,12 +31421,18 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
-    if (argc > 1 && (juce::String (argv[1]) == "offline" || juce::String (argv[1]) == "editticket" || juce::String (argv[1]) == "takeeditor" || juce::String (argv[1]) == "takezoom" || juce::String (argv[1]) == "takemarkers" || juce::String (argv[1]) == "takeexport" || juce::String (argv[1]) == "midiexport" || juce::String (argv[1]) == "takeloop" || juce::String (argv[1]) == "takesnap" || juce::String (argv[1]) == "takefit" || juce::String (argv[1]) == "loopexport" || juce::String (argv[1]) == "editoraudition"))
+    if (argc > 1 && (juce::String (argv[1]) == "offline" || juce::String (argv[1]) == "editticket" || juce::String (argv[1]) == "takeeditor" || juce::String (argv[1]) == "takezoom" || juce::String (argv[1]) == "takemarkers" || juce::String (argv[1]) == "takeexport" || juce::String (argv[1]) == "midiexport" || juce::String (argv[1]) == "takeloop" || juce::String (argv[1]) == "readouts1" || juce::String (argv[1]) == "readouts2" || juce::String (argv[1]) == "takesnap" || juce::String (argv[1]) == "takegrid" || juce::String (argv[1]) == "takebody" || juce::String (argv[1]) == "takequant" || juce::String (argv[1]) == "takeundo" || juce::String (argv[1]) == "takefit" || juce::String (argv[1]) == "loopexport" || juce::String (argv[1]) == "editoraudition" || juce::String (argv[1]) == "levelrow" || juce::String (argv[1]) == "levelfit" || juce::String (argv[1]) == "reverse" || juce::String (argv[1]) == "morelikefit" || juce::String (argv[1]) == "focusselect" || juce::String (argv[1]) == "takestate"))
     {
         if (juce::String (argv[1]) == "offline")
             testOfflineSwitch();
         else if (juce::String (argv[1]) == "editoraudition")
             testEditorAudition (tmp);
+        else if (juce::String (argv[1]) == "levelrow")
+            testLevelRow (tmp);
+        else if (juce::String (argv[1]) == "reverse")
+            testReverse (tmp);
+        else if (juce::String (argv[1]) == "levelfit")
+            testLevelFit();
         else if (juce::String (argv[1]) == "takemarkers")
             testTakeMarkers (tmp);
         else if (juce::String (argv[1]) == "takeexport")
@@ -27794,14 +31450,46 @@ int main (int argc, char** argv)
             testTakeEditor (tmp);
         else if (juce::String (argv[1]) == "takeloop")
             testTakeLoop (tmp);
+        else if (juce::String (argv[1]) == "readouts1")
+            testReadouts1();
+        else if (juce::String (argv[1]) == "readouts2")
+            testReadouts2 (tmp);
         else if (juce::String (argv[1]) == "takesnap")
             testTakeSnap (tmp);
+        else if (juce::String (argv[1]) == "takegrid")
+            testTakeGridEdit (tmp);
+        else if (juce::String (argv[1]) == "takebody")
+            testTakeLoopBody (tmp);
+        else if (juce::String (argv[1]) == "takequant")
+            testTakeQuant (tmp);
+        else if (juce::String (argv[1]) == "takeundo")
+            testTakeUndo (tmp);
         else if (juce::String (argv[1]) == "takefit")
             testTakeFit (tmp);
         else if (juce::String (argv[1]) == "loopexport")
             testLoopExport (tmp);
+        else if (juce::String (argv[1]) == "morelikefit")
+            testMoreLikeFits();
+        else if (juce::String (argv[1]) == "focusselect")
+            testFocusSelect (tmp);
+        else if (juce::String (argv[1]) == "takestate")
+            testTakeState (tmp);
         else
             testEditTicket (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "headercount")
+    {
+        testHeaderCounters (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "offlinelocal")
+    {
+        testOfflineLocal (tmp);
         tmp.deleteRecursively();
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
@@ -27895,7 +31583,7 @@ int main (int argc, char** argv)
     if (argc > 1 && juce::String (argv[1]) != "r6" && juce::String (argv[1]) != "shutdown")
     {
         // Every other group or tool name has returned above: this one is not known (before o138 the whole suite ran).
-        std::fprintf (stderr, "HSLINK_Tests: unknown group or tool '%s' (or too few arguments for it). Valid: ab acemodel backend collection deletedfolder edit editoraudition editticket key labels liveness longreq loopexport nopoll offline peaks pill queue r6 roles seed shutdown split stretch submitrace takedelete takeeditor takefit takeloop takes takesnap tempo tempofallback uid; live, liveswitch; tools crop-file, loop-check, stretch-gen, stretch-file, tempo-scan, editor-shot. No argument runs everything.%c", argv[1], 10);
+        std::fprintf (stderr, "HSLINK_Tests: unknown group or tool '%s' (or too few arguments for it). Valid: ab acemodel backend collection deletedfolder edit editoraudition levelrow editticket key labels liveness longreq loopexport nopoll offline peaks pill queue r6 roles seed shutdown split stretch submitrace takedelete takeeditor takefit takebody takequant takeundo takeloop readouts1 readouts2 takes focusselect takestate takesnap tempo tempofallback uid; offlinelocal; live, liveswitch; tools crop-file, loop-check, stretch-gen, stretch-file, tempo-scan, editor-shot. No argument runs everything.%c", argv[1], 10);
         tmp.deleteRecursively();
         return 2;
     }
@@ -27930,6 +31618,8 @@ int main (int argc, char** argv)
         testBackendSwitch (tmp);
         testJobLabels();
         testPillAndSeedText();
+        testTakeSeedsDerived();
+        testPillSelectedBackend();
         testLiveness (tmp);
         testLongRequests (tmp);
         testTakeStore (tmp);
@@ -27963,10 +31653,15 @@ int main (int argc, char** argv)
     testCollection (tmp);
     testDeletedFolder (tmp);
     testTakeDelete (tmp);
+    testD2Rules (tmp);
+    testMissingTakeUi (tmp);
     testMoreLike (tmp);
+    testHeaderCounters (tmp);
     testLoadTakeKeepsEdits (tmp);
     testUnderstandTagsAndMeter();
     testTempo (tmp);
+    testTempoRestore (tmp);
+    testDerivedTempo (tmp);
     testTempoFallback (tmp);
     // testRephase(); // off: rephase is off by design, see W2 in docs/KNOWN_ISSUES.md
     testTempoHostAndStretchToken (tmp);
@@ -27975,12 +31670,21 @@ int main (int argc, char** argv)
     testEditTicket (tmp);
     testTakeEditor (tmp);
     testTakeLoop (tmp);
+    testReadouts1();
+    testReadouts2 (tmp);
     testTakeSnap (tmp);
+    testTakeGridEdit (tmp);
+    testTakeLoopBody (tmp);
+    testTakeQuant (tmp);
+    testTakeUndo (tmp);
     testTakeFit (tmp);
     testTakeZoom (tmp);
     testTakeWarpDraw (tmp);
     testLoopExport (tmp);
     testEditorAudition (tmp);
+    testLevelRow (tmp);
+    testReverse (tmp);
+    testLevelFit();
     testL1PreviewStopped();
     testServerUrlOverride();
     testVersionFooter();
@@ -27988,7 +31692,13 @@ int main (int argc, char** argv)
     testGuidanceStepsState();
     testParamTextRoundTrip();
     testStateRejectsGarbage();
+    testMoreLikeFits();
+    testPeakGuard (tmp);
+    testPeakNormalise (tmp);
     testOfflineSwitch();
+    testOfflineLocal (tmp);
+    testFocusSelect (tmp);
+    testTakeState (tmp);
     testItDefaultOutDir();
     testIntegration (tmp); // skipped unless HSLINK_IT_URL is set
     tmp.deleteRecursively();

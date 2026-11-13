@@ -113,6 +113,9 @@ struct DawStatus
     std::map<juce::String, DawEta> etaByBackend;
     int heartbeatsOk = 0;       // successful heartbeats since start
     int consecutiveFailures = 0;
+    // Last few heartbeat attempts, newest last: "<time> GET <url> -> <result> (<ms> ms)".
+    juce::StringArray recentAttempts;
+    static constexpr int kMaxRecentAttempts = 4;
     juce::int64 lastOkMs = 0;   // Time::getMillisecondCounter domain
     // A request other than the heartbeat is on the wire and its response headers have
     // not arrived yet: when it was sent and its own timeout. waitingTimeoutMs 0 = none.
@@ -124,7 +127,10 @@ struct DawStatus
     // the status reply, engineModel is loaded_model (the ACE model name only).
     // "Online (YuE2)", "Online (SA3)", "Online (ACE: <model>)", "Online (ACE)"; with a
     // missing or unknown backend (older server) "Online (<model>)" or "Online (no model)".
-    static juce::String onlinePillText (const juce::String& etaBackend, const juce::String& engineModel);
+    // selectedBackend (server id, empty = Auto) wins over a stale eta.backend: after a
+    // MiniMax-M3 job the server may report "ace" while MiniMax-M3 is still selected.
+    static juce::String onlinePillText (const juce::String& etaBackend, const juce::String& engineModel,
+                                        const juce::String& selectedBackend = {});
 };
 
 struct DawJob;
@@ -183,6 +189,7 @@ struct DawJob
     juce::String ditModel;         // server dit_model, empty = not reported
     juce::String phase;            // server phase (e.g. loading_model), empty = not reported
     juce::Array<juce::int64> takeSeeds; // takes[n].seed, -1 = not reported
+    juce::Array<float> takeGuardDb; // peak guard gain per downloaded take (dB, 0 = none)
     // understand result
     double bpm = 0.0;
     juce::String key, timesig;
@@ -229,6 +236,12 @@ struct DawJob
     //   {11,12}       "seed 11, 12"           {5,-1,7}     "seed 5, unknown, 7"
     //   {-1,-1}       ""
     static juce::String seedText (const juce::Array<juce::int64>& takeSeeds);
+    // Pure (KNOWN_ISSUES row 14): the server reports the request seed on every take
+    // of a batch, but renders take i at seed + i (HOT-Step-CPP hot-step-server.cpp
+    // batch fan-out, pipeline-lm.cpp out[b].seed = dit_seed + b, and the facade's
+    // sequential path). More than one take, every seed known and all equal: rewrite
+    // to base + i so each take carries the seed that reproduces it. Else unchanged.
+    static void resolveTakeSeeds (juce::Array<juce::int64>& takeSeeds);
     // Pure: status suffix for ETA or phase ("  Loading model...", "  ETA 42 s", or empty).
     static juce::String etaText (const DawJob& j);
     static State parseState (const juce::String& s, bool& ok);
@@ -305,6 +318,14 @@ public:
     static constexpr int kLivePort = 3001;
     // Pure: 127.x.x.x, localhost, 0.0.0.0 or [::1] on kLivePort, with or without a path.
     static bool isLiveDefaultBase (const juce::String& baseUrl);
+    // Pure: the base URL the worker requests. Trims, repairs a mistyped scheme separator
+    // ("http;//", "http:/", "http//") to "://", adds "http://" when no scheme is given,
+    // and drops trailing slashes.
+    static juce::String normaliseBaseUrl (const juce::String& typed);
+    static std::atomic<bool> testNoUrlNormalise; // test hook (teeth): true = the typed text is used as is
+    // Pure: one attempt log line. code 0 = no response (connect failed).
+    static juce::String attemptLine (const juce::String& url, bool connected, int code, juce::int64 elapsedMs,
+                                     int timeoutMs, const juce::String& timeText);
     static bool gateRequest (juce::String& base);
     // A take whose rename kept failing stays in "<name>.part". takeNameOf gives the
     // take's name for either file: the file name without a trailing ".part".
@@ -561,7 +582,7 @@ public:
 
 private:
     void run() override;
-    bool heartbeat (juce::String& body, juce::String& err);
+    bool heartbeat (juce::String& body, juce::String& err, juce::String& attempt);
     // HTTP on the worker thread. code 0 = connection failed. fileField empty = no upload.
     int request (const juce::String& method, const juce::String& path, const juce::String& jsonBody,
                  const juce::String& fileField, const juce::File& file, const juce::String& formField,
@@ -742,11 +763,39 @@ public:
     // Loop on: the region repeats. Off: it plays to its end once. Takes effect at the
     // next pass through the end of the region.
     void setLoop (bool on) { loopOn.store (on, std::memory_order_relaxed); }
+    // Metronome, any thread: a click on every grid beat of the take while a clip plays
+    // (beats at downbeatSec + k * 60 / bpm, seconds of the take). Audition only: no
+    // render to file ever sees it. The click is added after the take gain and fades,
+    // so it stays audible at any gain. bpm <= 0 or not finite = no click.
+    void setClick (bool on, double bpm, double downbeatSec)
+    {
+        clickBpm.store (std::isfinite (bpm) ? bpm : 0.0, std::memory_order_relaxed);
+        clickDownbeat.store (std::isfinite (downbeatSec) ? downbeatSec : 0.0, std::memory_order_relaxed);
+        clickOn.store (on, std::memory_order_release);
+    }
+    static constexpr double kClickSeconds = 0.015, kClickHz = 1500.0;
+    static constexpr float kClickLevel = 0.3f;
+    std::atomic<bool> revSeamCropForTest { false }; // teeth: reverse plus loop mirrors in the crop (pre-roll forward)
+    std::atomic<bool> seamNoCorrForTest { false }; // teeth: the loop seam without the render's correlation law
+    // Audio thread only: the loop seam correlation (TakeEdit::seamRawCorrelation) for the seam it was measured on.
+    const float* seamKeySrc = nullptr;
+    int seamKeyStart = -1, seamKeyEnd = -1, seamKeyXf = -1, seamKeyRvS = 0, seamKeyRvE = 0, seamKeyLen = -1;
+    bool seamKeyRev = false;
+    double seamCorrUsed = 0.0;
+    std::atomic<bool> clickNoDownbeatForTest { false }; // teeth: the click ignores the grid offset
     // Any thread: moves the region of the clip that plays (frames of the file, as
     // play()). The audio thread takes it at its next block; a read position outside
     // the new region jumps to its start with a crossfade of the fade length.
     // play() sets it too. end <= start or length <= 0 = the whole take.
     void setRegion (juce::int64 start, juce::int64 end, juce::int64 length);
+    // F1, any thread: the level shaping of the take (TakeEdit::EditData fades, loop
+    // xfade and gain) and the crop region it hangs on (frames of the file, as play()).
+    // The audio thread takes it at its next block: sine fades at the crop start and
+    // end, an equal power crossfade of that length at the loop wrap (0 = the short
+    // built-in one), and the gain on the clip.
+    // reverse: the crop region reads backwards (before the fades and gain).
+    void setLevel (juce::int64 cropStart, juce::int64 cropEnd, juce::int64 length, double fadeInMs, double fadeOutMs,
+                   double loopXfadeMs, double gainDb, bool reverse = false);
     // Pure: the region packed as two 32-bit fractions of the take (lo = start, hi = end).
     static juce::uint64 packRegion (juce::int64 start, juce::int64 end, juce::int64 length);
     State getState() const;
@@ -805,7 +854,12 @@ private:
 
     std::atomic<double> rate { 48000.0 };
     std::atomic<bool> loopOn { false };
+    std::atomic<bool> clickOn { false };
+    std::atomic<double> clickBpm { 0.0 }, clickDownbeat { 0.0 };
     std::atomic<juce::uint64> regionReq { 0xFFFFFFFF00000000ull }; // packRegion(), see setRegion()
+    std::atomic<juce::uint64> cropReq { 0xFFFFFFFF00000000ull };   // packRegion() of the crop, see setLevel()
+    std::atomic<float> fadeInMsReq { 0.0f }, fadeOutMsReq { 0.0f }, loopXfadeMsReq { 0.0f }, levelGainReq { 1.0f };
+    std::atomic<bool> reverseReq { false };
     std::atomic<double> playFrac { -1.0 }; // audio thread writes, see getPlayFraction()
     std::atomic<int> generation { 0 };
     std::atomic<Clip*> requested { nullptr };
@@ -877,19 +931,22 @@ namespace TakeGrid
         juce::String key;      // the take's file name: the same before and after its lasting copy
         juce::String label;    // key without its extension, painted in the cell
         int jobId = 0, takeIndex = 0;
+        int number = 0;        // D2: HslinkTakeEntry::number, painted as T<number>
         juce::File temp, stable;
         juce::File file;       // what audition, star and Export act on: stable when saved, else temp
         bool shown = false;    // false: filtered out (another queue card, or teeth)
         bool saved = false;    // stable is set (a verified lasting copy was made)
         bool badge = false;    // NOT SAVED: a lasting-copy attempt failed
         bool pending = false;  // no lasting copy yet and no failed attempt (no badge)
-        bool dragAllowed = false; // == saved
+        bool dragAllowed = false; // == saved and not missing
+        bool missing = false;     // D-fix: HslinkTakeEntry::missing (restored, file gone): dimmed, no audition/edit/export/drag
         bool selected = false, starred = false;
         int tempoState = HslinkTakeEntry::tempoNotMeasured; // HslinkTakeEntry::TempoState
         TempoMeasure::Result tempo;                         // meaningful in state measured
         TempoResolve::Resolved resolved;                    // the tempo of the grid and its source (HslinkTakeEntry::resolvedTempo)
         double durationS = 0.0;                             // HslinkTakeEntry::durationS, 0 = unknown
         int fitScore = -1;                                  // fitToBarsScore at the host tempo, -1 = no score (set by the editor)
+        TakeEdit::GridEdit gridEdit;                        // R1b: HslinkTakeEntry::gridEdit
     };
     // Fit to bars. Pure. How well a take lines up with whole host bars at the host tempo,
     // 0..100, -1 = no score (no host tempo, no length, or a bad argument).
@@ -927,6 +984,9 @@ namespace TakeGrid
     // The fit tag of a take cell: "fit 87", green at 80 and up, amber at 50 and up, else
     // red. score < 0: an empty tag.
     TempoTag fitTagOf (int score);
+    // The take length painted in a grid cell: under 60 s one decimal ('4.0 s'), else m:ss
+    // rounded to the second ('1:15'). {} for an unknown length (0 or less).
+    juce::String lengthTextOf (double seconds);
     struct Model
     {
         std::vector<Cell> cells;  // one per take entry, in list order, shown or not
@@ -936,13 +996,20 @@ namespace TakeGrid
     // Test only. true = the old per-take existsAsFile filter in build (and the old
     // stats in the editor's paint and Export enable), through EditorFs so it is counted.
     extern std::atomic<bool> testEditorStats;
+    // readouts1 teeth: 1 = lengthTextOf never uses m:ss; 2 = the cell length plate skips its tempo-plate check.
+    extern std::atomic<int> testLengthMutant;
+    // Test only (teeth MISSING_IGNORED). true = build drops HslinkTakeEntry::missing (the old grid).
+    extern std::atomic<bool> testMissingIgnored;
     // Test only (teeth THUMB_FROM_LASTING). true = the old thumbnail source: Cell::file,
     // which is the lasting copy for a saved take.
     extern std::atomic<bool> testThumbFromLasting;
     // The file a cell's waveform thumbnail reads: always the take's temp copy, never the
     // lasting one (JUCE opens the source on the message thread, and again per pixel
     // column in paint for a very short take). Empty temp = no source, a blank waveform.
+    // When the temp copy is gone (temp cleanup) and the lasting one exists: the lasting one.
     juce::File thumbSourceOf (const Cell& c);
+    // Test only (teeth NO_THUMB_FALLBACK). true = the old source: always Cell::temp.
+    extern std::atomic<bool> testNoThumbFallback;
     // Test only (teeth NO_TEMP_FALLBACK). true = the old behaviour: a click and Export
     // use Cell::file only, with no fallback to the temp copy.
     extern std::atomic<bool> testNoTempFallback;
@@ -956,6 +1023,39 @@ namespace TakeGrid
     // selected: the audition selection (a path; compared, never opened).
     Model build (const std::vector<HslinkTakeEntry>& takes, int selectedJob, bool showUnsaved,
                  const juce::File& selected, const std::function<bool (const juce::File&)>& isStarred);
+}
+
+// Peak guard (KNOWN_ISSUES (e)): backend takes can arrive over 0 dBFS. On import
+// (download complete, before the take is recorded) and on Export WAV the file is
+// measured (4x oversampled true peak estimate) and, when it is over the ceiling,
+// rewritten with one static gain so it sits at the ceiling. Gain only, no limiter,
+// never a boost. Idempotent: a guarded file measures at or under the ceiling, so a
+// second pass on it (re-import, re-export) applies nothing. Message or worker
+// thread only: reads and writes whole files.
+namespace PeakGuard
+{
+    constexpr float kCeilingDbtp = -1.0f;
+    constexpr float kMarginDb = 0.05f;   // headroom for the estimate's own error
+    extern std::atomic<bool> enabled;    // default on
+    // Level mode (user setting, saved in plugin state; KNOWN_ISSUES row 15).
+    // Off: files untouched. Guard (default): cut only, as before. Normalise: one
+    // static gain that brings the true peak to the ceiling, boost or cut.
+    enum Mode { kOff = 0, kGuard = 1, kNormalise = 2 };
+    extern std::atomic<int> mode;
+    // Pure: gain in dB for a true peak under a mode (0 = nothing to do).
+    float gainForMode (float truePeakDbtp, int mode);
+    // Pure: 4x oversampled true peak estimate in dBTP (-200 for silence).
+    float truePeakDb (const juce::AudioBuffer<float>& buf);
+    // Pure: the gain in dB (<= 0) that brings truePeak to the ceiling; 0 when under.
+    float gainForPeak (float truePeakDbtp);
+    // Applies the guard to a WAV file in place. Returns the gain applied in dB
+    // (0 = nothing done: under the ceiling, disabled, or unreadable).
+    float applyToFile (const juce::File& wav);
+    // Export: guards dest, but never when dest is the source itself (the take is
+    // never rewritten in place by an export; import already guarded it).
+    float applyToExport (const juce::File& src, const juce::File& dest);
+    // "Peak guard -2.2 dB" (cut) or "Normalise +6.0 dB" (boost), empty for 0.
+    juce::String text (float gainDb);
 }
 
 // R6: stable take folder. Hosts reference dragged files after the plugin
@@ -1056,6 +1156,12 @@ public:
     // frames of that file, see TakeEdit::EditData; bad values are taken out). Nothing is
     // rendered and the file is not touched. false = not listed. Never throws.
     bool setTakeEdit (const juce::File& tempFile, const TakeEdit::EditData& edit);
+    // R1b: stores the hand-set beatgrid of the listed take (set false = back to the
+    // detected grid). A set grid that is not usable (TakeEdit::gridUsable) is stored as
+    // not set. false = not listed. requestTakeEdit snaps on it when set. Never throws.
+    bool setTakeGrid (const juce::File& tempFile, const TakeEdit::GridEdit& grid);
+    // C1: the warp the take editor left on the take (markers empty = automatic). false = not listed.
+    bool setTakeWarp (const juce::File& tempFile, const std::vector<WarpMarkers::Marker>& markers, bool edited, double tagBpm);
     // What a finished edit job did. ticket is the number requestTakeEdit gave for that
     // job. serial counts the finished jobs (0 = none yet). gridSkipped: snap to grid was
     // asked for but the take has no valid measured tempo, so the points were used as
@@ -1092,6 +1198,10 @@ public:
     // Standalone dev shot hook (--shot-load): list a WAV already on disk as a saved take
     // at the front of the list (take 0), as the edit-result path lists a rendered take.
     bool addShotTake (const juce::File& wav);
+    // "Add as take..." / a WAV dropped on the TAKES list uses the same path. Test mutant
+    // (teeth), 0 in the plugin: mutAddTakeWrongRate = length counted at the host rate.
+    enum AddTakeMutant { mutAddTakeNone = 0, mutAddTakeWrongRate = 1 };
+    static std::atomic<int> addTakeMutantForTest;
     // Queues a crop or loop render (TakeEdit) of the listed take with this temp file on
     // the pool thread of the stretch (one heavy take job at a time). Any thread but the
     // audio thread; returns at once with the job's ticket (never 0), the key of its
@@ -1142,6 +1252,22 @@ public:
     // root per starred take). testDtorLastingProbes counts those lasting-root probes;
     // the shipped destructor makes none.
     static std::atomic<bool> testDtorProbesLasting;
+    // Teeth only (D2). testMergeOnLoad = the old merge: a loaded state adds to the live
+    // takes instead of replacing them. testRenumberTakes = numbers follow list position
+    // (1..n, oldest first) instead of staying with the take.
+    static std::atomic<bool> testMergeOnLoad;
+    static std::atomic<bool> testRenumberTakes;
+    // Teeth only (D2c). true = the old rule: a derived take (crop, loop, stretch) keeps
+    // its parent's number instead of getting a fresh one on top.
+    static std::atomic<bool> testDerivedInheritsNum;
+    // Teeth only. true = writeTakesState drops the measured tempo of every take.
+    static std::atomic<bool> testDropTakeTempoOnSave;
+    // Tests only: every take remeasure gives no number (as a failed detection).
+    static std::atomic<bool> testFailRemeasure;
+    // Teeth only: derived takes get no estimated tempo (the old 'tempo ?').
+    static std::atomic<bool> testNoDerivedEstimate;
+    // Teeth only: a stretch take whose name gives its target tempo is still marked est.
+    static std::atomic<bool> testStretchEst;
     static std::atomic<int> testDtorLastingProbes;
     // false (teeth only) = the worker is told to end only after the wait for the
     // collection pool, as before.
@@ -1170,6 +1296,12 @@ public:
     // and the file published, without waking the saver thread (as if the process died
     // there). A timed retry pass of the saver can still copy the take.
     static std::atomic<bool> testStopAfterRecord;
+    // teeth TS_NO_WRITE: writeTakesState writes no Takes child (the state before C1).
+    static std::atomic<bool> testNoTakesWrite;
+    // teeth TS_TRUST_EXT: readTakesState trusts the saved ext flag for a file outside the takes root.
+    static std::atomic<bool> testTrustExt;
+    // teeth TS_SKIP_EXTERNAL: writeTakesState skips external (Add as take) takes, the pre-fix bug.
+    static std::atomic<bool> testSkipExternalTakes;
     // false = the old order (teeth only): publish, copy, and only then add the entry.
     // With testStopAfterRecord also set, the old order returns after the publish and
     // before the copy and the entry (as if the process died while the copy ran).
@@ -1413,6 +1545,9 @@ public:
     bool prepareSourceJob (DawJobRequest& r, double manualStartS, double manualEndS, juce::String& err) const;
 
     juce::AudioProcessorValueTreeState apvts;
+    // Server id of the backend param ("" = Auto, "sa3", "ace", "minimax-m3", ...). Message thread.
+    juce::String getSelectedBackendId() const;
+    static juce::String backendIdForIndex (int index);
     HostSyncState hostSync;
     CaptureEngine capture;
     DawWorker daw;
@@ -1444,6 +1579,10 @@ public:
     static const char* keyName (int index); // 1..24 -> "C major" .. "B minor"; else nullptr
     juce::int64 getSeed() const;            // -1 = random
     void setSeed (juce::int64 seed);
+    // Level mode for imported/exported takes (PeakGuard::Mode), saved in plugin
+    // state. Message thread. Default PeakGuard::kGuard.
+    int getPeakMode() const;
+    void setPeakMode (int mode);
     int getKeyIndex() const;                // 0 = Auto
     void setKeyIndex (int index);
     juce::String getCaption() const;        // stored in state, not automatable
@@ -1455,6 +1594,8 @@ public:
     // Bumped (message thread) on every setStateInformation so an open editor
     // reloads caption/lyrics/seed/key/instrumental without echoing writes back.
     juce::uint32 getStateGeneration() const { return stateGeneration.load(); }
+    // D2: changes each time a loaded state replaced the take list (host state wins).
+    juce::uint32 getTakesRestoreGeneration() const { return takesRestoreGeneration.load(); }
 
     // Mode combo id (1 text2music, 2 repaint, 3 lego) and standalone BPM:
     // UI settings kept with the text state so A/B and presets carry them.
@@ -1540,10 +1681,15 @@ private:
     bool otherSlotSet = false;        // under textLock
     juce::File presetFolder;          // empty = default app-data folder
     std::atomic<juce::uint32> stateGeneration { 0 };
+    std::atomic<juce::uint32> takesRestoreGeneration { 0 }; // D2: bumped when readTakesState replaces the take list
     void writeTextState (juce::ValueTree& state) const;
     void readTextState (juce::ValueTree& state);
     void writeSlotState (juce::ValueTree& state) const;
     void readSlotState (juce::ValueTree& state);
+    // C1: the Takes child (v=1): every listed take with a lasting copy, restored on load
+    // with temp = stable (no copy, no re-measure). Unknown version or a bad child: ignored.
+    void writeTakesState (juce::ValueTree& state) const;
+    void readTakesState (juce::ValueTree& state);
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     bool standalone = false;
@@ -1564,6 +1710,8 @@ private:
     juce::int64 previewClock = 0;     // audio thread
     bool lastPreviewPlay = false;     // audio thread
     void trimTakesLocked();
+    int nextTakeNumber = 1;            // takesLock; D2: the number the next listed take gets
+    void numberTakeLocked (TakeEntry& e); // takesLock held; gives e a number once (number > 0 is kept)
     void syncStarMirror();             // message thread, after any change to the starred list
     // result: Aborted when the processor is closing (no attempt started, or the copy
     // stopped between two file calls).
@@ -1639,6 +1787,7 @@ private:
     };
     std::shared_ptr<MeasureGate> measureGate { std::make_shared<MeasureGate>() };
     void storeTakeTempo (const juce::File& tempFile, bool measured, const TempoMeasure::Result& r);
+    static double derivedTempoOf (const TakeEntry& src);
     juce::ThreadPool measurePool { 1 };    // take tempo measurements only; stopped before the pools above
     std::deque<TakeEditReport> takeEditReports; // takesLock; newest last, at most kTakeEditReportsKept
     int takeEditSerial = 0;                // takesLock
@@ -1654,9 +1803,10 @@ private:
 // ACE model settings. Pure, no state of their own.
 namespace RoleCards
 {
-    enum Card { kNone = -1, kSa3 = 0, kYue2 = 1, kAce = 2, kCount = 3 };
-    // Backend param indices ("Auto", "SA3", "YuE2", "ACE") and ACE model Base.
-    constexpr int kBackendAuto = 0, kBackendSa3 = 1, kBackendYue2 = 2, kBackendAce = 3, kAceModelBase = 2;
+    enum Card { kNone = -1, kSa3 = 0, kYue2 = 1, kAce = 2, kMinimax = 3, kHeartmula = 4, kCount = 5 };
+    // Backend param indices ("Auto", "SA3", "YuE2", "ACE", "MiniMax-M3", "HeartMuLa") and ACE model Base.
+    constexpr int kBackendAuto = 0, kBackendSa3 = 1, kBackendYue2 = 2, kBackendAce = 3,
+                  kBackendMinimax = 4, kBackendHeartmula = 5, kAceModelBase = 2;
     const char* title (int card);
     const char* subtitle (int card);
     // The settings after clicking a card. Unknown card = unchanged.

@@ -13,8 +13,8 @@
 // MIDI export of one take: two type 1 files at kPpq.
 //   <name>_tempo.mid: tempo, time signature and a "Bar N" marker at every bar start.
 //   <name>_hits.mid:  one GM drum note (channel 10) per detected onset, the note from
-//                     classifyDrum (kick 36, snare 38, closed hat 42, open hat 46, other
-//                     39), velocity from the onset peak relative to the take's loudest hit.
+//                     classifyHits (kick 36, snare 38, closed hat 42, open hat 46, low
+//                     tom 45, high tom 50, crash 49, ride 51), velocity from the onset peak relative to the take's loudest hit.
 // Tick 0 is the file start; ticks are seconds through the tempo map (one fixed tempo
 // when the map is empty, else one tempo event per warp segment). Message thread or a
 // worker thread, never the audio thread.
@@ -29,6 +29,7 @@ namespace MidiExport
     constexpr double kDefaultBpm = 120.0; // hits timing when the take has no usable tempo
 
     constexpr int kKickNote = 36, kSnareNote = 38, kClosedHatNote = 42, kOpenHatNote = 46, kPercNote = 39;
+    constexpr int kLowTomNote = 45, kHighTomNote = 50, kCrashNote = 49, kRideNote = 51;
     constexpr int kVelMin = 30;            // a hit kVelRangeDb below the loudest one
     constexpr double kVelRangeDb = 36.0;   // loudest hit 127, this far below -> kVelMin
 
@@ -138,8 +139,12 @@ namespace MidiExport
         return f;
     }
 
-    // GM drum note for a hit's features: mostly low = kick, mostly high = hat (open when
-    // the highs ring past 120 ms), mid with some highs = snare, else other perc.
+    // GM drum note for a hit's features (absolute band split of the first 50 ms):
+    // mostly low = kick; mostly high = hat or cymbal by how long the highs ring (closed
+    // hat, open hat past 120 ms, ride past 250 ms with some mid bell, crash past 350 ms);
+    // mid-heavy with real lows and few highs = tom (low tom when the lows are strong);
+    // mid with some highs = snare; anything else falls back to snare (mid-heavy) or
+    // closed hat, never a catch-all one note.
     // Teeth (HSLINK_TEETH=MIDI_ONE_NOTE): every hit on kHitNote, absolute velocity.
     inline int classifyDrum (const DrumFeatures& f)
     {
@@ -150,11 +155,70 @@ namespace MidiExport
         if (f.low >= 0.5)
             return kKickNote;
         if (f.high >= 0.45)
+        {
+            if (f.decaySec > 0.35) return kCrashNote;
+            if (f.decaySec > 0.25 && f.mid >= 0.2) return kRideNote;
             return f.decaySec > 0.12 ? kOpenHatNote : kClosedHatNote;
+        }
+        if (f.mid >= 0.6 && f.low >= 0.15 && f.high < 0.03)
+            return f.low >= 0.3 ? kLowTomNote : kHighTomNote;
         if (f.high >= 0.03 && f.low < 0.35)
             return kSnareNote;
-        return kPercNote;
+        return f.mid >= 0.5 ? kSnareNote : kClosedHatNote;
 #endif
+    }
+
+    // Notes for all hits of a take. A full mix carries bass under every onset, so the
+    // absolute split can put every hit in one class (Alex 2026-11-10: "just c note").
+    // When 4 or more hits all land on one note and their features actually vary, the
+    // hits are re-classed relative to the take's median band split: clearly more low
+    // than typical = kick, clearly more high = hat (open when the highs ring past
+    // 120 ms), clearly more mid with fewer highs = snare, the rest closed hat.
+    // Deterministic: depends only on the features, in order.
+    inline std::vector<int> classifyHits (const std::vector<DrumFeatures>& fs)
+    {
+        std::vector<int> notes;
+        notes.reserve (fs.size());
+        for (const auto& f : fs)
+            notes.push_back (classifyDrum (f));
+#if ! defined (HSLINK_TEETH_MIDI_ONE_NOTE)
+        if (fs.size() < 4)
+            return notes;
+        bool allSame = true;
+        for (int n : notes)
+            allSame = allSame && n == notes.front();
+        if (! allSame)
+            return notes;
+        auto median = [&fs] (double DrumFeatures::* m)
+        {
+            std::vector<double> v;
+            for (const auto& f : fs) v.push_back (f.*m);
+            std::sort (v.begin(), v.end());
+            const size_t h = v.size() / 2;
+            return v.size() % 2 ? v[h] : 0.5 * (v[h - 1] + v[h]);
+        };
+        const double mLow = median (&DrumFeatures::low), mMid = median (&DrumFeatures::mid), mHigh = median (&DrumFeatures::high);
+        double spread = 0.0;
+        for (const auto& f : fs)
+            spread = std::max ({ spread, std::abs (f.low - mLow), std::abs (f.high - mHigh) });
+        if (spread < 0.02) // the same sound every time: one note is right
+            return notes;
+        const double t = std::max (0.02, 0.25 * spread);
+        for (size_t i = 0; i < fs.size(); ++i)
+        {
+            const auto& f = fs[i];
+            const double dl = f.low - mLow, dm = f.mid - mMid, dh = f.high - mHigh;
+            if (dl > t && dl >= dh)
+                notes[i] = kKickNote;
+            else if (dh > t)
+                notes[i] = f.decaySec > 0.12 ? kOpenHatNote : kClosedHatNote;
+            else if (dm > t || (dl < -t && dh >= 0.0))
+                notes[i] = kSnareNote;
+            else
+                notes[i] = kClosedHatNote;
+        }
+#endif
+        return notes;
     }
 
     // Hits from onset times in a take: per onset the peak over kPeakWindowSec and a GM
@@ -162,6 +226,7 @@ namespace MidiExport
     inline std::vector<Hit> hitsFromOnsets (const juce::AudioBuffer<float>& buf, double sr, const std::vector<double>& secs)
     {
         std::vector<Hit> out;
+        std::vector<DrumFeatures> feats;
         std::vector<float> mono;
         const int nCh = buf.getNumChannels(), nS = buf.getNumSamples();
         const float g = 1.0f / (float) std::max (1, nCh);
@@ -185,9 +250,12 @@ namespace MidiExport
             for (int ch = 0; ch < nCh; ++ch)
                 if (pb > a)
                     h.peak = std::max (h.peak, buf.getMagnitude (ch, a, pb - a));
-            h.note = classifyDrum (drumFeatures (mono.data(), (int) mono.size(), sr));
+            feats.push_back (drumFeatures (mono.data(), (int) mono.size(), sr));
             out.push_back (h);
         }
+        const auto notes = classifyHits (feats);
+        for (size_t k = 0; k < out.size(); ++k)
+            out[k].note = notes[k];
         return out;
     }
 
@@ -594,22 +662,50 @@ namespace MidiExport
     constexpr double kPitchHopSec = 256.0 / 44100.0;  // hop (256 at 44.1 kHz)
     constexpr double kPitchMinHz = 40.0, kPitchMaxHz = 1500.0;
     constexpr double kYinThresh = 0.15;      // CMNDF dip under this = confident pitch
+    constexpr double kOctaveSlack = 0.1;     // prefer tau/2 when its dip is this close to the best
     constexpr double kPitchGateDb = -50.0;   // frames quieter than this (RMS dBFS) are unpitched
     constexpr double kMinNoteSec = 0.06;     // a note holds its pitch at least this long
     constexpr double kTonalFraction = 0.4;   // over this share of frames pitched = tonal take
     constexpr int kNoteChannel = 1;
 
-    struct PitchNote { double sec = 0.0, durSec = 0.0; int note = 60; float rms = 0.0f; };
+    // Note velocity from the level: peak RMS in the first 50 ms, -30 dB -> 20, 0 dB -> 127.
+    inline int velocityForLevel (double rmsPeak)
+    {
+        if (! (rmsPeak > 0.0))
+            return 1;
+        const double db = 20.0 * std::log10 (rmsPeak);
+        return juce::jlimit (1, 127, (int) std::lround (20.0 + (db + 30.0) / 30.0 * 107.0));
+    }
+
+    // vel 0 = velocity relative to the loudest note (from rms); 1..127 = absolute.
+    struct PitchNote { double sec = 0.0, durSec = 0.0; int note = 60; float rms = 0.0f; int vel = 0; };
     struct PitchTrack { std::vector<PitchNote> notes; double pitchedFraction = 0.0; };
+
+    // Melody tracker settings (defaults follow the export plan).
+    struct MelodyParams
+    {
+        int smoothFrames = 5;          // median window in frames (odd), 1 = off
+        double hystCents = 70.0;       // a new note needs at least this far from the held one
+        double holdSec = 0.04;         // ... for at least this long
+        double gapSec = 0.06;          // pitch lost longer than this ends the note
+        double decayDb = 20.0;         // RMS this far under the note's peak ends the note
+        double mergeGapSec = 0.05;     // same-pitch notes closer than this merge (no onset between)
+        double onsetSnapSec = 0.03;    // an onset this far before a pitch run moves its start
+        double velocitySec = 0.05;     // velocity from the peak RMS in this span
+    };
 
     inline double hzToMidi (double hz) { return 69.0 + 12.0 * std::log2 (hz / 440.0); }
 
-    // Monophonic YIN pitch tracking on mono x (decimated to about 11 kHz first, so the
-    // cost stays low on long takes), then notes: runs of confident frames on one
-    // semitone, split when the rounded pitch changes for 3 frames running or at an
-    // onset (onsetSecs, may be empty), kept when at least kMinNoteSec long.
+    // Monophonic YIN melody tracking on mono x (decimated to about 11 kHz first, so the
+    // cost stays low on long takes). Per frame: pitch with an octave check, then a median
+    // over smoothFrames, then hysteresis (a new note needs hystCents for holdSec).
+    // A note ends when pitch is lost for over gapSec, the RMS falls decayDb under its
+    // peak, or at an onset (onsetSecs, may be empty). Short gaps are bridged, same-pitch
+    // neighbours closer than mergeGapSec with no onset between are merged, and notes
+    // shorter than kMinNoteSec are dropped. Pitch = median of the note's frames.
     // pitchedFraction = confident frames / all frames (silence counts as unpitched).
-    inline PitchTrack trackNotes (const float* x, int n, double sr, const std::vector<double>& onsetSecs = {})
+    inline PitchTrack trackMelody (const float* x, int n, double sr, const std::vector<double>& onsetSecs = {},
+                                   const MelodyParams& prm = {})
     {
         PitchTrack out;
         if (x == nullptr || n <= 0 || ! (sr > 0.0))
@@ -680,6 +776,16 @@ namespace MidiExport
                 }
             if (best < 0)
                 continue;
+            // Octave check: a dip near best/2 close to the best one = the higher octave.
+            {
+                const int hh = (int) std::lround (best * 0.5);
+                int hb = -1;
+                for (int tau = std::max (minTau, hh - 1); tau <= std::min (maxTau - 1, hh + 1); ++tau)
+                    if (hb < 0 || d[(size_t) tau] < d[(size_t) hb])
+                        hb = tau;
+                if (hb > minTau && hb < best && d[(size_t) hb] <= d[(size_t) best] + kOctaveSlack)
+                    best = hb;
+            }
             double t = (double) best;
             {
                 const double a0 = d[(size_t) best - 1], a1 = d[(size_t) best], a2 = d[(size_t) best + 1];
@@ -694,83 +800,189 @@ namespace MidiExport
             ++pitched;
         }
         out.pitchedFraction = (double) pitched / (double) nF;
+        // Median smoothing over pitched frames only (unpitched frames stay unpitched).
+        std::vector<double> sm (midi);
+        if (prm.smoothFrames > 1)
+        {
+            const int hw = prm.smoothFrames / 2;
+            std::vector<double> win;
+            for (int f = 0; f < nF; ++f)
+            {
+                if (midi[(size_t) f] < 0.0)
+                    continue;
+                win.clear();
+                for (int g = std::max (0, f - hw); g <= std::min (nF - 1, f + hw); ++g)
+                    if (midi[(size_t) g] >= 0.0)
+                        win.push_back (midi[(size_t) g]);
+                std::nth_element (win.begin(), win.begin() + (long) (win.size() / 2), win.end());
+                sm[(size_t) f] = win[win.size() / 2];
+            }
+        }
         // Frame f stands for its window start: YIN only turns confident once the window's
         // integration span lies inside the new note (window centre measured ~22 ms late).
-        auto frameSec = [&] (int f) { return (double) f * hop / dsr; };
+        const double frameDt = (double) hop / dsr;
+        auto frameSec = [&] (int f) { return (double) f * frameDt; };
+        auto framesFor = [&] (double s) { return std::max (1, (int) std::ceil (s / frameDt - 1.0e-9)); };
+        const int holdF = framesFor (prm.holdSec);
+        const int gapF = std::max (0, (int) std::floor (prm.gapSec / frameDt + 1.0e-9));
+        const double hyst = std::max (0.0, prm.hystCents) / 100.0;
+        const double decay = std::pow (10.0, -std::max (0.0, prm.decayDb) / 20.0);
+        const int velF = framesFor (prm.velocitySec);
         std::vector<char> split ((size_t) nF, 0);
-        for (double s : onsetSecs)
+        std::vector<double> ons (onsetSecs);
+        std::sort (ons.begin(), ons.end());
+        for (double s : ons)
         {
-            const int f = (int) std::lround (s * dsr / hop);
+            const int f = (int) std::lround (s / frameDt);
             if (f > 0 && f < nF)
                 split[(size_t) f] = 1;
         }
-        int start = -1, cur = -1, pend = 0, pendStart = -1;
+        std::vector<PitchNote> raw;
+        int start = -1, cur = -1, pend = 0, pendStart = -1, pendNote = -1;
+        double peak = 0.0, quietBelow = 0.0;
         auto close = [&] (int endF)
         {
             if (start >= 0 && endF > start)
             {
-                const double s0 = frameSec (start), s1 = frameSec (endF);
-                if (s1 - s0 >= kMinNoteSec - 1.0e-9)
+                std::vector<double> ms;
+                double e = 0.0, vpk = 0.0;
+                for (int f = start; f < endF; ++f)
                 {
-                    std::vector<double> ms;
-                    double e = 0.0;
-                    for (int f = start; f < endF; ++f)
-                    {
-                        if (midi[(size_t) f] >= 0.0)
-                            ms.push_back (midi[(size_t) f]);
-                        e += rms[(size_t) f] * rms[(size_t) f];
-                    }
+                    if (midi[(size_t) f] >= 0.0)
+                        ms.push_back (midi[(size_t) f]);
+                    e += rms[(size_t) f] * rms[(size_t) f];
+                    if (f < start + velF)
+                        vpk = std::max (vpk, rms[(size_t) f]);
+                }
+                if (! ms.empty())
+                {
                     std::nth_element (ms.begin(), ms.begin() + (long) (ms.size() / 2), ms.end());
                     PitchNote pn;
-                    pn.sec = s0;
-                    pn.durSec = s1 - s0;
+                    pn.sec = frameSec (start);
+                    pn.durSec = frameSec (endF) - pn.sec;
                     pn.note = juce::jlimit (0, 127, (int) std::lround (ms[ms.size() / 2]));
                     pn.rms = (float) std::sqrt (e / (endF - start));
-                    out.notes.push_back (pn);
+                    pn.vel = velocityForLevel (vpk);
+                    raw.push_back (pn);
                 }
             }
             start = -1;
             cur = -1;
             pend = 0;
+            peak = 0.0;
+        };
+        auto open = [&] (int f, int note)
+        {
+            start = f;
+            cur = note;
+            pend = 0;
+            peak = rms[(size_t) f];
         };
         int gap = 0;
         for (int f = 0; f < nF; ++f)
         {
-            const double mf = midi[(size_t) f];
+            const double mf = sm[(size_t) f];
             if (mf < 0.0)
             {
-                if (start >= 0 && ++gap > 2)
+                ++gap;
+                if (start >= 0 && gap > gapF)
                     close (f - gap + 1);
+                if (start < 0 && gap > gapF)
+                    quietBelow = 0.0;
                 continue;
             }
+            const double lv = rms[(size_t) f];
+            if (start < 0 && lv < quietBelow)
+                continue; // still the decayed tail of the last note
+            quietBelow = 0.0;
             gap = 0;
             const int r = (int) std::lround (mf);
             if (start >= 0 && split[(size_t) f])
                 close (f);
             if (start < 0)
             {
-                start = f;
-                cur = r;
-                pend = 0;
+                open (f, r);
                 continue;
             }
-            if (r == cur)
+            peak = std::max (peak, lv);
+            if (lv < peak * decay)
+            {
+                quietBelow = peak * decay;
+                close (f);
+                continue;
+            }
+            if (r == cur || std::abs (mf - (double) cur) < hyst)
             {
                 pend = 0;
                 continue;
             }
-            if (pend == 0)
+            if (pend == 0 || r != pendNote)
+            {
                 pendStart = f;
-            if (++pend >= 3)
+                pendNote = r;
+                pend = 0;
+            }
+            if (++pend >= holdF)
             {
                 close (pendStart);
-                start = pendStart;
-                cur = r;
+                open (pendStart, r);
+                for (int g = pendStart; g <= f; ++g)
+                    peak = std::max (peak, rms[(size_t) g]);
             }
         }
         if (start >= 0)
             close (nF - gap);
+        // Merge same-pitch neighbours across short gaps with no onset between.
+        auto onsetIn = [&] (double a, double b)
+        {
+            auto it = std::upper_bound (ons.begin(), ons.end(), a);
+            return it != ons.end() && *it <= b;
+        };
+        std::vector<PitchNote> merged;
+        for (const auto& nt : raw)
+        {
+            if (! merged.empty())
+            {
+                auto& pv = merged.back();
+                const double pEnd = pv.sec + pv.durSec;
+                if (pv.note == nt.note && nt.sec - pEnd < prm.mergeGapSec && ! onsetIn (pEnd - frameDt, nt.sec))
+                {
+                    const double total = pv.durSec + nt.durSec;
+                    if (total > 0.0)
+                        pv.rms = (float) std::sqrt ((pv.rms * pv.rms * pv.durSec + nt.rms * nt.rms * nt.durSec) / total);
+                    pv.durSec = nt.sec + nt.durSec - pv.sec;
+                    continue;
+                }
+            }
+            merged.push_back (nt);
+        }
+        // Onset snap (an onset shortly before a pitch run starts the note), then the minimum length.
+        double prevEnd = -1.0e300;
+        for (auto nt : merged)
+        {
+            auto it = std::upper_bound (ons.begin(), ons.end(), nt.sec);
+            if (it != ons.begin())
+            {
+                const double o = *(it - 1);
+                if (nt.sec - o <= prm.onsetSnapSec && o >= prevEnd)
+                {
+                    nt.durSec += nt.sec - o;
+                    nt.sec = o;
+                }
+            }
+            if (nt.durSec >= kMinNoteSec - 1.0e-9)
+            {
+                out.notes.push_back (nt);
+                prevEnd = nt.sec + nt.durSec;
+            }
+        }
         return out;
+    }
+
+    // Older entry point, kept for callers and tests: the melody tracker with default settings.
+    inline PitchTrack trackNotes (const float* x, int n, double sr, const std::vector<double>& onsetSecs = {})
+    {
+        return trackMelody (x, n, sr, onsetSecs);
     }
 
     // Simple drums-vs-tonal rule: tonal when over kTonalFraction of all frames hold a
@@ -799,16 +1011,24 @@ namespace MidiExport
         return out;
     }
 
-    // Notes file: a tempo track and one note track named trackName (channel 1),
-    // velocity from segment RMS relative to the loudest note.
+    // Notes file: a tempo track and one note track named trackName (channel 1).
+    // Velocity: the note's own vel when set, else segment RMS relative to the loudest note.
+    // originTicks: the export origin (pass the same exportOriginTicks the hits file uses so
+    // both files line up). Starts quantize like the hits (quantDiv, quantStrength); ends
+    // snap to the grid when within a quarter step, and a note never overlaps the next one.
     inline juce::MidiFile buildNotesFile (const std::vector<PitchNote>& notes, const juce::String& trackName,
                                           double bpm, int beatsPerBar, int den = 4,
-                                          std::optional<KeySig> key = std::nullopt, const TempoMap& map = {})
+                                          std::optional<KeySig> key = std::nullopt, const TempoMap& map = {},
+                                          int quantDiv = 0, double quantStrength = 0.0, double originTicks = 0.0)
     {
         const double tps = ticksPerSecond (bpm);
         const bool useMap = map.size() >= 2;
         const auto st = useMap ? segTicks (map) : std::vector<double>();
-        auto toT = [&] (double s) { return useMap ? std::round (secToTicks (map, st, s)) : std::round (std::max (0.0, s) * tps); };
+        const double origin = std::isfinite (originTicks) ? std::max (0.0, originTicks) : 0.0;
+        auto toT = [&] (double s)
+        {
+            return std::max (0.0, (useMap ? std::round (secToTicks (map, st, s)) : std::round (std::max (0.0, s) * tps)) - origin);
+        };
         juce::MidiMessageSequence h;
         auto name = juce::MidiMessage::textMetaEvent (3, trackName);
         name.setTimeStamp (0.0);
@@ -816,18 +1036,43 @@ namespace MidiExport
         float loudest = 0.0f;
         for (const auto& nt : notes)
             loudest = std::max (loudest, nt.rms);
-        double last = 0.0;
+        struct Ev { double on, off; int note, vel; };
+        std::vector<Ev> evs;
+        const double grid = quantizeGridTicks (quantDiv);
+        const bool q = grid > 0.0 && quantStrength > 0.0;
         for (const auto& nt : notes)
         {
-            const double on = toT (nt.sec);
-            const double off = std::max (on + 1.0, toT (nt.sec + nt.durSec));
-            auto a = juce::MidiMessage::noteOn (kNoteChannel, nt.note, (juce::uint8) velocityRelative (nt.rms, loudest));
-            a.setTimeStamp (on);
-            auto b = juce::MidiMessage::noteOff (kNoteChannel, nt.note);
-            b.setTimeStamp (off);
+            double on = toT (nt.sec), off = toT (nt.sec + nt.durSec);
+            if (q)
+            {
+                on = std::max (0.0, std::round (quantizeTick (on, grid, 0.0, quantStrength)));
+                const double g = std::round (off / grid) * grid;
+                if (std::abs (g - off) <= 0.25 * grid)
+                    off = g;
+            }
+            const int vel = nt.vel > 0 ? nt.vel : velocityRelative (nt.rms, loudest);
+            evs.push_back ({ on, off, juce::jlimit (0, 127, nt.note), juce::jlimit (1, 127, vel) });
+        }
+        std::stable_sort (evs.begin(), evs.end(), [] (const Ev& a, const Ev& b) { return a.on < b.on; });
+        double last = 0.0;
+        for (size_t i = 0; i < evs.size(); ++i)
+        {
+            auto& e = evs[i];
+            if (i + 1 < evs.size())
+                e.off = std::min (e.off, evs[i + 1].on);
+            if (e.off < e.on + 1.0)
+            {
+                if (i + 1 < evs.size() && evs[i + 1].on <= e.on)
+                    continue; // quantized onto the same tick as the next note: keep the later one
+                e.off = e.on + 1.0;
+            }
+            auto a = juce::MidiMessage::noteOn (kNoteChannel, e.note, (juce::uint8) e.vel);
+            a.setTimeStamp (e.on);
+            auto b = juce::MidiMessage::noteOff (kNoteChannel, e.note);
+            b.setTimeStamp (e.off);
             h.addEvent (a);
             h.addEvent (b);
-            last = std::max (last, off);
+            last = std::max (last, e.off);
         }
         h.updateMatchedPairs();
         auto end = juce::MidiMessage::endOfTrack();
@@ -835,7 +1080,7 @@ namespace MidiExport
         h.addEvent (end);
         juce::MidiFile f;
         f.setTicksPerQuarterNote (kPpq);
-        f.addTrack (tempoTrack (bpm, beatsPerBar, den, key, map));
+        f.addTrack (tempoTrack (bpm, beatsPerBar, den, key, map, origin));
         f.addTrack (h);
         return f;
     }

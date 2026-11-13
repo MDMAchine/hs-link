@@ -10,15 +10,22 @@
 
 A VST3 plugin and Standalone application that connects a DAW (or desktop session) to a running local [HOT-Step](https://github.com/scragnog/HOT-Step-CPP) server. You type a caption, pick a mode, and the plugin sends a generation request over HTTP. Audio generation happens entirely in HOT-Step; the plugin handles host sync, capture, take playback, and drag-out.
 
-**Status: v0.5.18 beta, pre-release.** Rounds R1 through R6 pass the console test suite. Ableton Live was tested by hand on 2026-10-07. Reaper and Bitwig have not been tested by hand; see [Unverified sections](#unverified) below. An unsigned Windows zip (VST3, CLAP, Standalone, license file) is available; see [Install](#install). Code signing is not yet done. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for a summary of confirmed issues.
+**Status: v0.5.23 beta, pre-release.** Rounds R1 through R6 pass the console test suite. Ableton Live was tested by hand on 2026-10-07. Reaper and Bitwig have not been tested by hand; see [Unverified sections](#unverified) below. An unsigned Windows zip (VST3, CLAP, Standalone, license file) and an ad-hoc signed Mac zip (VST3, AU, CLAP, Standalone, universal: Apple Silicon and Intel) are available; see [Install](#install). Code signing is not yet done. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) for a summary of confirmed issues.
 
-**What is new in 0.5.16:** MIDI export (beta): drum hits plus tempo map, drag to DAW or Export MIDI.
+**What is new in 0.5.21 to 0.5.23:**
+- Backend picker with five backend cards, adding MiniMax-M3 and HeartMuLa, plus matching COLLECTION filter chips.
+- MIDI export drum notes use the General MIDI map, with a per-take fallback.
+- Per-take seeds (base seed + take index) and a Level option: Off, Peak guard, or Normalise to -1 dBTP.
+- QUEUE counts only queued and running jobs; the status pill names the selected backend.
+- Fixed: the MiniMax-M3 take card no longer sticks on loading.
+- Note: MiniMax-M3 may return longer audio than requested.
+- Mac build: VST3, AU, CLAP and Standalone, universal (Apple Silicon and Intel).
 
 ---
 
 ## Beta install
 
-HOT-STEP LINK 0.5.18 beta is a VST3/CLAP plugin and Standalone app that sends generation requests to a running local HOT-Step server and brings the takes back into your DAW. It makes no audio by itself: HOT-Step must be running and reachable (default `http://127.0.0.1:3001`).
+HOT-STEP LINK 0.5.23 beta is a VST3/CLAP plugin and Standalone app that sends generation requests to a running local HOT-Step server and brings the takes back into your DAW. It makes no audio by itself: HOT-Step must be running and reachable (default `http://127.0.0.1:3001`).
 
 1. Install the Microsoft Visual C++ 2015-2022 x64 runtime if you do not have it: https://aka.ms/vs/17/release/vc_redist.x64.exe
 2. Copy the `HOT-STEP LINK.vst3` folder to `C:\Program Files\Common Files\VST3\`.
@@ -93,7 +100,7 @@ The test binary covers host sync, capture ring, DawWorker offline detection, aud
 
 Windows x64 only for now. Install by hand from the zip.
 
-Download: **[release download link: TBD]** (`HOTSTEP_LINK_<version>_Windows_x64.zip`, with a `.sha256`)
+Download: https://github.com/MDMAchine/hs-link/releases (`HOTSTEP_LINK_<version>_Windows_x64.zip`, with a `.sha256`)
 
 Before you start, you need:
 

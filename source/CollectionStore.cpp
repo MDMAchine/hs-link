@@ -346,6 +346,16 @@ juce::String CollectionStore::toJson (const CollectionItem& item)
         o->setProperty ("loop_start", edit.loopStart);
     if (edit.loopEnd >= 0)
         o->setProperty ("loop_end", edit.loopEnd);
+    if (edit.fadeInMs > 0.0)
+        o->setProperty ("fade_in_ms", edit.fadeInMs);
+    if (edit.fadeOutMs > 0.0)
+        o->setProperty ("fade_out_ms", edit.fadeOutMs);
+    if (edit.loopXfadeMs > 0.0)
+        o->setProperty ("loop_xfade_ms", edit.loopXfadeMs);
+    if (edit.gainDb != 0.0)
+        o->setProperty ("gain_db", edit.gainDb);
+    if (edit.reverse)
+        o->setProperty ("reverse", true);
     return juce::JSON::toString (v);
 }
 
@@ -455,6 +465,16 @@ bool CollectionStore::fromJson (const juce::String& json, CollectionItem& item)
     edit.cropEnd = point ("crop_end");
     edit.loopStart = point ("loop_start");
     edit.loopEnd = point ("loop_end");
+    auto level = [&v] (const char* key)
+    {
+        const auto p = v.getProperty (key, 0.0);
+        return (p.isInt() || p.isInt64() || p.isDouble()) ? (double) p : 0.0; // sanitized() clamps
+    };
+    edit.fadeInMs = level ("fade_in_ms");
+    edit.fadeOutMs = level ("fade_out_ms");
+    edit.loopXfadeMs = level ("loop_xfade_ms");
+    edit.gainDb = level ("gain_db");
+    edit.reverse = (bool) v.getProperty ("reverse", false);
     item.edit = edit.sanitized();
     return true;
 }
@@ -770,7 +790,9 @@ CollectionQuery CollectionView::queryFor (const CollectionChips& chips)
     q.text = chips.search.trim();
     q.backend = chips.backend == CollectionChips::sa3 ? "sa3"
               : chips.backend == CollectionChips::yue2 ? "yue2"
-              : chips.backend == CollectionChips::ace ? "ace" : "";
+              : chips.backend == CollectionChips::ace ? "ace"
+              : chips.backend == CollectionChips::minimax ? "minimax-m3"
+              : chips.backend == CollectionChips::heartmula ? "heartmula" : "";
     q.starredOnly = chips.starredOnly;
     return q;
 }

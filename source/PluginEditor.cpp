@@ -112,6 +112,33 @@ void HslinkLook::drawButtonText (juce::Graphics& g, juce::TextButton& b, bool, b
     g.drawFittedText (t, b.getLocalBounds().reduced (4, 0), juce::Justification::centred, 1, 0.75f);
 }
 
+float HotStepLinkEditor::moreLikeLabelWidth (const juce::String& text)
+{
+    // Same font the look draws button text with (12 pt bold).
+    juce::GlyphArrangement ga;
+    ga.addLineOfText (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)), text, 0.0f, 0.0f);
+    return ga.getBoundingBox (0, -1, true).getWidth();
+}
+
+juce::String HotStepLinkEditor::moreLikeTextFor (const juce::String& takeLabel, float availWidth)
+{
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    // Teeth only (HSLINK_TEETH=OLD_MORE_LIKE): the old long label that clipped in the button.
+    if (teeth == "OLD_MORE_LIKE")
+        return takeLabel.isEmpty() ? juce::String ("+4 MORE LIKE TAKE") : "+4 MORE LIKE " + takeLabel.toUpperCase();
+    if (takeLabel.isEmpty())
+        return moreLikeLabelWidth ("+4 MORE LIKE") <= availWidth ? juce::String ("+4 MORE LIKE") : juce::String ("+4 LIKE");
+    auto t = takeLabel.toUpperCase();
+    if (t.startsWith ("TAKE"))
+        t = "T" + t.substring (4).trimStart();
+    const juce::String withId = "+4 LIKE " + t;
+    // Teeth only (HSLINK_TEETH=MORELIKE_NO_FIT): always keep the id, whatever the width.
+    if (teeth == "MORELIKE_NO_FIT" || moreLikeLabelWidth (withId) <= availWidth)
+        return withId;
+    // The id does not fit at the button's real width: drop it rather than clip.
+    return moreLikeLabelWidth ("+4 MORE LIKE") <= availWidth ? juce::String ("+4 MORE LIKE") : juce::String ("+4 LIKE");
+}
+
 void HslinkLook::drawComboBox (juce::Graphics& g, int w, int h, bool, int, int, int, int, juce::ComboBox& box)
 {
     auto r = juce::Rectangle<float> (0.0f, 0.0f, (float) w, (float) h).reduced (0.5f);
@@ -294,6 +321,8 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
 
     // Take editor: the panel holds no processor, these are its only ways out.
     takeEditor.onSetEdit = [this] (const juce::File& temp, const TakeEdit::EditData& e) { return proc.setTakeEdit (temp, e); };
+    takeEditor.onSetGrid = [this] (const juce::File& temp, const TakeEdit::GridEdit& g) { return proc.setTakeGrid (temp, g); };
+    takeEditor.onSetWarp = [this] (const juce::File& temp, const std::vector<WarpMarkers::Marker>& m, bool ed, double tag) { return proc.setTakeWarp (temp, m, ed, tag); };
     takeEditor.onApply = [this] (const juce::File& temp, const TakeEdit::EditData& e, const TakeEdit::EditOptions& o, juce::String& whyNot)
     {
         return proc.requestTakeEdit (temp, e, o, &whyNot);
@@ -307,6 +336,13 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     };
     // Fit to bars: the tempo field starts from the host tempo (the manual one without a host).
     takeEditor.onHostBpm = [this] { return fitHostBpm (standalone, proc.hostSync, proc.getManualBpm()); };
+    // Warp to host: the real host tempo only (B4). The manual tempo is not a host tempo.
+    takeEditor.onWarpHostBpm = [this]
+    {
+        if (TakeEditorMath::testMutant.load() == TakeEditorMath::mutWarpResetsNoHost)
+            return fitHostBpm (standalone, proc.hostSync, proc.getManualBpm()); // teeth: the B3 bug
+        return (standalone || ! proc.hostSync.hostSyncActive.load (std::memory_order_relaxed)) ? 0.0 : proc.hostSync.tempoForCascade();
+    };
     // Stretch to fit: the take the Apply made, looked up by its name now (a copy of the list, no disk IO).
     takeEditor.onStretch = [this] (const juce::String& name, double fromBpm, double toBpm)
     {
@@ -322,7 +358,12 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     };
     takeEditor.onAuditionWarp = [this] (const std::vector<WarpMarkers::Marker>& m) { proc.editorAudition.setWarp (m); };
     takeEditor.onAuditionStop = [this] { proc.editorAudition.stop(); };
+    takeEditor.onAuditionLevel = [this] (juce::int64 s, juce::int64 e, juce::int64 n, const TakeEdit::EditData& d)
+    {
+        proc.editorAudition.setLevel (s, e, n, d.fadeInMs, d.fadeOutMs, d.loopXfadeMs, d.gainDb, d.reverse);
+    };
     takeEditor.onAuditionLoop = [this] (bool on) { proc.editorAudition.setLoop (on); };
+    takeEditor.onAuditionClick = [this] (bool on, double bpm, double downbeat) { proc.editorAudition.setClick (on, bpm, downbeat); };
     takeEditor.onAuditionRegion = [this] (juce::int64 s, juce::int64 e, juce::int64 n) { proc.editorAudition.setRegion (s, e, n); };
     takeEditor.onAuditionState = [this] { return (int) proc.editorAudition.getState(); };
     takeEditor.onAuditionPosition = [this] { return proc.editorAudition.getPlayFraction(); };
@@ -440,6 +481,14 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     songKeyBox.setSelectedId (proc.getKeyIndex() + 1, juce::dontSendNotification);
     songKeyBox.onChange = [this] { proc.setKeyIndex (songKeyBox.getSelectedId() - 1); };
     addAndMakeVisible (songKeyBox);
+    caption (peakModeCaption, "Level");
+    peakModeBox.addItem ("Off", PeakGuard::kOff + 1);
+    peakModeBox.addItem ("Peak guard", PeakGuard::kGuard + 1);
+    peakModeBox.addItem ("Normalise -1 dBTP", PeakGuard::kNormalise + 1);
+    peakModeBox.setTooltip ("New takes on import and Export WAV: Off = untouched; Peak guard = cut to -1 dBTP only; Normalise = gain to -1 dBTP (may boost)");
+    peakModeBox.setSelectedId (proc.getPeakMode() + 1, juce::dontSendNotification);
+    peakModeBox.onChange = [this] { proc.setPeakMode (peakModeBox.getSelectedId() - 1); };
+    addAndMakeVisible (peakModeBox);
     refreshSeedUi();
 
     // R5 take list + audition
@@ -581,6 +630,31 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     };
     addChildComponent (dropButton);
     dropButton.setVisible (standalone);
+    addTakeButton.setTooltip ("List a WAV as a take (edit, audition, export, drag out; no server needed). "
+                              "Or drop a WAV on the TAKES list");
+    addTakeButton.onClick = [this]
+    {
+        // One chooser at a time: a click while it is open is ignored (it opened twice before).
+        if (addTakeChooser != nullptr)
+            return;
+        // Owned by this window and brought to the front, so it never opens behind the app.
+        if (auto* top = getTopLevelComponent())
+            top->toFront (true);
+        addTakeChooser = std::make_unique<juce::FileChooser> ("Add WAV as take", juce::File(), "*.wav;*.aif;*.aiff;*.flac",
+                                                              true, false, this);
+        juce::Component::SafePointer<HotStepLinkEditor> safeThis (this);
+        addTakeChooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                     [this, safeThis] (const juce::FileChooser& fc)
+                                     {
+                                         const auto picked = fc.getResult();
+                                         // Freed after the callback returns, never inside it.
+                                         juce::MessageManager::callAsync ([safeThis]
+                                                                          { if (safeThis != nullptr) safeThis->addTakeChooser.reset(); });
+                                         addTakeFromFile (picked);
+                                     });
+    };
+    addChildComponent (addTakeButton);
+    addTakeButton.setVisible (addTakeAllowed()); // all formats (VST3, CLAP, Standalone)
     for (auto* e : { &regionStartEditor, &regionEndEditor })
     {
         e->setInputRestrictions (10, "0123456789.");
@@ -681,6 +755,8 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
         if (hook == "sa3")  c.backend = CollectionChips::sa3;
         if (hook == "yue2") c.backend = CollectionChips::yue2;
         if (hook == "ace")  c.backend = CollectionChips::ace;
+        if (hook == "minimax-m3") c.backend = CollectionChips::minimax;
+        if (hook == "heartmula")  c.backend = CollectionChips::heartmula;
         c.starredOnly = hook == "starred";
         if (hook.startsWith ("text:"))
             c.search = hook.substring (5);
@@ -780,7 +856,34 @@ HotStepLinkEditor::~HotStepLinkEditor()
 {
     proc.previewPlay.store (false); // L1: preview stops when the editor closes
     proc.commitTakeDelete(); // no Undo button any more: the pending delete is moved to its Deleted folder (pool thread)
+    if (keyHost != nullptr)
+        keyHost->removeKeyListener (this);
     setLookAndFeel (nullptr);
+}
+
+std::atomic<bool> HotStepLinkEditor::testNoTopLevelKeys { false };
+
+void HotStepLinkEditor::parentHierarchyChanged()
+{
+    juce::Component* top = getTopLevelComponent();
+    if (top == keyHost.getComponent())
+        return;
+    if (keyHost != nullptr)
+        keyHost->removeKeyListener (this);
+    keyHost = top;
+    if (top != nullptr)
+        top->addKeyListener (this);
+}
+
+bool HotStepLinkEditor::keyPressed (const juce::KeyPress& k, juce::Component*)
+{
+    auto* f = juce::Component::getCurrentlyFocusedComponent();
+    if (testNoTopLevelKeys.load() || ! takeEditor.isOpen() || ! takeEditor.isShowing())
+        return false;
+    for (auto* c = f; c != nullptr; c = c->getParentComponent())
+        if (dynamic_cast<juce::TextEditor*> (c) != nullptr)
+            return false; // a text field keeps its own Ctrl+Z
+    return takeEditor.keyPressed (k);
 }
 
 void HotStepLinkEditor::refreshSyncReadout()
@@ -896,7 +999,7 @@ void HotStepLinkEditor::refreshServerStatus()
     if (st.online && switching.isNotEmpty())
         t << "Switching to " << switching << "...";
     else if (st.online)
-        t << DawStatus::onlinePillText (st.etaBackend, st.engineModel);
+        t << DawStatus::onlinePillText (st.etaBackend, st.engineModel, proc.getSelectedBackendId());
     else
         t << (st.heartbeatsOk == 0 && st.consecutiveFailures == 0 ? "Connecting..." : "Offline");
     const auto ps = pillStateFor (st.online, proc.daw.getJobs());
@@ -914,9 +1017,16 @@ void HotStepLinkEditor::refreshServerStatus()
     }
 
     // Do not flash the overlay before the first heartbeat has had a chance.
-    const bool showOverlay = ! st.online && (st.consecutiveFailures > 0 || st.everOnline);
+    // A banner over the Generate controls only; hidden while the take editor covers them.
+    const bool offline = ! st.online && (st.consecutiveFailures > 0 || st.everOnline);
+    if (lastServerOnline == offline)
+    {
+        lastServerOnline = ! offline; // "not known offline": Connecting... does not block
+        refreshJob(); // re-run the Generate gate
+    }
+    const bool showOverlay = offline && (! takeEditor.isVisible() || offlineMutantForTest == mutOverlayFullWindow);
     if (showOverlay)
-        overlay.setMessage (url, st.lastError);
+        overlay.setMessage (url, st.lastError, st.recentAttempts);
     if (overlay.isVisible() != showOverlay)
     {
         overlay.setVisible (showOverlay);
@@ -1004,6 +1114,7 @@ void HotStepLinkEditor::refreshTextState()
     instrumentalButton.setToggleState (inst, juce::dontSendNotification);
     lyricsEditor.setEnabled (! inst);
     songKeyBox.setSelectedId (proc.getKeyIndex() + 1, juce::dontSendNotification);
+    peakModeBox.setSelectedId (proc.getPeakMode() + 1, juce::dontSendNotification);
     refreshSeedUi();
     modeBox.setSelectedId (proc.getModeId(), juce::dontSendNotification);
     manualBpm.setValue (proc.getManualBpm(), juce::dontSendNotification);
@@ -1267,13 +1378,42 @@ void HotStepLinkEditor::useSourceFile (const juce::File& f)
 
 bool HotStepLinkEditor::isInterestedInFileDrag (const juce::StringArray& files)
 {
-    return standalone && files.size() == 1 && juce::File (files[0]).hasFileExtension ("wav;aif;aiff;flac");
+    return addTakeAllowed() && files.size() == 1 && juce::File (files[0]).hasFileExtension ("wav;aif;aiff;flac");
 }
 
-void HotStepLinkEditor::filesDropped (const juce::StringArray& files, int, int)
+void HotStepLinkEditor::filesDropped (const juce::StringArray& files, int x, int y)
 {
-    if (standalone && files.size() > 0)
+    if (! addTakeAllowed() || files.size() == 0)
+        return;
+    // Dropped on the TAKES list (right plate): a new take. Anywhere else: the Source.
+    if (queuePlate.contains (x, y))
+        addTakeFromFile (juce::File (files[0]));
+    else
         useSourceFile (juce::File (files[0]));
+}
+
+bool HotStepLinkEditor::addTakeFromFile (const juce::File& f)
+{
+    if (f == juce::File())
+        return false;
+    {
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        std::unique_ptr<juce::AudioFormatReader> r (fm.createReaderFor (f));
+        if (r == nullptr || r->sampleRate <= 0.0 || r->lengthInSamples <= 0)
+        {
+            jobLabel.setText ("Not a readable audio file: " + f.getFileName(), juce::dontSendNotification);
+            return false;
+        }
+    }
+    if (! proc.addShotTake (f))
+    {
+        jobLabel.setText ("Already in the take list: " + f.getFileName(), juce::dontSendNotification);
+        return false;
+    }
+    jobLabel.setText ("Added take: " + f.getFileName(), juce::dontSendNotification);
+    refreshTakes();
+    return true;
 }
 
 // One VBlank tick. Nothing here or in paint makes a file-system call: the take
@@ -1331,6 +1471,8 @@ void HotStepLinkEditor::tick (bool periodic)
 void HotStepLinkEditor::deleteTake (const juce::String& tempPath)
 {
     const auto r = proc.deleteTake (tempPath); // no file call here; a selected take is deselected first
+    if (r == HotStepLinkProcessor::TakeDelete::deleted)
+        takeEditor.forgetHistory (juce::File (tempPath)); // C3
     if (r != HotStepLinkProcessor::TakeDelete::deleted)
         collectionPanel.showNote (HotStepLinkProcessor::takeDeleteText (r), true);
     refreshTakes();
@@ -1358,6 +1500,16 @@ void HotStepLinkEditor::refreshJob()
         t << "  takes " << j.takeFiles.size() << "/" << j.takeCount;
         if (j.ditModel.isNotEmpty())
             t << "  DiT " << j.ditModel;
+        {
+            // Level mode: the largest gain applied to this job's takes on import,
+            // a cut (Peak guard or Normalise) or a boost (Normalise).
+            float most = 0.0f;
+            for (auto g : j.takeGuardDb)
+                if (std::abs (g) > std::abs (most))
+                    most = g;
+            if (most != 0.0f)
+                t << "  " << PeakGuard::text (most);
+        }
         // Empty when the server reported no seed at all; see DawJob::seedText.
         if (const auto seedPart = DawJob::seedText (j.takeSeeds); seedPart.isNotEmpty())
             t << "  " << seedPart;
@@ -1367,8 +1519,10 @@ void HotStepLinkEditor::refreshJob()
     const bool active = have && ! j.isFinished();
     const bool needSrc = HotStepLinkProcessor::modeNeedsSource (modeBox.getText());
     const bool srcOk = ! needSrc || proc.sourceLoaded(); // state only; the file is checked on Generate
-    generateButton.setEnabled (srcOk); // while a job runs, Generate queues the next one
-    generateButton.setTooltip (srcOk ? juce::String()
+    // while a job runs, Generate queues the next one; offline it is blocked (banner over it)
+    generateButton.setEnabled (srcOk && lastServerOnline);
+    generateButton.setTooltip (! lastServerOnline ? juce::String ("HOT-Step is not reachable: see the banner, then Retry")
+                               : srcOk ? juce::String()
                                      : modeBox.getText() + " needs a source clip first: "
                                            + (standalone ? "drop a WAV" : "arm Capture and play the host"));
     cancelButton.setEnabled (active && ! j.cancelRequested);
@@ -1423,6 +1577,14 @@ void HotStepLinkEditor::refreshQueue()
                 }
     }
     queueList.setCards (cards, selectedJob);
+    // The QUEUE header count and the job card title are painted by the editor:
+    // repaint when either changes, else they stay at 0 / "No job yet".
+    if (! noHeaderRepaintForTest && (queueList.getNumActiveCards() != lastQueueCountShown || currentJob != lastJobCardShown))
+    {
+        lastQueueCountShown = queueList.getNumActiveCards();
+        lastJobCardShown = currentJob;
+        repaint();
+    }
 }
 
 // The grid of the take editor from a take cell: the test of requestTakeEdit.
@@ -1476,19 +1638,70 @@ void HotStepLinkEditor::refreshTakes()
     // takes here). getTakes copies the list, no disk IO.
     const auto notice = proc.getSaveNotice();
     takeModel = buildTakeModel();
+    {
+        // v0.5.19: a take that just arrived (generate result, Add as take, WAV drop) is
+        // selected at once so Edit take and Export WAV are on. The first refresh only
+        // records the keys, so a fresh launch does not select anything by itself.
+        juce::String arrived;
+        juce::StringArray now;
+        for (const auto& cell : takeModel.cells)
+        {
+            now.add (cell.key);
+            if (takeKeysSeeded && cell.shown && ! knownTakeKeys.contains (cell.key))
+                arrived = cell.key;
+        }
+        // D2: a loaded state replaced the list. Its takes are not arrivals (no auto-select),
+        // and undo histories of takes no longer listed are forgotten.
+        const auto restoreGen = proc.getTakesRestoreGeneration();
+        if (restoreGen != lastTakesRestoreGen)
+        {
+            lastTakesRestoreGen = restoreGen;
+            arrived = {};
+            juce::StringArray listed;
+            for (const auto& cell : takeModel.cells)
+                listed.add (cell.temp.getFullPathName());
+            takeEditor.forgetHistoriesExcept (listed);
+        }
+        knownTakeKeys = now;
+        takeKeysSeeded = true;
+        // An open take editor does not block it (Apply crop, stretch, Export loop add a
+        // take while it is open): the new take is selected for audition, and the editor
+        // stays on the take it edits.
+        if (arrived.isNotEmpty() && ! (openEditorBlocksSelectForTest && takeEditor.isOpen()) && ! noAutoSelectForTest)
+        {
+            const auto before = proc.audition.getSelected();
+            selectTake (arrived); // refreshes the whole take area itself
+            if (proc.audition.getSelected() != before)
+            {
+                if (! noHeaderRepaintForTest && takeList.getNumCells() != lastTakeCountShown)
+                {
+                    lastTakeCountShown = takeList.getNumCells();
+                    repaint();
+                }
+                return;
+            }
+        }
+    }
     takeList.setTakes (takeModel.shown(),
                        "Not saved: could not write to " + notice.stableFolder
                            + ". Kept in a temporary folder; you can still audition it and use Export WAV."
                              " Dragging to the DAW is off until it is saved.");
+    if (takeList.getNumCells() != lastTakeCountShown)
+    {
+        // The TAKES header count is painted by the editor: repaint in the same call.
+        lastTakeCountShown = takeList.getNumCells();
+        repaint();
+    }
     {
         // Edit take: on while a take cell is selected. An open editor whose take left the list closes.
-        bool anySelected = false, editedListed = false;
+        bool anySelected = false, editedListed = false, selMissing = false;
         juce::String selKey, selLabel;
         for (const auto& cell : takeModel.cells)
         {
             anySelected = anySelected || (cell.selected && cell.shown);
             if (cell.selected && cell.shown && selKey.isEmpty())
             {
+                selMissing = cell.missing;
                 selKey = cell.key;
                 selLabel = cell.label;
             }
@@ -1501,9 +1714,10 @@ void HotStepLinkEditor::refreshTakes()
                 takeEditor.setLiveGrid (takeEditorGridOf (fc), editorTempoText (fc));
             }
         }
-        editTakeButton.setEnabled (anySelected);
+        editTakeButton.setEnabled (anySelected && ! selMissing);
         moreLikeKey = selKey;
-        const auto moreText = selKey.isEmpty() ? juce::String ("+4 MORE LIKE TAKE") : "+4 MORE LIKE " + selLabel.toUpperCase();
+        moreLikeLabel = selKey.isEmpty() ? juce::String() : selLabel;
+        const auto moreText = moreLikeTextFor (moreLikeLabel, (float) moreLikeButton.getWidth() - 8.0f);
         if (moreLikeButton.getButtonText() != moreText)
             moreLikeButton.setButtonText (moreText);
         // Only with a known seed: a take whose job reported none (e.g. YuE2) cannot seed neighbours.
@@ -1550,7 +1764,10 @@ void HotStepLinkEditor::refreshTakes()
     {
         // From state: something is selected. The file is touched when Export is clicked.
         const auto sel = proc.audition.getSelected();
-        exportWavButton.setEnabled (sel != juce::File()
+        bool selMissing = false;
+        for (const auto& c : takeModel.cells)
+            selMissing = selMissing || (c.selected && c.missing);
+        exportWavButton.setEnabled (sel != juce::File() && ! selMissing
                                     && (! TakeGrid::testEditorStats.load() || EditorFs::exists (sel, EditorFs::tagTick)));
         exportMidiButton.setEnabled (sel != juce::File() && ! midiBusy);
         const bool canDrag = sel != juce::File() && (! midiBusy || midiDrag.isBuilding());
@@ -1608,6 +1825,11 @@ bool HotStepLinkEditor::openTakeEditor()
     {
         if (! cell.selected || ! cell.shown)
             continue;
+        if (cell.missing)
+        {
+            collectionPanel.showNote ("Cannot edit: the take's file is missing: " + cell.file.getFullPathName(), true, 8000);
+            return false;
+        }
         TakeEditorPanel::Take t;
         t.temp = cell.temp;
         t.name = cell.key;
@@ -1617,12 +1839,23 @@ bool HotStepLinkEditor::openTakeEditor()
         t.grid = takeEditorGridOf (fc);
         for (const auto& e : proc.getTakes()) // a copy, no disk IO
             if (e.temp == cell.temp)
+            {
                 t.edit = e.edit;
+                t.warpMarkers = e.warpMarkers; // C1: the stored warp
+                t.warpMarkersEdited = e.warpMarkersEdited;
+                t.warpTagBpm = e.warpTagBpm;
+            }
+        t.gridEdit = cell.gridEdit; // R1b: the hand grid stored on the take (setTakeGrid)
+        if ((cell.tempoState == HslinkTakeEntry::tempoMeasured && cell.tempo.valid)
+            || cell.tempoState == HslinkTakeEntry::tempoEstimated)
+            t.takeBpm = cell.tempo.bpm > 0.0 ? cell.tempo.bpm : 0.0; // Fit to bars opens on the take tempo
         takeEditor.open (t);
         takeEditor.setVisible (true);
         takeEditor.toFront (false);
-        if (overlay.isVisible())
-            overlay.toFront (false); // the offline overlay stays on top
+        if (offlineMutantForTest == mutOverlayFullWindow && overlay.isVisible())
+            overlay.toFront (false);
+        else
+            overlay.setVisible (false); // the offline banner sits on the Generate plate; the editor needs no server
         return true;
     }
     return false;
@@ -1660,6 +1893,11 @@ void HotStepLinkEditor::selectTake (const juce::String& key)
         return; // the take left the list since the last refresh
     // Clicking the selected take again turns audition off (pass-through).
     const bool off = c->selected;
+    if (! off && c->missing)
+    {
+        collectionPanel.showNote ("Cannot audition: the take's file is missing: " + c->file.getFullPathName(), true, 8000);
+        return;
+    }
     // One file check per click, so a take whose file is gone says so instead of
     // being selected in silence.
     // A saved take whose lasting file was removed by hand plays from its temp copy
@@ -1768,6 +2006,14 @@ void HotStepLinkEditor::trimWarpCache (const juce::File& dir, const juce::File& 
     }
 }
 
+int HotStepLinkEditor::takeCellMissingForTest (const juce::String& key) const
+{
+    const auto* c = static_cast<const TakeCell*> (takeList.cellForKey (key));
+    if (c == nullptr)
+        return -1;
+    return c->isMissing() && c->getAlpha() < 0.9f ? 1 : 0;
+}
+
 juce::File HotStepLinkEditor::exportSource()
 {
     auto src = proc.audition.getSelected();
@@ -1780,6 +2026,8 @@ juce::File HotStepLinkEditor::exportSource()
     for (const auto& c : buildTakeModel().cells)
         if (c.selected)
         {
+            if (c.missing)
+                return {};
             src = c.saved ? TakeGrid::actionFileOf (c, EditorFs::tagExport) : c.file;
             return warpedFileFor (c.temp, src);
         }
@@ -1818,7 +2066,12 @@ void HotStepLinkEditor::exportWav()
         }
         else
         {
-            jobLabel.setText ("Exported " + dest.getFileName(), juce::dontSendNotification);
+            // Peak guard on export: a take edited or warped after import can be over the
+            // ceiling again. A take already at or under it is written as copied.
+            // dest == src is skipped: the take itself is never rewritten by an export.
+            const float g = PeakGuard::applyToExport (src, dest);
+            jobLabel.setText ("Exported " + dest.getFileName() + (g < 0.0f ? "  " + PeakGuard::text (g) : juce::String()),
+                              juce::dontSendNotification);
             showExportResult (dest);
         }
     });
@@ -1885,7 +2138,7 @@ MidiBuildResult buildMidiFiles (const MidiBuildInputs& in, const juce::File& des
         // Hits only from drum-like transients (horns and pads stay out of the hits file);
         // the notes track below still splits at every onset.
         auto hits = MidiExport::hitsFromOnsets (buf, sr, MidiExport::percussiveOnsets (buf, sr, onSecs));
-        const auto pitch = MidiExport::trackNotes (mono.data(), (int) mono.size(), sr, onSecs);
+        const auto pitch = MidiExport::trackMelody (mono.data(), (int) mono.size(), sr, onSecs);
         auto notes = pitch.notes;
         if (mutant == 2)
             for (auto& h : hits)
@@ -1960,8 +2213,10 @@ MidiBuildResult buildMidiFiles (const MidiBuildInputs& in, const juce::File& des
         // Tonal takes also get a pitched note track (the hits track is always written).
         if (MidiExport::isTonal (pitch) && ! notes.empty())
         {
-            r.notes = dir.getChildFile (name + "_notes.mid");
-            if (! MidiExport::writeFile (MidiExport::buildNotesFile (notes, name + " notes", bpmOut, beatsPerBar, sigDen, std::nullopt, map), r.notes))
+            r.notes = dir.getChildFile (name + "_melody.mid");
+            if (! MidiExport::writeFile (MidiExport::buildNotesFile (notes, name + " melody", bpmOut, beatsPerBar, sigDen, std::nullopt, map,
+                                                                 in.quantDiv, in.quantStrength,
+                                                                 MidiExport::exportOriginTicks (hits, bpmOut, beatsPerBar, sigDen, map, down)), r.notes))
             {
                 err = "could not write " + r.notes.getFullPathName();
                 r.notes = juce::File();
@@ -2277,11 +2532,19 @@ OfflineOverlay::OfflineOverlay()
     retryButton.setComponentID ("pink");
     addAndMakeVisible (message);
     addAndMakeVisible (detail);
+    attemptsLabel.setJustificationType (juce::Justification::centredLeft);
+    attemptsLabel.setFont (juce::FontOptions (11.0f));
+    attemptsLabel.setColour (juce::Label::textColourId, kText.withAlpha (0.55f));
+    attemptsLabel.setMinimumHorizontalScale (0.6f);
+    addAndMakeVisible (attemptsLabel);
     addAndMakeVisible (retryButton);
 }
 
-void OfflineOverlay::setMessage (const juce::String& url, const juce::String& err)
+void OfflineOverlay::setMessage (const juce::String& url, const juce::String& err, const juce::StringArray& attempts)
 {
+    const auto a = attempts.joinIntoString (juce::newLine);
+    if (attemptsLabel.getText() != a)
+        attemptsLabel.setText (a, juce::dontSendNotification);
     const auto m = "HOT-Step not reachable at " + url;
     if (message.getText() != m)
         message.setText (m, juce::dontSendNotification);
@@ -2292,16 +2555,25 @@ void OfflineOverlay::setMessage (const juce::String& url, const juce::String& er
 
 void OfflineOverlay::paint (juce::Graphics& g)
 {
-    g.fillAll (kBg.withAlpha (0.88f));
+    // A banner over the Generate controls: opaque enough to read, framed so it reads as one.
+    const auto b = getLocalBounds().toFloat().reduced (1.0f);
+    g.setColour (kBg.withAlpha (0.95f));
+    g.fillRoundedRectangle (b, 6.0f);
+    g.setColour (kText.withAlpha (0.25f));
+    g.drawRoundedRectangle (b, 6.0f, 1.0f);
 }
 
 void OfflineOverlay::resized()
 {
-    auto r = getLocalBounds().withSizeKeepingCentre (juce::jmin (getWidth() - 20, 520), 110);
+    message.setMinimumHorizontalScale (0.6f);
+    detail.setMinimumHorizontalScale (0.6f);
+    auto r = getLocalBounds().withSizeKeepingCentre (juce::jmin (getWidth() - 20, 560), juce::jmin (getHeight() - 8, 180));
     message.setBounds (r.removeFromTop (34));
     detail.setBounds (r.removeFromTop (28));
-    r.removeFromTop (10);
-    retryButton.setBounds (r.withSizeKeepingCentre (110, 30));
+    r.removeFromTop (6);
+    retryButton.setBounds (r.removeFromTop (30).withSizeKeepingCentre (110, 30));
+    r.removeFromTop (6);
+    attemptsLabel.setBounds (r); // last attempts, newest at the bottom
 }
 
 void HotStepLinkEditor::paintSection (juce::Graphics& g, juce::Rectangle<int> r, const juce::String& title,
@@ -2472,7 +2744,7 @@ void HotStepLinkEditor::paint (juce::Graphics& g)
     paintSection (g, genPlate.reduced (inset, 0).withTop (genPlate.getY() + 8).withHeight (20), "Generate", -1);
     // Mockup A right column: TAKES on top, QUEUE under it. PREVIEW sits under GENERATE.
     paintSection (g, queuePlate.reduced (inset, 0).withY (jobCard.getY() - 22).withHeight (20), "Queue",
-                  queueList.getNumCards());
+                  queueList.getNumActiveCards());
     paintSection (g, queuePlate.reduced (inset, 0).withY (takeList.getY() - 22).withHeight (20).withTrimmedRight (100),
                   "Takes", takeList.getNumCells());
     paintSection (g, previewHeaderArea(), "Preview", -1);
@@ -2760,7 +3032,6 @@ void HotStepLinkEditor::resized()
         versionLabel.setBounds (s.removeFromRight (280));
         syncLabel.setBounds (s);
     }
-    overlay.setBounds (getLocalBounds().withTrimmedTop (headerArea.getHeight()));
 
     const int sideW = juce::jlimit (240, 320, r.getWidth() / 4);
     setupPlate = r.removeFromLeft (sideW);
@@ -2788,10 +3059,32 @@ void HotStepLinkEditor::resized()
         a.removeFromTop (6);
         {
             auto br = a.removeFromTop (28);
-            auto& b = standalone ? static_cast<juce::Component&> (dropButton) : captureButton;
-            b.setBounds (br.removeFromLeft ((br.getWidth() - gap) / 2));
-            br.removeFromLeft (gap);
-            captureNowButton.setBounds (br);
+            if (standalone)
+            {
+                // Drop WAV (Source) | Add as take | CAPTURE
+                const int w3 = (br.getWidth() - 2 * gap) / 3;
+                dropButton.setBounds (br.removeFromLeft (w3));
+                br.removeFromLeft (gap);
+                addTakeButton.setBounds (br.removeFromLeft (w3));
+                br.removeFromLeft (gap);
+                captureNowButton.setBounds (br);
+            }
+            else if (addTakeButton.isVisible())
+            {
+                // ARM | Add as take | CAPTURE
+                const int w3 = (br.getWidth() - 2 * gap) / 3;
+                captureButton.setBounds (br.removeFromLeft (w3));
+                br.removeFromLeft (gap);
+                addTakeButton.setBounds (br.removeFromLeft (w3));
+                br.removeFromLeft (gap);
+                captureNowButton.setBounds (br);
+            }
+            else
+            {
+                captureButton.setBounds (br.removeFromLeft ((br.getWidth() - gap) / 2));
+                br.removeFromLeft (gap);
+                captureNowButton.setBounds (br);
+            }
         }
         sourceLabel.setBounds (a.removeFromTop (20));
         a.removeFromTop (24); // painted HOST SYNC header
@@ -2889,12 +3182,23 @@ void HotStepLinkEditor::resized()
             seedRandomButton.setBounds (sc.removeFromRight (84));
             sc.removeFromRight (4);
             seedEditor.setBounds (sc);
+            auto pk = row2.removeFromRight ((row2.getWidth() - gap) / 2);
+            row2.removeFromRight (gap);
+            peakModeCaption.setBounds (pk.removeFromTop (16));
+            peakModeBox.setBounds (pk);
             songKeyCaption.setBounds (row2.removeFromTop (16));
             songKeyBox.setBounds (row2);
         }
         a.removeFromTop (10);
 
         generateButton.setBounds (a.removeFromTop (44));
+        // Offline banner: over the GENERATE controls (knobs, seed/key, Generate) only, so the
+        // take list, Edit take, audition, export and drag-out stay usable with no server.
+        if (offlineMutantForTest == mutOverlayFullWindow)
+            overlay.setBounds (getLocalBounds().withTrimmedTop (headerArea.getHeight()));
+        else
+            overlay.setBounds (juce::Rectangle<int>::leftTopRightBottom (genPlate.getX() + 4, knobPanel.getY(),
+                                                                         genPlate.getRight() - 4, generateButton.getBottom()));
         a.removeFromTop (8);
         if (saveNotice.isVisible())
         {
@@ -2929,9 +3233,12 @@ void HotStepLinkEditor::resized()
         exp.removeFromLeft (gap);
         midiDrag.setBounds (exp.removeFromRight (40));
         exp.removeFromRight (gap);
-        quantStrengthSlider.setBounds (exp.removeFromRight (juce::jmin (60, exp.getWidth() / 4)));
+        // The Q combo needs about 80 px for "Q 1/16" plus its arrow; size it first, then the
+        // strength slider takes what is left so Export MIDI keeps at least half the row.
+        const int qW = juce::jmin (82, exp.getWidth() * 2 / 5);
+        quantStrengthSlider.setBounds (exp.removeFromRight (juce::jmin (56, (exp.getWidth() - qW) / 3)));
         exp.removeFromRight (gap);
-        quantizeBox.setBounds (exp.removeFromRight (juce::jmin (72, exp.getWidth() / 3)));
+        quantizeBox.setBounds (exp.removeFromRight (qW));
         exp.removeFromRight (gap);
         exportMidiButton.setBounds (exp);
         a.removeFromBottom (6);
@@ -2961,6 +3268,8 @@ void HotStepLinkEditor::resized()
             auto row = a.removeFromBottom (28);
             const int half = (row.getWidth() - gap) / 2;
             moreLikeButton.setBounds (row.removeFromLeft (half));
+            // Re-fit the label to the new width (the take id is dropped when it would clip).
+            moreLikeButton.setButtonText (moreLikeTextFor (moreLikeLabel, (float) moreLikeButton.getWidth() - 8.0f));
             row.removeFromLeft (gap);
             clearUnstarredButton.setBounds (row);
         }
@@ -3132,6 +3441,16 @@ void QueueListComponent::mouseDown (const juce::MouseEvent& e)
 }
 
 //==============================================================================
+bool TakeCell::repointThumbIfGone (const juce::File& src)
+{
+    if (src == juce::File() || src == thumbFile || thumbFile.existsAsFile() || ! src.existsAsFile())
+        return false;
+    thumbFile = src;
+    thumb.setSource (new juce::FileInputSource (thumbFile));
+    repaint();
+    return true;
+}
+
 TakeCell::TakeCell (const juce::String& k, const juce::String& lab, const juce::File& thumbSource, int idx,
                     juce::AudioFormatManager& fm, juce::AudioThumbnailCache& cache)
     : key (k), label (lab), thumbFile (thumbSource), index (idx), thumb (256, fm, cache)
@@ -3193,6 +3512,13 @@ void TakeCell::paint (juce::Graphics& g)
     }
     g.drawText (label, nameArea, juce::Justification::centredLeft, true);
     ri.removeFromTop (4);
+    if (missing)
+    {
+        g.setColour (juce::Colour (0xffff6b6b));
+        g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+        g.drawFittedText ("FILE MISSING", ri, juce::Justification::centred, 1);
+        return;
+    }
     if (dragRefused)
     {
         g.setColour (juce::Colour (0xffffb347));
@@ -3213,19 +3539,26 @@ void TakeCell::paint (juce::Graphics& g)
         thumb.drawChannels (g, ri, 0.0, thumb.getTotalLength(), 1.0f);
     else
         g.drawText ("loading...", ri, juce::Justification::centred);
-    if (tempoTag.text.isNotEmpty())
+    if (tempoShown().isNotEmpty())
     {
         // Lower left corner of the waveform, on a dark plate so it reads over the peaks.
-        // The width is an estimate from the character count (9 pt text).
-        const int w = juce::jmin (ri.getWidth(), 8 + juce::roundToInt (5.2f * (float) tempoTag.text.length()));
-        const auto plate = juce::Rectangle<int> (ri.getX(), ri.getBottom() - 12, w, 12);
+        const auto plate = tempoPlate();
         g.setColour (juce::Colours::black.withAlpha (0.62f));
         g.fillRoundedRectangle (plate.toFloat(), 3.0f);
         g.setColour (tempoTag.colour == TakeGrid::TempoTag::green ? juce::Colour (0xff6fd08c)
                      : tempoTag.colour == TakeGrid::TempoTag::amber ? juce::Colour (0xffffb347)
                      : tempoTag.colour == TakeGrid::TempoTag::red ? juce::Colour (0xffff6b6b) : kDim);
         g.setFont (juce::FontOptions (9.0f, juce::Font::bold));
-        g.drawText (tempoTag.text, plate.reduced (4, 0), juce::Justification::centredLeft, true);
+        g.drawText (tempoShown(), plate.reduced (4, 0), juce::Justification::centredLeft, true);
+    }
+    if (const auto lp = lengthPlate(); ! lp.isEmpty())
+    {
+        // Lower right corner: the take length, always shown; the tempo tag gives way (tempoShown).
+        g.setColour (juce::Colours::black.withAlpha (0.62f));
+        g.fillRoundedRectangle (lp.toFloat(), 3.0f);
+        g.setColour (kText);
+        g.setFont (juce::FontOptions (9.0f, juce::Font::bold));
+        g.drawText (lengthText, lp.reduced (4, 0), juce::Justification::centredRight, false);
     }
     if (! fitRow.isEmpty())
     {
@@ -3245,6 +3578,75 @@ void TakeCell::paint (juce::Graphics& g)
         g.setColour (col);
         g.fillRoundedRectangle (bar.withWidth (bar.getWidth() * (float) score / 100.0f), 2.0f);
     }
+}
+
+juce::Rectangle<int> TakeCell::waveArea() const
+{
+    auto ri = getLocalBounds().reduced (9, 8);
+    ri.removeFromTop (22); // head row 18 + gap 4
+    if (fitTag.text.isNotEmpty())
+        ri.removeFromBottom (15); // FIT row 12 + gap 3
+    return ri;
+}
+
+juce::Rectangle<int> TakeCell::tempoPlate() const
+{
+    const auto t = tempoShown();
+    if (t.isEmpty())
+        return {};
+    const auto ri = waveArea();
+    const int w = juce::jmin (ri.getWidth(), 8 + (int) std::ceil (lengthTextWidth (t)));
+    return { ri.getX(), ri.getBottom() - 12, w, 12 };
+}
+
+float TakeCell::lengthTextWidth (const juce::String& t)
+{
+    juce::AttributedString as;
+    as.append (t, juce::FontOptions (9.0f, juce::Font::bold));
+    juce::TextLayout tl;
+    tl.createLayout (as, 100000.0f);
+    return tl.getWidth();
+}
+
+juce::String TakeCell::tempoShown() const
+{
+    const auto& full = tempoTag.text;
+    if (full.isEmpty() || TakeGrid::testLengthMutant.load() == 2)
+        return full;
+    const auto ri = waveArea();
+    const auto lp = lengthPlate();
+    // Room left of the length plate (4 px gap); the whole width with no length.
+    const int room = lp.isEmpty() ? ri.getWidth() : lp.getX() - 4 - ri.getX();
+    const auto fits = [room] (const juce::String& t) { return 8.0f + lengthTextWidth (t) <= (float) room; };
+    if (fits (full))
+        return full;
+    // Shorter forms: the number and the est mark, then the number alone.
+    const auto first = full.upToFirstOccurrenceOf (" ", false, false);
+    const bool est = juce::StringArray::fromTokens (full, " ", {}).contains ("est");
+    if (est && fits (first + " est"))
+        return first + " est";
+    if (fits (first))
+        return first;
+    return {}; // not even the number fits: the tempo gives way to the length
+}
+
+juce::Rectangle<int> TakeCell::lengthPlate() const
+{
+    if (lengthText.isEmpty() || missing || dragRefused)
+        return {};
+    const auto ri = waveArea();
+    const int w = 8 + (int) std::ceil (lengthTextWidth (lengthText));
+    if (w > ri.getWidth())
+        return {}; // narrower than the length text itself
+    return { ri.getRight() - w, ri.getBottom() - 12, w, 12 };
+}
+
+bool TakeCell::lengthFitsForTest (juce::Rectangle<int>* plateOut, juce::Rectangle<int>* tempoOut) const
+{
+    const auto lp = lengthPlate();
+    if (plateOut != nullptr) *plateOut = lp;
+    if (tempoOut != nullptr) *tempoOut = tempoPlate();
+    return ! lp.isEmpty() && waveArea().contains (lp) && lengthTextWidth (lengthText) <= (float) (lp.getWidth() - 8);
 }
 
 void TakeCell::resized()
@@ -3363,7 +3765,7 @@ void TakeListComponent::setTakes (const std::vector<TakeGrid::Cell>& shownCells,
             {
                 // The waveform reads the temp copy. A kept cell is never given another
                 // file, so a save does not re-point it at the lasting copy.
-                c = new TakeCell (m.key, m.label, TakeGrid::thumbSourceOf (m), i, formats, cache);
+                c = new TakeCell (m.key, m.label, TakeGrid::thumbSourceOf (m), m.number > 0 ? m.number - 1 : i, formats, cache);
                 c->onSelect = [this] (const juce::String& k) { if (onSelect) onSelect (k); };
                 c->onStar = [this] (const juce::String& k, bool on) { if (onStar) onStar (k, on); };
                 c->onAdd = [this] (const juce::String& k) { if (onAdd) onAdd (k); };
@@ -3372,7 +3774,7 @@ void TakeListComponent::setTakes (const std::vector<TakeGrid::Cell>& shownCells,
                 c->dragFileFor = [this] (const juce::String& k) { return dragFileFor ? dragFileFor (k) : juce::File(); };
                 content.addAndMakeVisible (c);
             }
-            c->setIndex (i);
+            c->setIndex (m.number > 0 ? m.number - 1 : i); // D2: T<stable number>
             cells.add (c);
         }
         current = keys;
@@ -3381,12 +3783,18 @@ void TakeListComponent::setTakes (const std::vector<TakeGrid::Cell>& shownCells,
     for (int i = 0; i < cells.size() && i < (int) shownCells.size(); ++i)
     {
         const auto& m = shownCells[(size_t) i];
+        if (! TakeGrid::testNoThumbFallback.load())
+            cells[i]->repointThumbIfGone (TakeGrid::thumbSourceOf (m));
         cells[i]->deleteKey = m.temp.getFullPathName(); // set on every refresh: a kept cell follows its place in the list
         cells[i]->setSelected (m.selected);
         cells[i]->setStarred (m.starred);
         cells[i]->setUnsaved (m.badge, unsavedWhy, m.pending);
+        cells[i]->setMissing (m.missing);
+        if (m.missing)
+            cells[i]->setTooltip ("File missing: " + m.file.getFullPathName());
         cells[i]->setTempoTag (TakeGrid::tempoTagOf (m.tempoState, m.tempo, m.resolved));
         cells[i]->setFitTag (TakeGrid::fitTagOf (m.fitScore));
+        cells[i]->setLengthText (TakeGrid::lengthTextOf (m.durationS));
     }
 }
 
@@ -3565,6 +3973,8 @@ CollectionPanel::CollectionPanel()
     backendChip (chipSa3, CollectionChips::sa3, "Only takes made with SA3");
     backendChip (chipYue2, CollectionChips::yue2, "Only takes made with YuE2");
     backendChip (chipAce, CollectionChips::ace, "Only takes made with ACE");
+    backendChip (chipMiniMax, CollectionChips::minimax, "Only takes made with MiniMax-M3");
+    backendChip (chipHeart, CollectionChips::heartmula, "Only takes made with HeartMuLa");
     chipStar.setTooltip ("Only starred items");
     chipStar.onClick = [this]
     {
@@ -3586,6 +3996,8 @@ void CollectionPanel::syncChipButtons()
     chipSa3.setToggleState (chips.backend == CollectionChips::sa3, juce::dontSendNotification);
     chipYue2.setToggleState (chips.backend == CollectionChips::yue2, juce::dontSendNotification);
     chipAce.setToggleState (chips.backend == CollectionChips::ace, juce::dontSendNotification);
+    chipMiniMax.setToggleState (chips.backend == CollectionChips::minimax, juce::dontSendNotification);
+    chipHeart.setToggleState (chips.backend == CollectionChips::heartmula, juce::dontSendNotification);
     chipStar.setToggleState (chips.starredOnly, juce::dontSendNotification);
 }
 
@@ -3671,13 +4083,17 @@ void CollectionPanel::resized()
         search.setBounds (c.removeFromLeft (150));
         c.removeFromLeft (6);
         const int gap = 3;
-        for (auto* b : { &chipAll, &chipSa3, &chipYue2, &chipAce })
+        int used = 150 + 6;
+        const std::pair<juce::TextButton*, int> chipW[] = { { &chipAll, 44 }, { &chipSa3, 44 }, { &chipYue2, 44 }, { &chipAce, 44 },
+                                                            { &chipMiniMax, 58 }, { &chipHeart, 70 } };
+        for (const auto& [b, w] : chipW)
         {
-            b->setBounds (c.removeFromLeft (44));
+            b->setBounds (c.removeFromLeft (w));
             c.removeFromLeft (gap);
+            used += w + gap;
         }
         chipStar.setBounds (c.removeFromLeft (70));
-        a.removeFromLeft (150 + 6 + 4 * (44 + gap) + 70 + 10);
+        a.removeFromLeft (used + 70 + 10);
     }
     listArea = a;
     viewport.setBounds (listArea);

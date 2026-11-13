@@ -771,3 +771,7 @@ Test access added: `setSnapGridForTest` / `getSnapGridForTest`, `setZeroCrossing
 `third_party/` holds source taken from other projects, each folder with the upstream `LICENSE.txt` and a `README-VENDORED.txt` (URL, tag, commit, date, files taken). `third_party/.gitattributes` (`* -text`) keeps the files byte-identical to upstream. They are never edited here; their compiler warnings are switched off around the include in `source/TakeStretch.cpp`.
 
 To update: clone the new tag of `signalsmith-stretch` into a scratch folder, read the `GIT_TAG` of `signalsmith-linear` in its `CMakeLists.txt` and clone that tag too, copy only the files listed in each `README-VENDORED.txt` (`signalsmith-stretch.h`; `stft.h`, `fft.h`; both `LICENSE.txt`), then update the commit, tag and date in both README files and in `THIRD_PARTY_NOTICES.md`. Define none of the `SIGNALSMITH_USE_*` macros (they pull in `platform/` headers that are not vendored). Rebuild, then run `stretch-file` in both modes and compare the counts and the measured tempo with the CHANGELOG entry.
+
+## Mac build note: JUCE FetchContent on macOS SDK 14.2
+
+JUCE 8.0.12 fetched by FetchContent fails to build against the macOS 14.2 SDK. The workaround used for the 0.5.23 Mac build is to point the configure step at a local JUCE checkout with `-DJUCE_DIR=<path>` (or the `JUCE_DIR` environment variable, see CMakeLists.txt) instead of the FetchContent download. No build file was changed for this; it is a configure-time workaround only.

@@ -9,6 +9,7 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_formats/juce_audio_formats.h>
 
+#include <algorithm>
 #include <cmath>
 #include <exception>
 #include <memory>
@@ -16,6 +17,8 @@
 
 namespace TakeEdit
 {
+std::atomic<int> testLevelMutant { lvMutNone };
+
 std::atomic<const char*> testEditPartToken { nullptr };
 std::atomic<bool> testUntaggedWarp { false };
 
@@ -38,6 +41,12 @@ EditData EditData::sanitized (juce::int64 lengthSamples) const
         d.cropStart = d.cropEnd = -1; // nothing would be left
     if (d.loopStart < 0 || d.loopEnd <= d.loopStart)
         d.loopStart = d.loopEnd = -1;
+    auto lim = [] (double v, double lo, double hi) { return std::isfinite (v) ? juce::jlimit (lo, hi, v) : 0.0; };
+    d.fadeInMs = lim (fadeInMs, 0.0, kMaxUserFadeMs);
+    d.fadeOutMs = lim (fadeOutMs, 0.0, kMaxUserFadeMs);
+    d.loopXfadeMs = lim (loopXfadeMs, 0.0, kMaxLoopXfadeMs);
+    d.gainDb = lim (gainDb, kMinGainDb, kMaxGainDb);
+    d.reverse = reverse;
     return d;
 }
 
@@ -220,11 +229,16 @@ namespace
             std::vector<float> mono ((size_t) len, 0.0f);
             for (int c = 0; c < res.channels; ++c)
                 juce::FloatVectorOperations::add (mono.data(), in.getReadPointer (c), (int) len);
-            const auto window = (juce::int64) std::llround (juce::jlimit (0.0, kMaxFadeMs, opt.zeroCrossingMs) * sr / 1000.0);
+            const auto window = testLevelMutant.load() == lvMutNoZeroSnap ? (juce::int64) 0
+                              : (juce::int64) std::llround (juce::jlimit (0.0, kMaxFadeMs, opt.zeroCrossingMs) * sr / 1000.0);
+            const juce::int64 cs0 = cs, ce0 = ce;
             if (d.cropStart >= 0)
                 cs = nearestZeroCrossing (mono.data(), len, cs, window);
             if (d.cropEnd >= 0)
                 ce = nearestZeroCrossing (mono.data(), len, ce, window);
+            res.zeroSnapped = true;
+            res.zeroMoveStart = cs - cs0;
+            res.zeroMoveEnd = ce - ce0;
         }
         if (! loopRender && ce <= cs)
             return fail ("the crop region is empty");
@@ -232,6 +246,28 @@ namespace
             return fail ("aborted");
 
         const auto fadeAsked = (juce::int64) std::llround (juce::jlimit (0.0, kMaxFadeMs, opt.fadeMs) * sr / 1000.0);
+        const bool revOn = d.reverse && ! warpRender && testLevelMutant.load() != lvMutNoReverse;
+        // Loop seam length, known before the reverse so the pre-roll can be reversed with it.
+        juce::int64 seamX = 0;
+        if (loopRender)
+        {
+            const juce::int64 xUser = testLevelMutant.load() == lvMutNoXfade ? 0 : (juce::int64) std::llround (d.loopXfadeMs * sr / 1000.0);
+            seamX = juce::jmin (juce::jmax (fadeAsked, xUser), ls, (le - ls) / 2);
+            // Reversed, the audio before the loop start is the audio after its end, backwards.
+            if (revOn && testLevelMutant.load() != lvMutRevSeamForward)
+                seamX = juce::jmin (seamX, len - le);
+        }
+        // Reverse: the kept region backwards, after the crop and before the fades and gain.
+        // A loop reverses [ls - x, le + x): the loop stays in place and its pre-roll is the
+        // reversed audio after the loop end, so the seam fades from what plays.
+        if (revOn)
+        {
+            const juce::int64 pad = loopRender && testLevelMutant.load() != lvMutRevSeamForward ? seamX : 0;
+            const juce::int64 r0 = loopRender ? ls - pad : cs, r1 = loopRender ? le + pad : ce;
+            if (r0 >= 0 && r1 > r0)
+                for (int c = 0; c < in.getNumChannels(); ++c)
+                    std::reverse (in.getWritePointer (c) + r0, in.getWritePointer (c) + r1);
+        }
         juce::AudioBuffer<float> out;
         if (loopRender)
         {
@@ -239,7 +275,7 @@ namespace
             res.outSamples = cell * (juce::int64) opt.loopRepeats;
             if ((double) res.outSamples > sr * kMaxSeconds)
                 return fail ("the result would be longer than " + juce::String (kMaxSeconds / 60.0, 0) + " minutes");
-            const juce::int64 x = juce::jmin (fadeAsked, ls, cell / 2);
+            const juce::int64 x = seamX;
             res.seamFadeSamples = x;
             out.setSize (res.channels, (int) res.outSamples);
             // How alike the two overlapped segments are: the end of the loop and the audio
@@ -259,9 +295,7 @@ namespace
                         ab += (double) a[i] * (double) b[i];
                     }
                 }
-                const double den = std::sqrt (aa * bb);
-                if (den > 1.0e-20 && std::isfinite (den) && std::isfinite (ab))
-                    raw = juce::jlimit (-1.0, 1.0, ab / den);
+                raw = seamRawCorrelation (aa, bb, ab);
             }
             const double corr = juce::jlimit (0.0, 1.0, raw);
             res.seamCorrelation = raw;
@@ -275,10 +309,10 @@ namespace
                 // power gains, divided so the power stays flat for the correlation.
                 for (juce::int64 i = 0; i < x; ++i)
                 {
-                    const double t = ((double) i + 0.5) / (double) x;
                     const juce::int64 at = cell - x + i;
-                    const double ga = std::cos (t * kHalfPi), gb = std::sin (t * kHalfPi);
-                    first[at] = (float) (((double) first[at] * ga + (double) src[ls - x + i] * gb) / std::sqrt (1.0 + 2.0 * corr * ga * gb));
+                    double ga = 0.0, gb = 0.0;
+                    seamGains (i, x, corr, ga, gb);
+                    first[at] = (float) ((double) first[at] * ga + (double) src[ls - x + i] * gb);
                 }
                 for (int r = 1; r < opt.loopRepeats; ++r)
                 {
@@ -302,6 +336,11 @@ namespace
         {
             res.outSamples = ce - cs;
             const juce::int64 f = juce::jmin (fadeAsked, res.outSamples / 2);
+            // F1: the user fades, sine ramps from the crop start and to the crop end,
+            // applied whether or not the point is a real cut; each at most the region.
+            const bool noFade = testLevelMutant.load() == lvMutNoFade;
+            const juce::int64 fIn = noFade ? 0 : juce::jmin ((juce::int64) std::llround (d.fadeInMs * sr / 1000.0), res.outSamples);
+            const juce::int64 fOut = noFade ? 0 : juce::jmin ((juce::int64) std::llround (d.fadeOutMs * sr / 1000.0), res.outSamples);
             out.setSize (res.channels, (int) res.outSamples);
             for (int c = 0; c < res.channels; ++c)
             {
@@ -317,6 +356,10 @@ namespace
                     if (ce < len)
                         dst[res.outSamples - 1 - i] *= g;
                 }
+                for (juce::int64 i = 0; i < fIn; ++i)
+                    dst[i] *= (float) std::sin (((double) i + 0.5) / (double) fIn * kHalfPi);
+                for (juce::int64 i = 0; i < fOut; ++i)
+                    dst[res.outSamples - 1 - i] *= (float) std::sin (((double) i + 0.5) / (double) fOut * kHalfPi);
             }
             res.used.cropStart = cs;
             res.used.cropEnd = ce;
@@ -327,6 +370,8 @@ namespace
             }
         }
         in.setSize (0, 0);
+        if (d.gainDb != 0.0 && testLevelMutant.load() != lvMutNoGain) // F1: the gain of the take on the whole result
+            out.applyGain ((float) juce::Decibels::decibelsToGain (d.gainDb, -1000.0));
         if (opt.fitBars)
         {
             const auto fit = fitBars (res.outSamples / (loopRender ? opt.loopRepeats : 1), sr, opt.fitBpm, opt.fitBeatsPerBar);

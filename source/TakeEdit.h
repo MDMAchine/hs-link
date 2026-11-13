@@ -20,7 +20,33 @@ namespace TakeEdit
     constexpr int kMaxChannels = 8;
     constexpr int kMaxRepeats = 1024;
     constexpr double kMaxFadeMs = 1000.0;
+    // F1 level teeth (tests only): 0 none, 1 no user fades, 2 no loop xfade, 3 no gain.
+    enum { lvMutNone = 0, lvMutNoFade, lvMutNoXfade, lvMutNoGain, lvMutNoReverse, lvMutNoZeroSnap, lvMutRevSeamForward };
+    // lvMutNoZeroSnap: the zero crossing snap finds no crossing (the cuts stay where asked).
+    extern std::atomic<int> testLevelMutant;
+    constexpr double kMaxUserFadeMs = 2000.0, kMaxLoopXfadeMs = 500.0, kMinGainDb = -24.0, kMaxGainDb = 24.0;
     constexpr double kDefaultFadeMs = 5.0, kDefaultZeroCrossingMs = 3.0;
+
+    // Loop seam law, shared by renderEditFile and the editor audition so the two cannot
+    // drift. aa, bb, ab: energy sums and cross sum of the two overlapped segments, pooled
+    // per channel. Returns the signed normalised correlation (0 when not measurable).
+    inline double seamRawCorrelation (double aa, double bb, double ab) noexcept
+    {
+        const double den = std::sqrt (aa * bb);
+        if (den > 1.0e-20 && std::isfinite (den) && std::isfinite (ab))
+            return juce::jlimit (-1.0, 1.0, ab / den);
+        return 0.0;
+    }
+    // Frame i of an x frame seam, corr limited to 0..1: equal power gains divided so the
+    // power stays flat for that correlation. out = a * ga + b * gb.
+    inline void seamGains (long long i, long long x, double corr, double& ga, double& gb) noexcept
+    {
+        const double t = ((double) i + 0.5) / (double) x * 1.5707963267948966;
+        const double c = std::cos (t), s = std::sin (t);
+        const double n = 1.0 / std::sqrt (1.0 + 2.0 * corr * c * s);
+        ga = c * n;
+        gb = s * n;
+    }
 
     // The edit points a take keeps. All four are positions in SAMPLE FRAMES of the take's
     // own file at that file's own rate; -1 = not set. An end is exclusive (the first
@@ -32,10 +58,22 @@ namespace TakeEdit
     {
         juce::int64 cropStart = -1, cropEnd = -1;
         juce::int64 loopStart = -1, loopEnd = -1;
+        // F1 2026-11-12: level shaping of the take, kept beside the points (sidecar keys
+        // fade_in_ms, fade_out_ms, loop_xfade_ms, gain_db). Fades: sine (equal power)
+        // ramps at the crop start and end, 0 = only the built-in short fade at a real
+        // cut. Loop xfade: equal power crossfade at the loop seam, 0 = the built-in
+        // short seam fade only. Gain: dB on the whole result. Applied in the editor
+        // audition and in the Apply crop and Export loop renders.
+        double fadeInMs = 0.0, fadeOutMs = 0.0, loopXfadeMs = 0.0, gainDb = 0.0;
+        // Reverse 2026-11-12 (sidecar key reverse): the kept region plays backwards. Applied
+        // after the crop and before the fades and gain (crop render: the crop region; loop
+        // render: the loop region), in the audition and the renders.
+        bool reverse = false;
 
+        bool hasLevel() const { return fadeInMs > 0.0 || fadeOutMs > 0.0 || loopXfadeMs > 0.0 || gainDb != 0.0 || reverse; }
         bool hasCrop() const { return cropStart >= 0 || cropEnd >= 0; }
         bool hasLoop() const { return loopStart >= 0 && loopEnd > loopStart; }
-        bool isEmpty() const { return ! hasCrop() && ! hasLoop(); }
+        bool isEmpty() const { return ! hasCrop() && ! hasLoop() && ! hasLevel(); } // F1: level fields count
         // The same data with bad values taken out: a negative point is unset, a point
         // past lengthSamples is put at lengthSamples (lengthSamples < 0 = length not
         // known, no upper limit), a crop whose end is not after its start is unset as a
@@ -43,9 +81,22 @@ namespace TakeEdit
         EditData sanitized (juce::int64 lengthSamples = -1) const;
         bool operator== (const EditData& o) const
         {
-            return cropStart == o.cropStart && cropEnd == o.cropEnd && loopStart == o.loopStart && loopEnd == o.loopEnd;
+            return cropStart == o.cropStart && cropEnd == o.cropEnd && loopStart == o.loopStart && loopEnd == o.loopEnd
+                && fadeInMs == o.fadeInMs && fadeOutMs == o.fadeOutMs && loopXfadeMs == o.loopXfadeMs && gainDb == o.gainDb
+                && reverse == o.reverse;
         }
         bool operator!= (const EditData& o) const { return ! (*this == o); }
+    };
+
+    // R1b 2026-11-11: a beatgrid the user set by hand for one take (Set 1, nudge, bpm,
+    // half and double). set false = the detected grid is used. Kept beside the take like
+    // EditData; the render snaps on it when set and usable (gridUsable).
+    struct GridEdit
+    {
+        bool set = false;
+        double bpm = 0.0, downbeatSec = 0.0;
+        bool operator== (const GridEdit& o) const { return set == o.set && bpm == o.bpm && downbeatSec == o.downbeatSec; }
+        bool operator!= (const GridEdit& o) const { return ! (*this == o); }
     };
 
     struct EditOptions
@@ -112,6 +163,10 @@ namespace TakeEdit
         // fit. Loop render: the loop points; the crop points are -1 (not used).
         EditData used;
         bool gridSnapped = false;           // the grid snap was asked for and applied
+        // Crop render with snapToZeroCrossing: true, and how far each cut moved (frames,
+        // signed, + = later; 0 = it stayed). False = no zero crossing snap was made.
+        bool zeroSnapped = false;
+        juce::int64 zeroMoveStart = 0, zeroMoveEnd = 0;
         juce::int64 seamFadeSamples = 0;    // loop render: crossfade length at each seam
         // Loop render: the measured correlation of the two overlapped segments, signed,
         // -1..1 (see below). Near 1: the loop end runs into its own start. Near 0: the two

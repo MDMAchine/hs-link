@@ -85,17 +85,18 @@ public:
     juce::Font getLabelFont (juce::Label&) override;
 };
 
-// Covers the editor while the server is unreachable. Retry wakes the worker.
+// Banner over the Generate controls while the server is unreachable (the rest of the
+// editor stays usable). Retry wakes the worker.
 class OfflineOverlay : public juce::Component
 {
 public:
     OfflineOverlay();
-    void setMessage (const juce::String& url, const juce::String& err);
+    void setMessage (const juce::String& url, const juce::String& err, const juce::StringArray& attempts = {});
     void paint (juce::Graphics&) override;
     void resized() override;
     juce::TextButton retryButton { "Retry" };
 private:
-    juce::Label message, detail;
+    juce::Label message, detail, attemptsLabel;
 };
 
 // R5: one take in the grid. Mini waveform, star toggle, click to select.
@@ -120,19 +121,33 @@ public:
     // and no failed attempt (no badge; the drag is still refused).
     void setUnsaved (bool u, const juce::String& why, bool pending = false);
     bool isUnsaved() const { return unsaved; }
+    // Restored take whose file is gone: dimmed, FILE MISSING label, no waveform.
+    void setMissing (bool m) { if (m != missing) { missing = m; setAlpha (m ? 0.55f : 1.0f); repaint(); } }
+    bool isMissing() const { return missing; }
     void setIndex (int i) { if (i != index) { index = i; repaint(); } }
     // The measured-tempo tag in the waveform's lower left corner (TakeGrid::tempoTagOf).
     void setTempoTag (const TakeGrid::TempoTag& t) { if (t != tempoTag) { tempoTag = t; repaint(); } }
     void setFitTag (const TakeGrid::TempoTag& t) { if (t != fitTag) { fitTag = t; repaint(); } }
     const TakeGrid::TempoTag& getFitTag() const { return fitTag; }
     const TakeGrid::TempoTag& getTempoTag() const { return tempoTag; }
+    // The take length in the waveform's lower right corner (TakeGrid::lengthTextOf).
+    void setLengthText (const juce::String& t) { if (t != lengthText) { lengthText = t; repaint(); } }
+    const juce::String& getLengthText() const { return lengthText; }
+    // true when the length plate is drawn: inside the waveform, its text not cut, and
+    // clear of the tempo plate. plateOut/tempoOut: where they are ({} = not drawn).
+    bool lengthFitsForTest (juce::Rectangle<int>* plateOut = nullptr, juce::Rectangle<int>* tempoOut = nullptr) const;
+    juce::String tempoShownForTest() const { return tempoShown(); }
+    static float lengthTextWidthForTest (const juce::String& t) { return lengthTextWidth (t); }
     const juce::String key, label;
     // What the "x" button hands to onDelete: the full path of the take's temp file
     // (the processor's delete key). Two takes can share a name, so key is not used.
     juce::String deleteKey;
     // The file the waveform thumbnail was given when the cell was made ({} = none).
-    // Fixed for the cell's life: a kept cell is never re-pointed.
-    const juce::File thumbFile;
+    // A kept cell is re-pointed only when this file is gone (repointThumbIfGone).
+    juce::File thumbFile;
+    // src: TakeGrid::thumbSourceOf now. Re-points the waveform when thumbFile no longer
+    // exists and src does (the temp copy was cleaned up after the cell was made).
+    bool repointThumbIfGone (const juce::File& src);
     // Every action names the take by its key; the file is looked up by the owner then.
     std::function<void (const juce::String&)> onSelect;
     std::function<void (const juce::String&, bool)> onStar;
@@ -160,8 +175,15 @@ private:
     bool selected = false;
     bool dragStarted = false;
     bool unsaved = false, notCopiedYet = false, dragRefused = false;
+    bool missing = false;
     bool dragMissing = false; // the refusal is for a lasting file that is gone or empty
     TakeGrid::TempoTag tempoTag, fitTag;
+    juce::String lengthText;
+    juce::Rectangle<int> waveArea() const;       // the waveform rectangle paint() draws in
+    juce::Rectangle<int> tempoPlate() const;     // {} = no tempo tag
+    juce::Rectangle<int> lengthPlate() const;    // {} = no length (or no room in the whole waveform width)
+    juce::String tempoShown() const;             // the tempo tag, shortened so the length always shows
+    static float lengthTextWidth (const juce::String& t);
 };
 
 // R5: scrollable grid of takes; columns follow the width, rows scroll.
@@ -222,6 +244,14 @@ public:
     static juce::String stateLabel (const DawJob& j);
     static constexpr int kRowH = 22;
     int getNumCards() const { return (int) cards.size(); }
+    // Queued plus running jobs: the QUEUE header count. Finished cards stay listed but do not count.
+    int getNumActiveCards() const
+    {
+        int n = 0;
+        for (const auto& c : cards)
+            n += c.finished ? 0 : 1;
+        return n;
+    }
     // The empty-list hint and the lines paint() may wrap it to.
     static constexpr const char* kEmptyHint = "No jobs yet. Generate while a job runs to queue more.";
     static constexpr int kEmptyHintLines = 2;
@@ -287,7 +317,8 @@ private:
     CollectionChips chips;
     bool loaded = false;
     juce::TextEditor search;
-    juce::TextButton chipAll { "ALL" }, chipSa3 { "SA3" }, chipYue2 { "YuE2" }, chipAce { "ACE" }, chipStar { "* starred" };
+    juce::TextButton chipAll { "ALL" }, chipSa3 { "SA3" }, chipYue2 { "YuE2" }, chipAce { "ACE" },
+                     chipMiniMax { "MiniMax" }, chipHeart { "HeartMuLa" }, chipStar { "* starred" };
     juce::Viewport viewport;
     juce::Component content;
     juce::OwnedArray<CollectionRow> rows;
@@ -390,7 +421,7 @@ struct MidiBuildResult
     juce::String err;                        // empty = ok
 };
 // Reads in.src, writes <name>_hits.mid (and <name>_tempo.mid when hasTempo, and
-// <name>_notes.mid when the take is tonal, see MidiExport::isTonal) into destDir.
+// <name>_melody.mid when the take is tonal, see MidiExport::isTonal) into destDir.
 // Blocking file I/O: call from a background thread. Editor-free, so tests can call it.
 MidiBuildResult buildMidiFiles (const MidiBuildInputs& in, const juce::File& destDir);
 // buildMidiFiles, returning the full paths of the files that exist afterwards ({} on failure).
@@ -422,11 +453,18 @@ private:
     bool dragStarted = false, building = false;
 };
 
-class HotStepLinkEditor : public juce::AudioProcessorEditor, public juce::FileDragAndDropTarget
+class HotStepLinkEditor : public juce::AudioProcessorEditor, public juce::FileDragAndDropTarget, public juce::KeyListener
 {
 public:
     explicit HotStepLinkEditor (HotStepLinkProcessor&);
     ~HotStepLinkEditor() override;
+
+    // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z for the open take editor, caught at the top-level window
+    // (key listener) so they work whatever component holds focus, unless a TextEditor has it.
+    using juce::AudioProcessorEditor::keyPressed;
+    bool keyPressed (const juce::KeyPress&, juce::Component*) override;
+    void parentHierarchyChanged() override;
+    static std::atomic<bool> testNoTopLevelKeys; // teeth: the top-level undo/redo route is off
 
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -445,7 +483,7 @@ public:
     // the host gives none (never the stored last value or 120). Pure.
     static double fitHostBpm (bool isStandalone, const HostSyncState& s, double manualBpm);
 
-    // Standalone: drop a WAV as the repaint / lego source.
+    // Drop a WAV: the repaint / lego source, or a take on the TAKES plate (all formats).
     bool isInterestedInFileDrag (const juce::StringArray& files) override;
     void filesDropped (const juce::StringArray& files, int x, int y) override;
 
@@ -453,6 +491,11 @@ public:
     // tick including the part that runs on every 10th tick. getTakeGridForTest is the
     // model the grid was last filled from; getTakeCellKeysForTest the keys of the cells.
     void runRefreshForTest() { tick (true); }
+    // Label of the "+4 more like" button for a take label ({} = none selected); short so it fits.
+    // availWidth = button width minus the 4 px side margins; the take id is dropped when it would not fit.
+    static juce::String moreLikeTextFor (const juce::String& takeLabel, float availWidth = 1.0e9f);
+    static float moreLikeLabelWidth (const juce::String& text);
+    juce::TextButton& getMoreLikeButtonForTest() { return moreLikeButton; }
     const TakeGrid::Model& getTakeGridForTest() const { return takeModel; }
     juce::StringArray getTakeCellKeysForTest() const { return takeList.getCellKeys(); }
     const void* getTakeCellForTest (const juce::String& key) const { return takeList.cellForKey (key); }
@@ -463,6 +506,8 @@ public:
         return c != nullptr ? c->thumbFile : juce::File();
     }
     void selectTakeForTest (const juce::String& key) { selectTake (key); }
+    void setSettingsOpenForTest (bool open) { setSettingsOpen (open); }
+    bool settingsOpenForTest() const { return settingsPopover.isVisible(); }
     juce::File dragFileForTest (const juce::String& key) { return dragFileFor (key); }
     bool exportEnabledForTest() const { return exportWavButton.isEnabled(); }
     // The file Export WAV would read now ({} = nothing selected); no chooser is opened.
@@ -489,11 +534,44 @@ public:
     // The "Edit take" button without a click (false = no take cell is selected), and the panel.
     bool openTakeEditorForTest() { return openTakeEditor(); }
     TakeEditorPanel& getTakeEditorForTest() { return takeEditor; }
+    juce::Component::SafePointer<juce::Component> keyHost; // top-level component our KeyListener is on
     bool editTakeEnabledForTest() const { return editTakeButton.isEnabled(); }
+    // -1 = no cell for key, else 1 when the cell shows missing and is dimmed.
+    int takeCellMissingForTest (const juce::String& key) const;
     juce::Rectangle<int> editTakeBoundsForTest() const { return editTakeButton.getBounds(); }
     juce::Rectangle<int> reanalyzeBoundsForTest() const { return reanalyzeButton.getBounds(); }
     juce::Rectangle<int> setupPlateForTest() const { return setupPlate; }
     juce::Rectangle<int> generateBoundsForTest() const { return generateButton.getBounds(); }
+    // Offline banner (covers only the Generate controls) and the WAV-to-take path.
+    // Mutant: mutOverlayFullWindow = the banner covers the whole window again.
+    enum OfflineMutant { mutOfflineNone = 0, mutOverlayFullWindow = 1 };
+    int offlineMutantForTest = mutOfflineNone; // call resized() after setting
+    juce::Rectangle<int> offlineBannerBoundsForTest() const { return overlay.getBounds(); }
+    bool offlineBannerVisibleForTest() const { return overlay.isVisible(); }
+    juce::Rectangle<int> takesPlateForTest() const { return queuePlate; }
+    juce::Rectangle<int> addTakeBoundsForTest() const { return addTakeButton.getBounds(); }
+    bool generateEnabledForTest() const { return generateButton.isEnabled(); }
+    bool addTakeFromFileForTest (const juce::File& f) { return addTakeFromFile (f); }
+    // 0 take list, 1 Edit take, 2 audition Play, 3 Export WAV, 4 collection panel.
+    juce::Component* offlineTargetForTest (int which)
+    {
+        juce::Component* c[] = { &takeList, &editTakeButton, &playButton, &exportWavButton, &collectionPanel };
+        return which >= 0 && which < 5 ? c[which] : nullptr;
+    }
+    bool forceStandaloneForTest = false; // the test exe is not a standalone app: lets filesDropped run
+    // Teeth: true = Add as take and WAV drop are Standalone only again (the pre-E1 gate).
+    bool addTakeStandaloneOnlyForTest = false;
+    bool addTakeVisibleForTest() const { return addTakeButton.isVisible(); }
+    void applyAddTakeGateForTest() { addTakeButton.setVisible (addTakeAllowed()); resized(); }
+    bool noAutoSelectForTest = false; // teeth: a newly arrived take is not selected by refreshTakes
+    // Header counters (b1e6a71): the TAKES and QUEUE counts the editor last repainted for.
+    // Teeth HEADER_NO_REPAINT: noHeaderRepaintForTest restores the old code (no repaint
+    // after setCards, none on the auto-select early return of refreshTakes).
+    bool noHeaderRepaintForTest = false;
+    int queueCountShownForTest() const { return lastQueueCountShown; }
+    int takeCountShownForTest() const { return lastTakeCountShown; }
+    bool openEditorBlocksSelectForTest = false; // teeth: an open take editor blocks the auto-select (the v0.5.19 bug)
+    int takeCellCountForTest() const { return takeList.getNumCells(); }
     juce::Rectangle<int> exportWavBoundsForTest() const { return exportWavButton.getBounds(); }
     // Smallest window with the whole Preview section. Height: the rows of the middle plate
     // take 700 px, and previewWaveArea() needs a card of 60 px. Hosts clamp to this too.
@@ -551,6 +629,11 @@ private:
     // The grid model from the processor's take entries (no file-system call).
     TakeGrid::Model buildTakeModel();
     TakeGrid::Model takeModel;
+    juce::StringArray knownTakeKeys; // keys seen by the last refreshTakes (new-take auto-select)
+    bool takeKeysSeeded = false;
+    int lastTakeCountShown = -1;
+    int lastQueueCountShown = -1;
+    int lastJobCardShown = -1;
     void selectTake (const juce::String& key);
     juce::File dragFileFor (const juce::String& key);
     juce::File exportSource(); // the file Export reads, decided on the button press
@@ -567,6 +650,13 @@ private:
 
     // Source clip (plugin: Capture arm; standalone: Drop WAV + region fields)
     juce::TextButton captureButton { "Capture" }, dropButton { "Drop WAV..." };
+    // All formats: list a WAV as a take (no server). Drop WAV keeps setting the Source.
+    juce::TextButton addTakeButton { "Add as take..." };
+    std::unique_ptr<juce::FileChooser> addTakeChooser;
+    // Add as take + WAV drop: every format (VST3, CLAP, Standalone) since E1.
+    bool addTakeAllowed() const { return standalone || forceStandaloneForTest || ! addTakeStandaloneOnlyForTest; }
+    bool addTakeFromFile (const juce::File& f); // false = not a readable audio file / already listed
+    bool lastServerOnline = true;               // false = known offline: Generate is blocked
     // CAPTURE (Mockup A): stop-and-keep while recording (armCapture(false) keeps the
     // take); otherwise a disabled state readout (armed / captured N bars).
     juce::TextButton captureNowButton { "CAPTURE" };
@@ -623,6 +713,7 @@ private:
     juce::String lastPendingDelete;
     void deleteTake (const juce::String& tempPath);
     void undoDelete();
+    juce::uint32 lastTakesRestoreGen = 0; // D2: proc.getTakesRestoreGeneration() at the last refreshTakes
     juce::ToggleButton levelMatchButton { "Level match" };
     juce::TextButton playButton { "Play" }; // preview clock (all modes)
     juce::ToggleButton followHostButton { "Follow host" };
@@ -664,8 +755,9 @@ private:
     TakeEditorPanel takeEditor;
     juce::TextButton editTakeButton { "Edit take" };
     // "+4 MORE LIKE TAKE N" under the queue: acts on the selected take (moreLikeKey), off with none.
-    juce::TextButton moreLikeButton { "+4 MORE LIKE TAKE" };
+    juce::TextButton moreLikeButton { "+4 MORE LIKE" };
     juce::String moreLikeKey;
+    juce::String moreLikeLabel; // selected take's label, kept so resized() can re-fit the button text
     // "CLEAR UNSTARRED" beside it: every unstarred take to Deleted as one batch, one Undo.
     juce::TextButton clearUnstarredButton { "CLEAR UNSTARRED" };
     bool openTakeEditor();
@@ -707,11 +799,12 @@ private:
     int generateCount = 0; // generates sent from this editor: n of SeedSpread::spread
     juce::Slider manualBpm; // standalone only, app-owned
     // Seed + key: app settings in plugin state (not automatable).
-    juce::Label seedCaption, songKeyCaption;
+    juce::Label seedCaption, songKeyCaption, peakModeCaption;
     juce::TextEditor seedEditor;
     juce::ToggleButton seedRandomButton { "Random" };
     juce::TextButton diceButton { "Dice" };
     juce::ComboBox songKeyBox;
+    juce::ComboBox peakModeBox; // PeakGuard::Mode + 1 (KNOWN_ISSUES row 15)
     juce::Random diceRng; // message thread only
     void commitSeed();
     // The field holds a refused text: it keeps the text, shows the error outline and

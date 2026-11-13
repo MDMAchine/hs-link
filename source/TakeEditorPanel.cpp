@@ -1,6 +1,7 @@
 // HOT-STEP LINK -- TakeEditorPanel.cpp
 // Copyright (C) 2026 A&E Concepts. SPDX-License-Identifier: AGPL-3.0-or-later
 #include "TakeEditorPanel.h"
+#include <algorithm>
 #include <cmath>
 
 namespace
@@ -11,7 +12,11 @@ namespace
     const juce::Colour kAmber (0xffffb347), kRed (0xffff6b6b), kGreen (0xff6fd08c);
     constexpr int kPad = 12;
     constexpr int kPlayheadOverlayW = 126; // the playhead readout overlay at the right end of the ruler strip
-    constexpr int kAboveWave = 134, kFixedRows = 390; // waveform height = panel height - kFixedRows
+    constexpr int kAboveWave = 134, kFixedRows = 548; // readouts2: +22 for the warp readout line; R3: +34 for the quantize row; F1: +34 for the level row; F2: +34, level row wraps to two lines // waveform height = panel height - kFixedRows
+    // The grid row needs this content width on one row with every button at least 48 x 24;
+    // narrower, it wraps onto a second row (kGridWrapH more fixed height, the wave shrinks).
+    constexpr int kGridOneRowW = 750, kGridWrapH = 34;
+    constexpr juce::uint32 kWarpLimitFadeMs = 1500; // R2: the marker limit cue fades over this
     enum Tone { toneMade = 0, toneNothing = 1, toneFailed = 2, toneHint = 3, toneSeam = 4, toneSeamStrong = 5 };
 }
 
@@ -194,7 +199,7 @@ namespace TakeEditorMath
     }
 
     juce::int64 snapCropPoint (juce::int64 frame, juce::int64 other, bool movedEnd, const Grid& grid, double sampleRate,
-                               juce::int64 length, juce::int64 minLen)
+                               juce::int64 length, juce::int64 minLen, double stepBeats)
     {
         const int mut = testMutant.load (std::memory_order_relaxed);
         if (mut == mutSnapOff || ! gridUsable (grid, sampleRate))
@@ -202,6 +207,18 @@ namespace TakeEditorMath
         if ((frame <= 0 || frame >= length) && mut != mutSnapNoEnds)
             return frame; // a file end is a point of its own: it is always reached
         const double beat = sampleRate * 60.0 / grid.bpm, origin = grid.downbeatSec * sampleRate;
+        if (stepBeats != 1.0)
+        {
+            // Another step (the one the ruler draws): the same rules on lines stepBeats beats apart.
+            const double st = beat * clampStepBeats (stepBeats);
+            auto atS = [origin, st] (double j) { return (juce::int64) std::llround (origin + j * st); };
+            double j = std::round (((double) frame - origin) / st);
+            if (movedEnd && atS (j) < other + minLen)
+                j = std::ceil (((double) (other + minLen) - origin) / st);
+            else if (! movedEnd && atS (j) > other - minLen)
+                j = std::floor (((double) (other - minLen) - origin) / st);
+            return juce::jlimit ((juce::int64) 0, length, atS (j));
+        }
         double k = std::round (((double) frame - origin) / beat);
         // The nearest beat would come closer than minLen to the other point: one beat on.
         if (movedEnd && beatFrame (grid, sampleRate, k) < other + minLen)
@@ -211,7 +228,7 @@ namespace TakeEditorMath
         return juce::jlimit ((juce::int64) 0, length, beatFrame (grid, sampleRate, k));
     }
 
-    bool snapLoop (juce::int64& start, juce::int64& end, bool movedEnd, const Grid& grid, double sampleRate, juce::int64 length)
+    bool snapLoopBeats (juce::int64& start, juce::int64& end, bool movedEnd, const Grid& grid, double sampleRate, juce::int64 length)
     {
         if (testMutant.load (std::memory_order_relaxed) == mutSnapOff || ! gridUsable (grid, sampleRate) || length <= 0)
             return false;
@@ -256,6 +273,259 @@ namespace TakeEditorMath
         return true;
     }
 
+    Grid effectiveGrid (const Grid& detected, const TakeEdit::GridEdit& hand)
+    {
+        if (testMutant.load() == mutGridEditIgnored || ! hand.set || ! TakeEdit::gridUsable (hand.bpm, hand.downbeatSec))
+            return detected;
+        Grid g;
+        g.bpm = hand.bpm;
+        g.downbeatSec = hand.downbeatSec;
+        g.measured = true;
+        g.fallback = false;
+        return g;
+    }
+
+    static bool bpmInRange (double bpm) { return std::isfinite (bpm) && bpm >= TakeEdit::kMinBpm && bpm <= TakeEdit::kMaxBpm; }
+
+    double wrapDownbeat (double sec, double bpm)
+    {
+        if (testMutant.load() == mutGridNoWrap || ! bpmInRange (bpm) || ! std::isfinite (sec))
+            return sec;
+        const double bar = kBeatsPerBar * 60.0 / bpm;
+        const double w = sec - bar * std::floor (sec / bar);
+        return w >= bar ? 0.0 : w; // rounding at an exact bar line
+    }
+
+    TakeEdit::GridEdit gridWithDownbeat (const Grid& g, double sec)
+    {
+        TakeEdit::GridEdit e;
+        if (! bpmInRange (g.bpm) || ! std::isfinite (sec))
+            return e;
+        e.bpm = g.bpm;
+        e.downbeatSec = wrapDownbeat (sec, g.bpm);
+        e.set = TakeEdit::gridUsable (e.bpm, e.downbeatSec);
+        return e;
+    }
+
+    namespace
+    {
+        struct QuantizeChoice { const char* name; double beats; };
+        const QuantizeChoice kQuantizeChoices[] = {
+            { "1/64T", 1.0 / 24.0 }, { "1/64", 1.0 / 16.0 }, { "1/32T", 1.0 / 12.0 }, { "1/32", 1.0 / 8.0 },
+            { "1/16T", 1.0 / 6.0 },  { "1/16", 1.0 / 4.0 },  { "1/8T", 1.0 / 3.0 },   { "1/8", 1.0 / 2.0 },
+            { "1/4T", 2.0 / 3.0 },   { "1/4", 1.0 },         { "1/2T", 4.0 / 3.0 },   { "1/2", 2.0 },
+            { "1 bar", (double) kBeatsPerBar } };
+    }
+
+    int quantizeChoiceCount() { return (int) (sizeof (kQuantizeChoices) / sizeof (kQuantizeChoices[0])); }
+    juce::String quantizeChoiceName (int c) { return c >= 0 && c < quantizeChoiceCount() ? juce::String (kQuantizeChoices[c].name) : juce::String(); }
+    double quantizeChoiceBeats (int c) { return c >= 0 && c < quantizeChoiceCount() ? kQuantizeChoices[c].beats : 0.0; }
+
+    int quantizeMarkers (std::vector<WarpMarkers::Marker>& m, const std::vector<bool>& selected, const Grid& grid, double sampleRate,
+                         juce::int64 length, double stepBeats, double strengthPct)
+    {
+        if (! gridUsable (grid, sampleRate) || ! (stepBeats > 0.0) || length <= 0 || ! std::isfinite (strengthPct))
+            return 0;
+        const double k = testMutant.load() == mutQuantNoStrength ? 1.0 : juce::jlimit (0.0, 1.0, strengthPct / 100.0);
+        const double stepFrames = stepBeats * 60.0 / grid.bpm * sampleRate;
+        if (! (stepFrames >= 1.0))
+            return 0;
+        const double origin = (double) beatFrame (grid, sampleRate, 0.0);
+        std::vector<juce::int64> before, want;
+        for (std::size_t i = 0; i < m.size(); ++i)
+        {
+            before.push_back (m[i].dstFrame);
+            const double d = (double) m[i].dstFrame;
+            const double line = origin + std::round ((d - origin) / stepFrames) * stepFrames;
+            const auto target = juce::jlimit ((juce::int64) 0, length, (juce::int64) std::llround (line));
+            want.push_back (m[i].dstFrame + (juce::int64) std::llround ((double) (target - m[i].dstFrame) * k));
+        }
+        // Markers moving the same way can block each other in one pass (the later one has
+        // not left yet); a few passes, every other one from the right, settle them.
+        for (int pass = 0; pass < 4; ++pass)
+        {
+            bool changed = false;
+            for (std::size_t n = 0; n < m.size(); ++n)
+            {
+                const std::size_t i = (pass & 1) != 0 ? m.size() - 1 - n : n;
+                if (i >= selected.size() || ! selected[i] || m[i].dstFrame == want[i])
+                    continue;
+                const auto was = m[i].dstFrame;
+                WarpMarkers::moveTo (m, i, want[i], length);
+                changed = changed || m[i].dstFrame != was;
+            }
+            if (! changed)
+                break;
+        }
+        int moved = 0;
+        for (std::size_t i = 0; i < m.size(); ++i)
+            moved += m[i].dstFrame != before[i] ? 1 : 0;
+        return moved;
+    }
+
+    TakeEdit::GridEdit gridShifted (const Grid& g, double deltaSec)
+    {
+        if (! std::isfinite (g.downbeatSec) || ! std::isfinite (deltaSec))
+            return {};
+        return gridWithDownbeat (g, g.downbeatSec + deltaSec);
+    }
+
+    TakeEdit::GridEdit gridWithBpm (const Grid& g, double bpm)
+    {
+        TakeEdit::GridEdit e;
+        if (! std::isfinite (bpm) || bpm <= 0.0 || ! std::isfinite (g.downbeatSec))
+            return e;
+        e.bpm = juce::jlimit (TakeEdit::kMinBpm, TakeEdit::kMaxBpm, std::round (bpm * 1000.0) / 1000.0);
+        // The downbeat stays where it is (the lines around it stretch); kept wrapped.
+        e.downbeatSec = testMutant.load() == mutGridBpmMovesDownbeat ? 0.0 : wrapDownbeat (g.downbeatSec, e.bpm);
+        e.set = TakeEdit::gridUsable (e.bpm, e.downbeatSec);
+        return e;
+    }
+
+    TakeEdit::GridEdit gridScaled (const Grid& g, double factor)
+    {
+        const double b = g.bpm * factor;
+        if (! bpmInRange (g.bpm) || ! bpmInRange (b))
+            return {};
+        return gridWithBpm (g, b);
+    }
+
+    juce::String gridBpmText (double bpm)
+    {
+        return bpmInRange (bpm) ? juce::String (bpm, 2) : juce::String();
+    }
+
+    double clampStepBeats (double stepBeats)
+    {
+        return std::isfinite (stepBeats) && stepBeats > 0.0 ? juce::jlimit (kMinSnapStepBeats, 1.0e12, stepBeats) : 1.0;
+    }
+
+    juce::int64 snapLoopPoint (juce::int64 x, const Grid& grid, double sampleRate, juce::int64 length, double stepBeats, int dir)
+    {
+        // dir 0: the nearest target; -1: the largest target below x; +1: the smallest
+        // above x (-1 when there is none). Targets: the grid lines inside the file, 0 and length.
+        const double st = sampleRate * 60.0 / grid.bpm * clampStepBeats (stepBeats), origin = grid.downbeatSec * sampleRate;
+        auto at = [origin, st] (double j) { return (juce::int64) std::llround (origin + j * st); };
+        if (dir == 0)
+        {
+            juce::int64 best = 0;
+            auto consider = [&best, x, length] (juce::int64 c)
+            {
+                c = juce::jlimit ((juce::int64) 0, length, c);
+                if (std::abs (c - x) < std::abs (best - x))
+                    best = c;
+            };
+            consider (length);
+            const double j = std::round (((double) x - origin) / st);
+            consider (at (j - 1.0));
+            consider (at (j));
+            consider (at (j + 1.0));
+            return best;
+        }
+        if (dir < 0)
+        {
+            if (x <= 0)
+                return -1;
+            double j = std::floor (((double) x - origin) / st);
+            while (at (j) >= x)
+                j -= 1.0;
+            return juce::jmax ((juce::int64) 0, at (j));
+        }
+        if (x >= length)
+            return -1;
+        double j = std::ceil (((double) x - origin) / st);
+        while (at (j) <= x)
+            j += 1.0;
+        return juce::jmin (length, at (j));
+    }
+
+    bool snapLoop (juce::int64& start, juce::int64& end, bool movedEnd, const Grid& grid, double sampleRate, juce::int64 length,
+                   double stepBeats, bool keepOther)
+    {
+        const int mut = testMutant.load (std::memory_order_relaxed);
+        if (mut == mutSnapOff || ! gridUsable (grid, sampleRate) || length <= 0)
+            return false;
+        if (mut == mutLoopSnapBeats)
+            return snapLoopBeats (start, end, movedEnd, grid, sampleRate, length);
+        // Each handle to its nearest target (a grid line, 0 or the file end). When the two
+        // meet, the dragged one moves one target away; with no room there, the fixed one.
+        auto near = [&] (juce::int64 p) { return snapLoopPoint (juce::jlimit ((juce::int64) 0, length, p), grid, sampleRate, length, stepBeats, 0); };
+        if (keepOther && mut != mutLoopMovesOther)
+        {
+            // B1: a handle drag on an existing loop: only the dragged handle snaps, the
+            // other one stays exactly where it is (also when the start snaps to 0).
+            auto keep = [&] (juce::int64 p) { return juce::jlimit ((juce::int64) 0, length, p); };
+            juce::int64 s = movedEnd ? keep (start) : near (start), e = movedEnd ? near (end) : keep (end);
+            if (e <= s)
+            {
+                if (movedEnd)
+                    e = snapLoopPoint (s, grid, sampleRate, length, stepBeats, 1);
+                else
+                    s = snapLoopPoint (e, grid, sampleRate, length, stepBeats, -1);
+                if (s < 0 || e < 0 || e <= s)
+                    return false;
+            }
+            start = s;
+            end = e;
+            return true;
+        }
+        juce::int64 s = near (start), e = near (end);
+        if (e <= s)
+        {
+            const auto s0 = s, e0 = e;
+            if (movedEnd)
+                e = snapLoopPoint (s0, grid, sampleRate, length, stepBeats, 1);
+            else
+                s = snapLoopPoint (e0, grid, sampleRate, length, stepBeats, -1);
+            if (s < 0 || e <= s)
+            {
+                s = s0;
+                e = e0;
+                if (movedEnd)
+                    s = snapLoopPoint (e0, grid, sampleRate, length, stepBeats, -1);
+                else
+                    e = snapLoopPoint (s0, grid, sampleRate, length, stepBeats, 1);
+                if (s < 0 || e < 0 || e <= s)
+                    return false;
+            }
+        }
+        // Both on grid lines: the length is a whole number of steps measured from the start,
+        // the way the render counts it, so a render with the grid snap moves nothing.
+        {
+            const double st = sampleRate * 60.0 / grid.bpm * clampStepBeats (stepBeats), origin = grid.downbeatSec * sampleRate;
+            const double js = std::round (((double) s - origin) / st), je = std::round (((double) e - origin) / st);
+            auto at = [origin, st] (double j) { return (juce::int64) std::llround (origin + j * st); };
+            const auto e2 = s + (juce::int64) std::llround ((je - js) * st);
+            if (at (js) == s && at (je) == e && je > js && e2 <= length)
+                e = e2;
+        }
+        start = s;
+        end = e;
+        return true;
+    }
+
+    double gridStepBeats (const View& v, const Grid& grid, double sampleRate, int resolution)
+    {
+        // The step of beatLines (the finest division the ruler draws), as a number of beats.
+        if (! gridUsable (grid, sampleRate) || ! (v.framesPerPixel > 0.0))
+            return 1.0;
+        const double pxPerBeat = sampleRate * 60.0 / grid.bpm / v.framesPerPixel;
+        const int mut = testMutant.load (std::memory_order_relaxed);
+        double step = 1.0;
+        if (pxPerBeat < kMinBeatPx)
+            for (step = (double) kBeatsPerBar; step * pxPerBeat < kMinBeatPx && step < 1.0e12; step *= 2.0) {}
+        if (resolution != 0)
+            step = juce::jmax (mut == mutGridFloorBeat ? 1.0 : kMinSnapStepBeats, std::ldexp (step, juce::jlimit (-kMaxResolutionStep, kMaxResolutionStep, resolution)));
+        if (pxPerBeat >= kMinTagPx)
+        {
+            double tagStep = 1.0;
+            for (int n = 0; n < kMaxTagHalvings && 0.5 * tagStep * pxPerBeat >= (mut == mutTagTight ? 0.5 * kMinTagPx : kMinTagPx); ++n)
+                tagStep *= 0.5;
+            step = juce::jmin (step, tagStep);
+        }
+        return step;
+    }
+
     bool cropOnGrid (const TakeEdit::EditData& edit, const Grid& grid, double sampleRate, juce::int64 length)
     {
         if (! gridUsable (grid, sampleRate))
@@ -272,7 +542,7 @@ namespace TakeEditorMath
         if (! (start >= 0 && end > start))
             return false;
         auto s = start, e = end;
-        return snapLoop (s, e, true, grid, sampleRate, length) && s == start && e == end;
+        return snapLoopBeats (s, e, true, grid, sampleRate, length) && s == start && e == end;
     }
 
     bool scaleLoop (juce::int64& start, juce::int64& end, juce::int64 length, juce::int64 minLen, bool doubleIt)
@@ -300,7 +570,7 @@ namespace TakeEditorMath
         if (! all && resolution != 0)
         {
             step = std::ldexp (step, juce::jlimit (-kMaxResolutionStep, kMaxResolutionStep, resolution));
-            step = juce::jmax (1.0, step);
+            step = juce::jmax (testMutant.load (std::memory_order_relaxed) == mutGridFloorBeat ? 1.0 : kMinSnapStepBeats, step);
         }
         if (! all)
             while (labelBars * kBeatsPerBar * pxPerBeat < kMinBarLabelPx && labelBars < 1.0e12)
@@ -559,7 +829,22 @@ namespace TakeEditorMath
         if (asked.fitBars && report.result.bars > 0)
             t << ", " << report.result.bars << (report.result.bars == 1 ? " bar, " : " bars, ")
               << (report.result.leftoverMs >= 0.0 ? "+" : "") << juce::String (report.result.leftoverMs, 1) << " ms";
+        const auto moved = zeroMoveText (report.result);
+        if (moved.isNotEmpty())
+            t << ", " << moved;
         return t;
+    }
+
+    juce::String zeroMoveText (const TakeEdit::EditResult& result)
+    {
+        if (! result.zeroSnapped || ! (result.sampleRate > 0.0) || testMutant.load (std::memory_order_relaxed) == mutZeroMoveHidden)
+            return {};
+        auto ms = [&result] (juce::int64 frames)
+        {
+            const double v = (double) frames * 1000.0 / result.sampleRate;
+            return (v >= 0.0 ? juce::String ("+") : juce::String()) + juce::String (v, 1) + " ms";
+        };
+        return "cuts moved: start " + ms (result.zeroMoveStart) + ", end " + ms (result.zeroMoveEnd);
     }
 }
 
@@ -635,6 +920,7 @@ TakeEditorPanel::TakeEditorPanel()
     resetButton.setTooltip ("Put both crop handles back at the ends of the take and clear the loop");
     exportButton.setTooltip ("Make a new take that plays the part between the two loop flags as many times as Repeats says. This take is not changed.");
     exportButton.onClick = [this] { exportLoop(); };
+    repeatsBox.onValueChange = [this] { updateExportText(); };
     repeatsBox.setSliderStyle (juce::Slider::IncDecButtons);
     repeatsBox.setIncDecButtonsMode (juce::Slider::incDecButtonsNotDraggable);
     repeatsBox.setRange ((double) TakeEditorMath::kMinRepeats, (double) TakeEditorMath::kMaxRepeats, 1.0);
@@ -642,6 +928,7 @@ TakeEditorPanel::TakeEditorPanel()
     repeatsBox.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 34, 28);
     repeatsBox.setTooltip ("How many times the loop is played in the exported take (1 to 64)");
     addAndMakeVisible (repeatsBox);
+    updateExportText();
     cancelButton.setTooltip ("Close and put the crop points back as they were when the editor was opened");
     applyButton.setTooltip ("Make a new take from the part between the two handles. This take is not changed.");
     applyButton.setComponentID ("pink");
@@ -675,7 +962,7 @@ TakeEditorPanel::TakeEditorPanel()
         const int n = juce::roundToInt (v);
         return n == 0 ? juce::String ("A") : (n > 0 ? "x" : "/") + juce::String (1 << std::abs (n));
     };
-    gridResBox.setTooltip ("Grid resolution by hand: A = automatic, x2 x4... = fewer grid lines, /2 /4... = more (never finer than one line per beat)");
+    gridResBox.setTooltip ("Grid resolution by hand: A = automatic, x2 x4... = fewer grid lines, /2 /4... = more (down to 1/64 beat); drags snap to the grid drawn");
     gridResBox.onValueChange = [this] { stepResolution (juce::roundToInt (gridResBox.getValue()) - gridResolution); };
     loopHalfButton.onClick = [this] { scaleLoopLength (false); };
     loopDoubleButton.onClick = [this] { scaleLoopLength (true); };
@@ -694,6 +981,163 @@ TakeEditorPanel::TakeEditorPanel()
     applyWarpButton.onClick = [this] { applyWarp(); };
     for (auto* b : { (juce::Button*) &warpButton, (juce::Button*) &warpHostButton, (juce::Button*) &warpResetButton, (juce::Button*) &applyWarpButton })
         addAndMakeVisible (*b);
+    // R3: marker selection and quantize (their own row under the warp row).
+    warpSelLoopButton.setTooltip ("Select every warp marker inside the loop. Click a marker to select it, Shift + click to add or remove one, drag a box in the marker lane to select several.");
+    warpSelLoopButton.onClick = [this] { selectWarpInLoop(); };
+    for (int c = 0; c < TakeEditorMath::quantizeChoiceCount(); ++c)
+        quantizeBox.addItem (TakeEditorMath::quantizeChoiceName (c), c + 1);
+    quantizeBox.setSelectedItemIndex (TakeEditorMath::kQuantizeDefaultChoice, juce::dontSendNotification);
+    quantizeBox.setTooltip ("Quantize grid: the note value the selected markers move to, on the take's grid (as edited in the Grid row)");
+    quantizeStrengthBox.setSliderStyle (juce::Slider::IncDecButtons);
+    quantizeStrengthBox.setIncDecButtonsMode (juce::Slider::incDecButtonsNotDraggable);
+    quantizeStrengthBox.setRange (0.0, 100.0, 5.0);
+    quantizeStrengthBox.setValue (100.0, juce::dontSendNotification);
+    quantizeStrengthBox.setTextValueSuffix (" %");
+    quantizeStrengthBox.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 46, 28);
+    quantizeStrengthBox.setTooltip ("Quantize strength: 100 % puts the markers exactly on the grid, 50 % half way, 0 % leaves them");
+    quantizeButton.setTooltip ("Move the selected warp markers to the nearest grid line (each stays between its neighbours)");
+    quantizeButton.onClick = [this] { quantizeSelected(); };
+    for (auto* b : { (juce::Component*) &warpSelLoopButton, (juce::Component*) &quantizeBox, (juce::Component*) &quantizeStrengthBox, (juce::Component*) &quantizeButton })
+        addAndMakeVisible (*b);
+    // The quantize row words: "To" before the note value, "Strength" before the percent (tooltips name them in full).
+    for (auto* l : { &quantizeToLabel, &quantizeStrengthLabel })
+    {
+        l->setFont (juce::FontOptions (12.0f));
+        l->setColour (juce::Label::textColourId, kDim);
+        l->setJustificationType (juce::Justification::centredRight);
+        l->setBorderSize ({ 0, 0, 0, 2 });
+        addAndMakeVisible (*l);
+    }
+    quantizeToLabel.setText ("To", juce::dontSendNotification);
+    quantizeToLabel.setTooltip ("Quantize to: the note value the selected markers move to");
+    quantizeStrengthLabel.setText ("Strength", juce::dontSendNotification);
+    quantizeStrengthLabel.setTooltip ("Strength: how far the markers move toward the grid");
+    // F1: the level row. Every change is one undo step and goes to the processor (writeEdit).
+    {
+        struct L { juce::Label* label; const char* text; const char* tip; };
+        for (const auto& l : { L { &fadeInLabel, "In", "Fade in (ms): a sine fade at the start of the crop" },
+                               L { &fadeOutLabel, "Out", "Fade out (ms): a sine fade at the end of the crop" },
+                               L { &xfadeLabel, "Xf", "Loop crossfade (ms): an equal power crossfade at the loop seam" },
+                               L { &gainLabel, "Gain", "Gain (dB) on the whole take" } })
+        {
+            l.label->setText (l.text, juce::dontSendNotification);
+            l.label->setTooltip (l.tip);
+            l.label->setFont (juce::FontOptions (12.0f));
+            l.label->setColour (juce::Label::textColourId, kDim);
+            l.label->setJustificationType (juce::Justification::centredRight);
+            l.label->setBorderSize ({ 0, 0, 0, 2 });
+            addAndMakeVisible (*l.label);
+        }
+        struct B { juce::Slider* box; double lo, hi, step; const char* tip; double TakeEdit::EditData::* field; };
+        for (const auto& b : { B { &fadeInBox, 0.0, TakeEdit::kMaxUserFadeMs, 1.0, "Fade in, ms (0 to 2000)", &TakeEdit::EditData::fadeInMs },
+                               B { &fadeOutBox, 0.0, TakeEdit::kMaxUserFadeMs, 1.0, "Fade out, ms (0 to 2000)", &TakeEdit::EditData::fadeOutMs },
+                               B { &xfadeBox, 0.0, TakeEdit::kMaxLoopXfadeMs, 1.0, "Loop crossfade, ms (0 to 500)", &TakeEdit::EditData::loopXfadeMs },
+                               B { &gainBox, TakeEdit::kMinGainDb, TakeEdit::kMaxGainDb, 0.1, "Gain, dB (-24 to +24)", &TakeEdit::EditData::gainDb } })
+        {
+            // F1 polish: a readable value box with the unit and stacked - / + buttons, as
+            // Warp res; no thumb over the text. Typing a number works too.
+            b.box->setSliderStyle (juce::Slider::IncDecButtons);
+            b.box->setIncDecButtonsMode (juce::Slider::incDecButtonsNotDraggable);
+            b.box->setTextBoxStyle (juce::Slider::TextBoxLeft, false, 46, 28);
+            b.box->setRange (b.lo, b.hi, b.step);
+            const bool isGain = b.box == &gainBox;
+            b.box->textFromValueFunction = [isGain] (double v)
+            {
+                return isGain ? (v > 0.0 ? "+" : "") + juce::String (v, 1) + " dB" : juce::String (juce::roundToInt (v)) + " ms";
+            };
+            b.box->valueFromTextFunction = [] (const juce::String& t) { return t.retainCharacters ("+-.0123456789").getDoubleValue(); };
+            b.box->updateText();
+            b.box->setValue (0.0, juce::dontSendNotification);
+            b.box->setTooltip (b.tip);
+            b.box->setDoubleClickReturnValue (true, 0.0);
+            auto* box = b.box;
+            const auto field = b.field;
+            b.box->onValueChange = [this, box, field] { setLevelField (field, box->getValue()); };
+            addAndMakeVisible (*b.box);
+        }
+        normalizeButton.setTooltip ("Set the gain so the peak of the cropped take is -1 dBFS");
+        normalizeButton.onClick = [this] { normalizeGain(); };
+        addAndMakeVisible (normalizeButton);
+        reverseButton.setClickingTogglesState (false);
+        reverseButton.setTooltip ("Reverse: play the cropped take backwards (audition, Apply crop and Export loop)");
+        reverseButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff3a6ea5));
+        reverseButton.onClick = [this] { setReverse (! take.edit.reverse); };
+        addAndMakeVisible (reverseButton);
+        peakLabel.setFont (juce::FontOptions (12.0f));
+        peakLabel.setColour (juce::Label::textColourId, kDim);
+        peakLabel.setTooltip ("Peak of the cropped take after the gain, dBFS");
+        addAndMakeVisible (peakLabel);
+    }
+    // R1b beatgrid editing: the grid row (Set 1, nudge, bpm, half and double, Reset grid).
+    gridLabel.setText ("Grid", juce::dontSendNotification);
+    gridLabel.setFont (juce::FontOptions (12.0f));
+    gridLabel.setColour (juce::Label::textColourId, kDim);
+    addAndMakeVisible (gridLabel);
+    gridBpmField.setFont (juce::FontOptions (12.0f));
+    gridBpmField.setJustificationType (juce::Justification::centred);
+    gridBpmField.setEditable (true, false, false);
+    gridBpmField.setColour (juce::Label::backgroundColourId, kField);
+    gridBpmField.setColour (juce::Label::outlineColourId, kEdge);
+    gridBpmField.setColour (juce::Label::textColourId, kText);
+    gridBpmField.setColour (juce::Label::backgroundWhenEditingColourId, kField);
+    gridBpmField.setColour (juce::Label::textWhenEditingColourId, kBright);
+    gridBpmField.setColour (juce::Label::outlineWhenEditingColourId, kAccent);
+    gridBpmField.setTooltip ("Grid tempo in bpm (30 to 300). Type a value; the downbeat stays. Not the Fit to bars tempo.");
+    gridBpmField.onTextChange = [this] { gridBpmTyped(); };
+    addAndMakeVisible (gridBpmField);
+    gridSetButton.setTooltip ("Set 1: put the downbeat at the playhead, or at the last click on the ruler or waveform. Alt + click on the ruler does it there.");
+    gridBpmUnit.setText ("BPM", juce::dontSendNotification);
+    gridBpmUnit.setFont (juce::FontOptions (11.0f));
+    gridBpmUnit.setJustificationType (juce::Justification::centredLeft);
+    gridBpmUnit.setColour (juce::Label::textColourId, kText);
+    gridBpmUnit.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (gridBpmUnit);
+    for (auto* l : { &tempoUnit, &gridResLabel })
+    {
+        l->setFont (juce::FontOptions (11.0f));
+        l->setColour (juce::Label::textColourId, kText);
+        l->setInterceptsMouseClicks (false, false);
+        addAndMakeVisible (*l);
+    }
+    tempoUnit.setText ("BPM", juce::dontSendNotification);
+    tempoUnit.setJustificationType (juce::Justification::centredLeft);
+    gridResLabel.setText ("Warp res", juce::dontSendNotification);
+    gridResLabel.setTooltip ("Warp resolution: the grid step markers snap to and quantize on");
+    gridResLabel.setJustificationType (juce::Justification::centredRight);
+    gridEarlierButton.setTooltip ("Nudge: shift the grid 1 ms earlier (Shift: 10 ms). Ctrl + drag on the ruler drags the grid.");
+    gridLaterButton.setTooltip ("Nudge: shift the grid 1 ms later (Shift: 10 ms). Ctrl + drag on the ruler drags the grid.");
+    gridBpmDownButton.setTooltip ("Grid tempo -0.01 bpm (Shift: -0.1)");
+    gridBpmUpButton.setTooltip ("Grid tempo +0.01 bpm (Shift: +0.1)");
+    gridHalfButton.setTooltip ("Grid /2: half the grid tempo (not the loop length)");
+    gridDoubleButton.setTooltip ("Grid x2: double the grid tempo (not the loop length)");
+    gridResetButton.setTooltip ("Back to the detected grid");
+    auto shiftDown = [] { return juce::ModifierKeys::getCurrentModifiers().isShiftDown(); };
+    gridSetButton.onClick = [this] { setGridDownbeat (gridSetFrame()); };
+    gridEarlierButton.onClick = [this, shiftDown] { applyGridEdit (TakeEditorMath::gridShifted (take.grid, -(shiftDown() ? TakeEditorMath::kGridNudgeShiftSec : TakeEditorMath::kGridNudgeSec))); };
+    gridLaterButton.onClick = [this, shiftDown] { applyGridEdit (TakeEditorMath::gridShifted (take.grid, shiftDown() ? TakeEditorMath::kGridNudgeShiftSec : TakeEditorMath::kGridNudgeSec)); };
+    gridBpmDownButton.onClick = [this, shiftDown] { gridBpmStep (-(shiftDown() ? TakeEditorMath::kGridBpmShiftStep : TakeEditorMath::kGridBpmStep)); };
+    gridBpmUpButton.onClick = [this, shiftDown] { gridBpmStep (shiftDown() ? TakeEditorMath::kGridBpmShiftStep : TakeEditorMath::kGridBpmStep); };
+    gridHalfButton.onClick = [this] { applyGridEdit (TakeEditorMath::gridScaled (take.grid, 0.5)); };
+    gridDoubleButton.onClick = [this] { applyGridEdit (TakeEditorMath::gridScaled (take.grid, 2.0)); };
+    gridResetButton.onClick = [this] { resetGrid(); };
+    addAndMakeVisible (clickButton);
+    clickButton.setTooltip ("Metronome on the audition, on the grid beats (never in a render)");
+    clickButton.onClick = [this] { sendClick(); };
+    for (auto* b : { &gridSetButton, &gridEarlierButton, &gridLaterButton, &gridBpmDownButton, &gridBpmUpButton,
+                     &gridHalfButton, &gridDoubleButton, &gridResetButton })
+        addAndMakeVisible (*b);
+    // readouts2: the grid offset since Set 1 / Reset grid / open, and the warp marker line.
+    for (auto* l : { &gridOffsetLabel, &warpInfoLabel })
+    {
+        l->setFont (juce::FontOptions (11.0f));
+        l->setColour (juce::Label::textColourId, kText);
+        l->setInterceptsMouseClicks (false, false);
+        l->setBorderSize ({ 0, 2, 0, 2 });
+        addAndMakeVisible (*l);
+    }
+    gridOffsetLabel.setJustificationType (juce::Justification::centredLeft);
+    gridOffsetLabel.setTooltip ("Grid offset from the first-beat position set by Set 1, Reset grid or opening the take");
+    warpInfoLabel.setJustificationType (juce::Justification::centredLeft);
     // Horizontal zoom: -, +, Fit at the right of the scroll bar row. Not persisted.
     zoomOutButton.setTooltip ("Zoom out (the mouse wheel over the waveform zooms about the pointer; Shift + wheel scrolls)");
     zoomInButton.setTooltip ("Zoom in (the mouse wheel over the waveform zooms about the pointer; Shift + wheel scrolls)");
@@ -708,23 +1152,270 @@ TakeEditorPanel::TakeEditorPanel()
     scrollBar.setAutoHide (false);
     scrollBar.addListener (this);
     addChildComponent (scrollBar);
+    // R4: undo and redo, at the right of the title row next to Close.
+    undoButton.setTooltip ("Undo the last edit (Ctrl+Z)");
+    redoButton.setTooltip ("Redo (Ctrl+Y or Ctrl+Shift+Z)");
+    undoButton.onClick = [this] { undo(); };
+    redoButton.onClick = [this] { redo(); };
+    addAndMakeVisible (undoButton);
+    addAndMakeVisible (redoButton);
+    setWantsKeyboardFocus (! testNoFocusGrab.load()); // teeth NO_FOCUS_GRAB: the panel takes no focus at all
+    addMouseListener (&focusGrabber, true);
     zoomChanged();
     refreshButtons();
     refreshAudition();
 }
 
+//==============================================================================
+// R4 undo
+std::atomic<bool> TakeEditorPanel::testNormOff { false }, TakeEditorPanel::testLevelNotInUndo { false }, TakeEditorPanel::testOldLevelLayout { false };
+
+bool TakeEditorPanel::UndoSnapshot::sameEdit (const UndoSnapshot& o) const
+{
+    if (cropStart != o.cropStart || cropEnd != o.cropEnd || loopStart != o.loopStart || loopEnd != o.loopEnd
+        || gridEdit != o.gridEdit || markersEdited != o.markersEdited || warpTagBpm != o.warpTagBpm
+        || markers.size() != o.markers.size()
+        || fadeInMs != o.fadeInMs || fadeOutMs != o.fadeOutMs || loopXfadeMs != o.loopXfadeMs || gainDb != o.gainDb
+        || reverse != o.reverse)
+        return false;
+    for (std::size_t i = 0; i < markers.size(); ++i)
+        if (markers[i].srcFrame != o.markers[i].srcFrame || markers[i].dstFrame != o.markers[i].dstFrame)
+            return false;
+    return true;
+}
+
+TakeEditorPanel::UndoSnapshot TakeEditorPanel::takeSnapshot() const
+{
+    ensureWarp();
+    UndoSnapshot s;
+    s.cropStart = cropStart;
+    s.cropEnd = cropEnd;
+    s.loopStart = loopStart;
+    s.loopEnd = loopEnd;
+    s.gridEdit = take.gridEdit;
+    s.markers = warpMarkers;
+    s.markersEdited = markersEdited;
+    s.warpTagBpm = warpTagBpm;
+    s.fadeInMs = take.edit.fadeInMs;
+    s.fadeOutMs = take.edit.fadeOutMs;
+    s.loopXfadeMs = take.edit.loopXfadeMs;
+    s.gainDb = take.edit.gainDb;
+    s.reverse = take.edit.reverse;
+    return s;
+}
+
+void TakeEditorPanel::beginGesture()
+{
+    if (restoring || ! opened)
+        return;
+    gestureBefore = takeSnapshot();
+    gestureOpen = true;
+}
+
+void TakeEditorPanel::endGesture()
+{
+    if (! gestureOpen)
+        return;
+    gestureOpen = false;
+    if (! opened || gestureBefore.sameEdit (takeSnapshot()))
+        return; // a still click, or an edit that changed nothing: no step
+    undoStack.push_back (std::move (gestureBefore));
+    if ((int) undoStack.size() > kUndoCap)
+        undoStack.erase (undoStack.begin());
+    redoStack.clear();
+    storeWarp();
+    refreshButtons();
+}
+
+void TakeEditorPanel::storeWarp()
+{
+    if (! onSetWarp || ! opened)
+        return;
+    const bool any = markersEdited || warpTagBpm > 0.0 || WarpMarkers::movedCount (warpMarkers) > 0;
+    onSetWarp (take.temp, any ? warpMarkers : std::vector<WarpMarkers::Marker> {}, any && markersEdited, any ? warpTagBpm : 0.0);
+}
+
+void TakeEditorPanel::clearHistory()
+{
+    undoStack.clear();
+    redoStack.clear();
+    gestureOpen = false;
+}
+
+void TakeEditorPanel::saveHistory (bool cancelled)
+{
+    endGesture();
+    if (! take.temp.existsAsFile())
+    {
+        histories.erase (historyKey (take.temp)); // a deleted take keeps nothing
+        return;
+    }
+    auto& h = histories[historyKey (take.temp)];
+    if (cancelled)
+        h = openedHistory; // Cancel undoes the visit, its steps go with it
+    else
+    {
+        h.undo = undoStack;
+        h.redo = redoStack;
+    }
+    h.used = ++historyClock;
+    if (h.undo.empty() && h.redo.empty())
+        histories.erase (historyKey (take.temp));
+    while ((int) histories.size() > kHistoryTakes)
+    {
+        auto oldest = histories.begin();
+        for (auto it = histories.begin(); it != histories.end(); ++it)
+            if (it->second.used < oldest->second.used)
+                oldest = it;
+        histories.erase (oldest);
+    }
+}
+
+void TakeEditorPanel::loadHistory()
+{
+    clearHistory();
+    openedHistory = {};
+    if (testUndoClearedOnOpen.load())
+        return;
+    const auto it = histories.find (historyKey (take.temp));
+    if (it == histories.end())
+        return;
+    openedHistory = it->second;
+    undoStack = it->second.undo;
+    redoStack = it->second.redo;
+}
+
+void TakeEditorPanel::forgetHistory (const juce::File& takeFile)
+{
+    histories.erase (historyKey (takeFile));
+    if (opened && take.temp == takeFile)
+    {
+        clearHistory();
+        openedHistory = {};
+        refreshButtons();
+    }
+}
+
+void TakeEditorPanel::restoreSnapshot (const UndoSnapshot& s)
+{
+    restoring = true;
+    cropStart = s.cropStart;
+    cropEnd = s.cropEnd;
+    loopStart = s.loopStart;
+    loopEnd = s.loopEnd;
+    if (s.gridEdit != take.gridEdit && TakeEditorMath::testMutant.load() != TakeEditorMath::mutUndoSkipsGrid)
+        storeGridEdit (s.gridEdit); // stores it on the take (onSetGrid) and redraws
+    warpMarkers = s.markers; // after the grid: the grid change may have placed them again
+    warpBuilt = ! warpMarkers.empty();
+    markersEdited = s.markersEdited;
+    warpTagBpm = s.warpTagBpm;
+    if (! testLevelNotInUndo.load())
+    {
+        take.edit.fadeInMs = s.fadeInMs;
+        take.edit.fadeOutMs = s.fadeOutMs;
+        take.edit.loopXfadeMs = s.loopXfadeMs;
+        take.edit.gainDb = s.gainDb;
+        take.edit.reverse = s.reverse;
+    }
+    syncLevelBoxes();
+    gridBpmField.setText (TakeEditorMath::gridBpmText (take.grid.bpm), juce::dontSendNotification);
+    if (! waiting)
+        resultHeld = false;
+    writeEdit();
+    storeWarp();
+    refreshTexts();
+    refreshButtons();
+    repaint();
+    restoring = false;
+}
+
+bool TakeEditorPanel::undo()
+{
+    endGesture(); // a drag still open is a step of its own first
+    if (! opened || waiting || undoStack.empty() || dragging != TakeEditorMath::handleNone || warpDrag >= 0)
+        return false;
+    redoStack.push_back (takeSnapshot());
+    const auto s = undoStack.back();
+    undoStack.pop_back();
+    restoreSnapshot (s);
+    return true;
+}
+
+bool TakeEditorPanel::redo()
+{
+    endGesture();
+    if (! opened || waiting || redoStack.empty() || dragging != TakeEditorMath::handleNone || warpDrag >= 0)
+        return false;
+    undoStack.push_back (takeSnapshot());
+    const auto s = redoStack.back();
+    redoStack.pop_back();
+    restoreSnapshot (s);
+    return true;
+}
+
+bool TakeEditorPanel::keyPressed (const juce::KeyPress& k)
+{
+    const auto m = k.getModifiers();
+    if (! m.isCommandDown() || m.isAltDown())
+        return false;
+    int c = k.getKeyCode();
+    // Real Windows input: with Ctrl held JUCE delivers the control character (Ctrl+Z = 0x1A),
+    // not 'Z'. Map Ctrl+A..Ctrl+Z control codes back to their letters.
+    if (c >= 1 && c <= 26 && ! testNoCtrlCharMap.load())
+        c += 'A' - 1;
+    if (c == 'Z' || c == 'z')
+    {
+        if (m.isShiftDown())
+            redo();
+        else
+            undo();
+        return true;
+    }
+    if ((c == 'Y' || c == 'y') && ! m.isShiftDown())
+    {
+        redo();
+        return true;
+    }
+    return false;
+}
+
+void TakeEditorPanel::loopBodyDragForTest (juce::int64 pressFrame, juce::int64 nowFrame)
+{
+    if (! hasLoop())
+        return;
+    endGesture();
+    beginGesture();
+    dragging = TakeEditorMath::handleStart;
+    dragLoop = loopBodyDrag = true;
+    loopBodyOffset = pressFrame - loopStart;
+    loopBodyFrom = loopStart;
+    grabOffset = 0.0;
+    loopBodyMoveTo (nowFrame);
+    releaseDrag();
+}
+
 double TakeEditorPanel::warpTargetBpm() const
 {
-    const double host = onHostBpm ? TakeEditorMath::fitTempoFromHost (onHostBpm()) : 0.0;
+    const double host = onWarpHostBpm ? TakeEditorMath::fitTempoFromHost (onWarpHostBpm()) : 0.0;
     return host > 0.0 ? host : TakeEditorMath::fitTempo (fitBpm);
 }
 
 void TakeEditorPanel::warpToHost()
 {
     ensureWarp();
+    const double hostBpm = onWarpHostBpm ? TakeEditorMath::fitTempoFromHost (onWarpHostBpm()) : 0.0;
+    if (opened && ! (hostBpm > 0.0))
+    {
+        // B1: no host tempo (Standalone, or the host did not say): leave the markers alone and say why.
+        warpHostNote = "No host tempo: Warp to host needs a DAW";
+        repaint();
+        return;
+    }
+    warpHostNote = {};
     const double to = warpTargetBpm();
     if (! opened || waiting || warpMarkers.size() < 2 || ! (to > 0.0) || ! gridIsUsable())
         return;
+    const Step step (*this);
     warpMarkers = WarpMarkers::scaleToTempo (warpMarkers, take.grid.bpm, to);
     warpTagBpm = to;
     gridResBox.setValue ((double) gridResolution, juce::dontSendNotification);
@@ -736,12 +1427,100 @@ void TakeEditorPanel::resetMarkers()
 {
     if (! opened)
         return;
+    const Step step (*this);
     warpBuilt = false;
     markersEdited = false;
     warpTagBpm = 0.0;
+    warpHostNote = {};
     ensureWarp();
     refreshButtons();
     repaint();
+}
+
+void TakeEditorPanel::gridChanged (const TakeEditorMath::Grid& before)
+{
+    // Warp markers still on their auto places follow the new bar starts; markers moved,
+    // added or removed by hand stay (Reset markers then places them on this grid).
+    if ((before.bpm != take.grid.bpm || before.downbeatSec != take.grid.downbeatSec)
+        && TakeEditorMath::testMutant.load() != TakeEditorMath::mutGridMarkersStale
+        && (TakeEditorMath::testMutant.load() == TakeEditorMath::mutGridDropsHand
+            || (! markersEdited && WarpMarkers::movedCount (warpMarkers) == 0)))
+    {
+        warpBuilt = false;
+        warpMarkers.clear();
+        warpTagBpm = 0.0;
+        ensureWarp();
+    }
+    gridBpmField.setText (TakeEditorMath::gridBpmText (take.grid.bpm), juce::dontSendNotification);
+    refreshTexts();
+    refreshButtons();
+    repaint();
+}
+
+void TakeEditorPanel::storeGridEdit (const TakeEdit::GridEdit& e)
+{
+    const auto before = take.grid;
+    take.gridEdit = e;
+    if (onSetGrid && TakeEditorMath::testMutant.load() != TakeEditorMath::mutGridNotStored)
+        onSetGrid (take.temp, take.gridEdit);
+    take.grid = TakeEditorMath::effectiveGrid (detectedGrid, take.gridEdit);
+    gridChanged (before);
+    refreshReadouts2();
+}
+
+void TakeEditorPanel::applyGridEdit (const TakeEdit::GridEdit& e)
+{
+    // A result that is not set (out of range, no tempo) changes nothing.
+    if (! opened || waiting || ! e.set)
+        return;
+    const Step step (*this);
+    storeGridEdit (e);
+}
+
+juce::int64 TakeEditorPanel::gridSetFrame() const
+{
+    return playheadFrame >= 0 ? playheadFrame : lastClickFrame;
+}
+
+void TakeEditorPanel::setGridDownbeat (juce::int64 frame)
+{
+    if (frame < 0 || ! (sampleRate > 0.0))
+        return;
+    applyGridEdit (TakeEditorMath::gridWithDownbeat (take.grid, (double) frame / sampleRate));
+    if (TakeEditorMath::testMutant.load() != TakeEditorMath::mutR2OffsetNoReset)
+        gridAnchorSec = take.grid.downbeatSec; // readouts2: Set 1 is the new zero
+    refreshReadouts2();
+}
+
+void TakeEditorPanel::gridBpmStep (double delta)
+{
+    applyGridEdit (TakeEditorMath::gridWithBpm (take.grid, take.grid.bpm + delta));
+}
+
+void TakeEditorPanel::gridBpmTyped()
+{
+    const auto text = gridBpmField.getText().trim().replaceCharacter (',', '.');
+    const double v = text.getDoubleValue();
+    if (text.isNotEmpty() && text.containsOnly ("0123456789.") && v >= TakeEdit::kMinBpm && v <= TakeEdit::kMaxBpm)
+        applyGridEdit (TakeEditorMath::gridWithBpm (take.grid, v));
+    gridBpmField.setText (TakeEditorMath::gridBpmText (take.grid.bpm), juce::dontSendNotification); // a bad value reverts
+}
+
+void TakeEditorPanel::resetGrid()
+{
+    if (! opened || waiting || ! take.gridEdit.set)
+        return;
+    const Step step (*this);
+    storeGridEdit (TakeEdit::GridEdit());
+    gridAnchorSec = take.grid.downbeatSec; // readouts2: back to the detected first beat
+    refreshReadouts2();
+}
+
+void TakeEditorPanel::gridRulerDragForTest (juce::int64 pressFrame, juce::int64 nowFrame)
+{
+    gridDragFrom = take.grid;
+    if (sampleRate > 0.0)
+        applyGridEdit (TakeEditorMath::gridShifted (gridDragFrom, (double) (nowFrame - pressFrame) / sampleRate));
 }
 
 void TakeEditorPanel::applyWarp()
@@ -768,6 +1547,7 @@ void TakeEditorPanel::auditionPlay()
     }
     sentRegionStart = loop ? loopStart : 0;
     sentRegionEnd = loop ? loopEnd : length;
+    sendAuditionLevel();
     onAuditionPlay (take.temp, sentRegionStart, sentRegionEnd, length, loopButton.getToggleState());
     refreshAudition();
 }
@@ -816,8 +1596,31 @@ void TakeEditorPanel::refreshAudition()
     stopButton.setEnabled (state != 0);
 }
 
+void TakeEditorPanel::FocusGrabber::mouseDown (const juce::MouseEvent& e)
+{
+    // A text field (or anything inside one) keeps its own focus and its own Ctrl+Z.
+    for (auto* c = e.eventComponent; c != nullptr && c != &panel; c = c->getParentComponent())
+        if (dynamic_cast<juce::TextEditor*> (c) != nullptr)
+            return;
+    if (! testNoFocusGrab.load())
+        panel.grabFocusIfShowing();
+}
+
+void TakeEditorPanel::grabFocusIfShowing()
+{
+    if (isShowing() && ! hasKeyboardFocus (false))
+        grabKeyboardFocus();
+}
+
+void TakeEditorPanel::visibilityChanged()
+{
+    if (isVisible())
+        grabFocusIfShowing();
+}
+
 TakeEditorPanel::~TakeEditorPanel()
 {
+    removeMouseListener (&focusGrabber);
     if (onAuditionStop)
         onAuditionStop();
     cancelBuild();
@@ -827,6 +1630,10 @@ TakeEditorPanel::~TakeEditorPanel()
 std::atomic<bool> TakeEditorPanel::testMatchByName { false };
 std::atomic<bool> TakeEditorPanel::testNoTimeout { false };
 std::atomic<bool> TakeEditorPanel::testKeepExpiredTicket { false };
+std::atomic<bool> TakeEditorPanel::testNoFocusGrab { false };
+std::atomic<bool> TakeEditorPanel::testOpenWipesWarp { false };
+std::atomic<bool> TakeEditorPanel::testUndoClearedOnOpen { false };
+std::atomic<bool> TakeEditorPanel::testNoCtrlCharMap { false };
 std::atomic<bool> TakeEditorPanel::testClockAtClick { false };
 
 bool TakeEditorPanel::resultIsWarningForTest() const
@@ -904,10 +1711,14 @@ void TakeEditorPanel::setLiveGrid (const TakeEditorMath::Grid& g, const juce::St
     if (! opened || TakeEditorMath::testMutant.load() == TakeEditorMath::mutGridStale)
         return;
     auto eq = [] (double a, double b) { return a == b || (std::isnan (a) && std::isnan (b)); };
-    const bool sameGrid = g.measured == take.grid.measured && g.fallback == take.grid.fallback && eq (g.bpm, take.grid.bpm) && eq (g.downbeatSec, take.grid.downbeatSec);
+    const bool sameGrid = g.measured == detectedGrid.measured && g.fallback == detectedGrid.fallback && eq (g.bpm, detectedGrid.bpm) && eq (g.downbeatSec, detectedGrid.downbeatSec);
     if (sameGrid && tempoText == take.tempoText)
         return;
-    take.grid = g;
+    detectedGrid = g; // R1b: a hand grid of the take stays in force over a new detection
+    take.grid = TakeEditorMath::effectiveGrid (detectedGrid, take.gridEdit);
+    if (! take.gridEdit.set)
+        gridAnchorSec = take.grid.downbeatSec; // readouts2: a new detection is the new zero
+    gridBpmField.setText (TakeEditorMath::gridBpmText (take.grid.bpm), juce::dontSendNotification);
     take.tempoText = tempoText;
     refreshTexts(); // the info line and the snap note
     if (! sameGrid)
@@ -960,7 +1771,7 @@ void TakeEditorPanel::tempoTyped()
         fitBpm = tempoField.getText().getDoubleValue();
     else if (v > 0.0)
     {
-        fitBpm = v;
+        fitBpm = userBpm = v;
         tempoByUser = true;
     }
     // What is shown is what is used: the limited value, or the one before when the text was no tempo
@@ -1016,6 +1827,25 @@ bool TakeEditorPanel::playheadFitsForTest (juce::Rectangle<int>* boundsOut) cons
         && getLocalBounds().contains (v) && phTextW <= (float) (v.getWidth() - b.getLeftAndRight());
 }
 
+void TakeEditorPanel::updateExportText()
+{
+    if (TakeEditorMath::testMutant.load() == TakeEditorMath::mutExportTextStatic)
+        return;
+    exportButton.setButtonText ("Export loop x" + juce::String (repeats()));
+}
+
+bool TakeEditorPanel::exportTextFitsForTest (float* textW, int* roomW) const
+{
+    juce::AttributedString as;
+    as.append (exportButton.getButtonText(), juce::FontOptions (12.0f, juce::Font::bold)); // HslinkLook::drawButtonText
+    juce::TextLayout tl;
+    tl.createLayout (as, 100000.0f);
+    const int room = exportButton.getWidth() - 8;
+    if (textW != nullptr) *textW = tl.getWidth();
+    if (roomW != nullptr) *roomW = room;
+    return exportButton.getWidth() > 0 && tl.getWidth() <= (float) room;
+}
+
 int TakeEditorPanel::repeats() const
 {
     return juce::jlimit (TakeEditorMath::kMinRepeats, TakeEditorMath::kMaxRepeats, (int) std::lround (repeatsBox.getValue()));
@@ -1041,17 +1871,32 @@ void TakeEditorPanel::open (const Take& t)
     // step (held back by the throttle) is written to that take, not dropped.
     if (opened && TakeEditorMath::testMutant.load() != TakeEditorMath::mutOpenNoEndDrag)
         endDrag();
+    if (opened)
+        saveHistory (false); // C3: the take shown until now keeps its history
     auditionStop(); // the audition belongs to the take shown until now
     cancelBuild();
+    grabFocusIfShowing(); // Ctrl+Z / Ctrl+Y work right after opening (hidden: visibilityChanged grabs)
     take = t;
+    detectedGrid = t.grid;
+    take.grid = TakeEditorMath::effectiveGrid (detectedGrid, take.gridEdit);
+    gridAnchorSec = take.grid.downbeatSec; // readouts2: the offset counts from here
+    gridBpmField.setText (TakeEditorMath::gridBpmText (take.grid.bpm), juce::dontSendNotification);
+    lastClickFrame = gridDragFrame = -1;
     opened = true;
     openedEdit = t.edit;
+    openedWarp = t;
     length = cropStart = cropEnd = 0;
     loopStart = loopEnd = -1;
-    warpMarkers.clear();
-    warpBuilt = false;
-    markersEdited = false;
+    // C1: the take's stored warp (empty = place automatically from the grid).
+    warpMarkers = t.warpMarkers;
+    if (testOpenWipesWarp.load())
+        warpMarkers.clear(); // teeth: the stored warp is dropped at open
+    warpBuilt = ! warpMarkers.empty();
+    markersEdited = t.warpMarkersEdited;
+    warpTagBpm = t.warpTagBpm;
     warpDrag = -1;
+    warpSelSrc.clear();
+    warpBoxX0 = warpBoxX1 = -1;
     dragLoop = loopJustMade = runSeen = false;
     loopAnchor = -1;
     shownSeamLevel = 0;
@@ -1059,17 +1904,31 @@ void TakeEditorPanel::open (const Take& t)
     channels = 0;
     peaks.reset();
     peakError.clear();
+    syncLevelBoxes(); // F1: the take's level shaping
     dragging = TakeEditorMath::handleNone;
     writePending = waiting = resultHeld = false;
     waitTicket = 0; // an Apply of the take shown before is no longer waited for
     stretchName.clear();
-    if (! tempoByUser && TakeEditorMath::testMutant.load() != TakeEditorMath::mutFitNoHost)
+    const double takeTempo = TakeEditorMath::testMutant.load() == TakeEditorMath::mutFitIgnoresTakeBpm ? 0.0 : TakeEditorMath::fitTempo (t.takeBpm);
+    if (takeTempo > 0.0)
+    {
+        // The take has a tempo: the field starts from it; a typed tempo is kept for the next take.
+        fitBpm = takeTempo;
+        tempoField.setText (TakeEditorMath::fitFieldText (fitBpm), juce::dontSendNotification);
+    }
+    else if (tempoByUser)
+    {
+        fitBpm = userBpm;
+        tempoField.setText (TakeEditorMath::fitFieldText (fitBpm), juce::dontSendNotification);
+    }
+    else if (TakeEditorMath::testMutant.load() != TakeEditorMath::mutFitNoHost)
     {
         // The tempo field starts from the host tempo until a tempo was typed.
         // No usable host tempo = not set (0): the field is empty, never 120.
         fitBpm = TakeEditorMath::fitTempoFromHost (onHostBpm ? onHostBpm() : 0.0);
         tempoField.setText (TakeEditorMath::fitFieldText (fitBpm), juce::dontSendNotification);
     }
+    loadHistory(); // R4: undo is per take; C3: kept across Close and reopen
     zoom = 1.0; // a new take opens whole
     viewStart = 0;
     zoomChanged();
@@ -1106,6 +1965,11 @@ void TakeEditorPanel::close (bool restore)
     if (! opened)
         return;
     endDrag();
+    saveHistory (restore);
+    if (restore && onSetWarp)
+        onSetWarp (take.temp, openedWarp.warpMarkers, openedWarp.warpMarkersEdited, openedWarp.warpTagBpm);
+    else
+        storeWarp();
     if (restore && onSetEdit && TakeEditorMath::testMutant.load() != TakeEditorMath::mutCancelKeeps)
         onSetEdit (take.temp, openedEdit);
     auditionStop();
@@ -1122,6 +1986,14 @@ void TakeEditorPanel::tick()
 {
     if (! opened)
         return;
+    if (warpLimitMarker >= 0)
+    {
+        // R2: the marker limit cue fades out (VBlank driven, no timer).
+        if (juce::Time::getMillisecondCounter() - warpLimitMs > kWarpLimitFadeMs)
+            warpLimitMarker = -1;
+        repaint (warpLane);
+        repaint (readoutLabel.getBounds()); // gap round 2: the cue lives on the readout line
+    }
     refreshAudition();
     if (onAuditionRegion && length > 0)
     {
@@ -1179,7 +2051,10 @@ void TakeEditorPanel::tick()
             if (g == 2 && done != nullptr)
             {
                 if (done->ok)
+                {
                     peaks = done;
+                    refreshPeakLabel();
+                }
                 else
                     peakError = "Cannot read the take: " + done->error;
             }
@@ -1414,7 +2289,7 @@ void TakeEditorPanel::createLoopAt (juce::int64 frame)
         return;
     TakeEditorMath::loopAtClick (frame, length, TakeEditorMath::minCropLength (sampleRate), loopStart, loopEnd);
     if (snapActive())
-        TakeEditorMath::snapLoop (loopStart, loopEnd, true, take.grid, sampleRate, length); // start on a beat, whole beats long
+        TakeEditorMath::snapLoop (loopStart, loopEnd, true, take.grid, sampleRate, length, snapStepBeats()); // the visible grid, 0 and the end
     loopAnchor = juce::jlimit ((juce::int64) 0, length, frame); // the click itself, not the start loopAtClick may move back
     dragging = TakeEditorMath::handleEnd; // a drag on from here moves the end
     dragLoop = loopJustMade = true;
@@ -1431,6 +2306,7 @@ void TakeEditorPanel::scaleLoopLength (bool doubleIt)
 {
     if (! opened || length <= 0 || dragging != TakeEditorMath::handleNone)
         return;
+    const Step step (*this);
     if (! TakeEditorMath::scaleLoop (loopStart, loopEnd, length, TakeEditorMath::minCropLength (sampleRate), doubleIt))
         return;
     if (! waiting)
@@ -1439,6 +2315,22 @@ void TakeEditorPanel::scaleLoopLength (bool doubleIt)
     refreshTexts();
     refreshButtons();
     repaint (loopLane.getUnion (waveArea));
+}
+
+double TakeEditorPanel::snapStepBeats() const
+{
+    return TakeEditorMath::gridStepBeats (view(), take.grid, sampleRate, gridResolution);
+}
+
+juce::int64 TakeEditorPanel::snapToStep (juce::int64 frame) const
+{
+    // The nearest grid line snapStepBeats() apart (the step the ruler draws). One beat
+    // is TakeEdit::snapToGrid itself, the numbers the render uses.
+    const double step = TakeEditorMath::clampStepBeats (snapStepBeats());
+    if (step == 1.0 || ! gridIsUsable())
+        return TakeEdit::snapToGrid (frame, sampleRate, take.grid.bpm, take.grid.downbeatSec);
+    const double st = sampleRate * 60.0 / take.grid.bpm * step, origin = take.grid.downbeatSec * sampleRate;
+    return (juce::int64) std::llround (origin + std::round (((double) frame - origin) / st) * st);
 }
 
 void TakeEditorPanel::stepResolution (int delta)
@@ -1452,6 +2344,7 @@ void TakeEditorPanel::clearLoop()
 {
     if (! opened || ! hasLoop())
         return;
+    const Step step (*this);
     loopStart = loopEnd = -1;
     if (dragLoop)
         dragging = TakeEditorMath::handleNone;
@@ -1486,10 +2379,10 @@ void TakeEditorPanel::moveHandleTo (juce::int64 frame)
     // and the minimum length still have the last word.
     const bool snap = snapActive();
     if (snap && ! dragLoop)
-        frame = snapCropPoint (frame, end ? a : b, end, take.grid, sampleRate, length, minCropLength (sampleRate));
+        frame = snapCropPoint (frame, end ? a : b, end, take.grid, sampleRate, length, minCropLength (sampleRate), snapStepBeats());
     (end ? b : a) = frame;
     if (snap && dragLoop)
-        snapLoop (a, b, end, take.grid, sampleRate, length);
+        snapLoop (a, b, end, take.grid, sampleRate, length, snapStepBeats(), true); // B1: the other flag stays put
     if (! (dragLoop && testMutant.load() == mutLoopNoClamp))
         clampCrop (a, b, length, minCropLength (sampleRate), end);
     if (a == oldA && b == oldB)
@@ -1518,24 +2411,111 @@ void TakeEditorPanel::pointsMoved()
         writeEdit();
     else
         refreshButtons();
+    if (testMutant.load() == mutDragStepPerMove && gestureOpen)
+    {
+        endGesture(); // teeth: one undo step per drag move
+        beginGesture();
+    }
 }
 
 void TakeEditorPanel::writeEdit()
 {
     if (onSetEdit && length > 0)
         onSetEdit (take.temp, currentEdit()); // a lock and one write in the processor, no file IO
+    sendAuditionLevel();
     writePending = false;
     lastWriteMs = nowMs();
     refreshButtons();
 }
 
+void TakeEditorPanel::sendAuditionLevel()
+{
+    if (onAuditionLevel && length > 0)
+        onAuditionLevel (cropStart, cropEnd, length, currentEdit());
+    refreshPeakLabel();
+}
+
+void TakeEditorPanel::setReverse (bool on)
+{
+    if (! opened || take.edit.reverse == on)
+        return;
+    {
+        Step step (*this);
+        take.edit.reverse = on;
+    }
+    reverseButton.setToggleState (on, juce::dontSendNotification);
+    writeEdit();
+}
+
+void TakeEditorPanel::setLevelField (double TakeEdit::EditData::* field, double value)
+{
+    if (! opened || take.edit.*field == value)
+        return;
+    {
+        Step step (*this);
+        take.edit.*field = value;
+    }
+    writeEdit();
+}
+
+void TakeEditorPanel::syncLevelBoxes()
+{
+    fadeInBox.setValue (take.edit.fadeInMs, juce::dontSendNotification);
+    fadeOutBox.setValue (take.edit.fadeOutMs, juce::dontSendNotification);
+    xfadeBox.setValue (take.edit.loopXfadeMs, juce::dontSendNotification);
+    reverseButton.setToggleState (take.edit.reverse, juce::dontSendNotification);
+    gainBox.setValue (take.edit.gainDb, juce::dontSendNotification);
+    refreshPeakLabel();
+}
+
+double TakeEditorPanel::previewPeakDb() const
+{
+    if (peaks == nullptr || ! peaks->ok || length <= 0)
+        return -300.0;
+    const juce::int64 s = juce::jlimit<juce::int64> (0, length, cropStart);
+    const juce::int64 e = juce::jlimit<juce::int64> (0, length, cropEnd > 0 ? cropEnd : length);
+    const juce::int64 b0 = s / TakePeaks::kBucketFrames, b1 = (e + TakePeaks::kBucketFrames - 1) / TakePeaks::kBucketFrames;
+    float pk = 0.0f;
+    for (size_t lane = 0; lane < peaks->maxs.size() && lane < peaks->mins.size(); ++lane)
+    {
+        const auto& mx = peaks->maxs[lane];
+        const auto& mn = peaks->mins[lane];
+        for (juce::int64 b = b0; b < b1 && b < (juce::int64) mx.size() && b < (juce::int64) mn.size(); ++b)
+            pk = juce::jmax (pk, std::abs (mx[(size_t) b]), std::abs (mn[(size_t) b]));
+    }
+    return pk > 0.0f ? 20.0 * std::log10 ((double) pk) : -300.0;
+}
+
+void TakeEditorPanel::refreshPeakLabel()
+{
+    const double raw = previewPeakDb();
+    peakLabel.setText (raw <= -200.0 ? juce::String ("Pk --") : "Pk " + juce::String (raw + take.edit.gainDb, 1), juce::dontSendNotification);
+    normalizeButton.setEnabled (opened && raw > -200.0);
+}
+
+void TakeEditorPanel::normalizeGain()
+{
+    const double raw = previewPeakDb();
+    if (! opened || raw <= -200.0 || testNormOff.load())
+        return;
+    // Rounded DOWN to the 0.1 dB step, so the peak never lands above -1 dBFS.
+    const double g = juce::jlimit (TakeEdit::kMinGainDb, TakeEdit::kMaxGainDb, std::floor ((-1.0 - raw) * 10.0 + 1.0e-9) / 10.0);
+    setLevelField (&TakeEdit::EditData::gainDb, g);
+    gainBox.setValue (take.edit.gainDb, juce::dontSendNotification);
+    refreshPeakLabel();
+}
+
 void TakeEditorPanel::endDrag()
 {
+    endGesture(); // R4: the step of a drag is pushed when it ends (state is final here)
     if (dragging == TakeEditorMath::handleNone)
         return;
+    const bool bodyStill = loopBodyDrag && loopStart == loopBodyFrom;
     dragging = TakeEditorMath::handleNone;
-    dragLoop = loopJustMade = false;
+    dragLoop = loopJustMade = loopBodyDrag = false;
     loopAnchor = -1;
+    if (bodyStill && TakeEditorMath::testMutant.load() != TakeEditorMath::mutLoopBodyStillWrites)
+        return; // R2: a plain click on the loop bar: nothing moved, nothing written
     if (TakeEditorMath::testMutant.load() == TakeEditorMath::mutNoUpWrite)
         return;
     writeEdit(); // always on mouse up, whatever the throttle did
@@ -1557,6 +2537,8 @@ void TakeEditorPanel::mouseDown (const juce::MouseEvent& e)
     const bool dragOn = dragging != handleNone;
     if (! anyButton)
         endDrag(); // a press while a drag is still on (a second button) ends it with its write
+    endGesture();
+    beginGesture(); // R4: whatever this press and its drag change is one undo step, pushed on the mouse up
     dragLoop = loopJustMade = false;
     overviewDrag = false;
     if (overviewArea.contains (e.getPosition()) && length > 0)
@@ -1568,16 +2550,53 @@ void TakeEditorPanel::mouseDown (const juce::MouseEvent& e)
     loopAnchor = -1;
     dragging = handleNone;
     warpDrag = -1;
+    gridDragFrame = -1;
+    if (length > 0 && (rulerArea.contains (e.getPosition()) || waveArea.contains (e.getPosition())))
+    {
+        // R1b: the last click is where Set 1 puts the downbeat (when no playhead shows).
+        lastClickFrame = juce::jlimit ((juce::int64) 0, length, frameAtX (view(), (double) e.position.x - waveArea.getX()));
+        refreshButtons();
+        if (rulerArea.contains (e.getPosition()) && leftOnly (e.mods))
+        {
+            if (e.mods.isAltDown()) // Alt + click on the ruler: the downbeat here
+            {
+                setGridDownbeat (lastClickFrame);
+                return;
+            }
+            if (e.mods.isCommandDown() && gridIsUsable()) // Ctrl/Cmd + drag on the ruler: drag the grid
+            {
+                gridDragFrame = lastClickFrame;
+                gridDragFrom = take.grid;
+                return;
+            }
+        }
+    }
     if (warpLane.contains (e.getPosition()))
     {
         // The warp lane: a left press takes the marker under the pointer. Nothing else here.
         if (leftOnly (e.mods) && length > 0)
         {
             // Alt + click (Option on macOS) removes the marker under the pointer.
+            const int hit = warpMarkerAt (e.getPosition());
             if (e.mods.isAltDown())
-                removeWarpMarker (warpMarkerAt (e.getPosition()));
+                removeWarpMarker (hit);
+            else if (hit >= 0)
+            {
+                // R3: a click selects the marker (only it, unless it is selected already:
+                // then the selection stays); Shift + click adds or removes it. The press
+                // still takes the marker for a drag (Shift: free drag).
+                if (e.mods.isShiftDown())
+                    selectWarpMarker (hit, true);
+                else if (! warpSelectedAt (hit))
+                    selectWarpMarker (hit, false);
+                warpDrag = hit;
+            }
             else
-                warpDrag = warpMarkerAt (e.getPosition());
+            {
+                // R3: empty lane: a box select starts (a still click clears the selection).
+                warpBoxX0 = warpBoxX1 = e.getPosition().x;
+                warpBoxAdd = e.mods.isShiftDown();
+            }
         }
         return;
     }
@@ -1611,6 +2630,16 @@ void TakeEditorPanel::mouseDown (const juce::MouseEvent& e)
             return;
         }
         dragging = flagAt (e.getPosition());
+        if (dragging == handleNone && loopBodyAt (e.getPosition()))
+        {
+            // R2: the bar between the flags: the whole loop moves, its length kept.
+            dragging = handleStart;
+            dragLoop = loopBodyDrag = true;
+            loopBodyOffset = frameAtX (view(), (double) e.position.x - loopLane.getX()) - loopStart;
+            loopBodyFrom = loopStart;
+            grabOffset = 0.0;
+            return;
+        }
         if (dragging == handleNone)
             return;
         dragLoop = true;
@@ -1633,6 +2662,25 @@ void TakeEditorPanel::mouseDrag (const juce::MouseEvent& e)
         overviewSeek ((double) e.position.x - overviewArea.getX());
         return;
     }
+    if (gridDragFrame >= 0)
+    {
+        // R1b: Ctrl/Cmd + drag on the ruler moves the grid with the pointer (from the grid at the press).
+        const auto now = frameAtX (view(), (double) e.position.x - waveArea.getX());
+        if (sampleRate > 0.0)
+            applyGridEdit (gridShifted (gridDragFrom, (double) (now - gridDragFrame) / sampleRate));
+        if (testMutant.load() == mutDragStepPerMove && gestureOpen)
+        {
+            endGesture();
+            beginGesture();
+        }
+        return;
+    }
+    if (warpBoxX0 >= 0)
+    {
+        warpBoxX1 = juce::jlimit (warpLane.getX(), warpLane.getRight(), e.getPosition().x);
+        repaint (warpLane);
+        return;
+    }
     if (warpDrag >= 0)
     {
         warpDragMove (frameAtX (view(), (double) e.position.x - waveArea.getX()), e.mods.isShiftDown());
@@ -1643,6 +2691,11 @@ void TakeEditorPanel::mouseDrag (const juce::MouseEvent& e)
     if (! leftOnly (e.mods) && testMutant.load() != mutNoButtonCheck)
     {
         endDrag(); // the buttons changed under the drag: it ends here, nothing stays taken
+        return;
+    }
+    if (loopBodyDrag)
+    {
+        loopBodyMoveTo (frameAtX (view(), (double) e.position.x - loopLane.getX()));
         return;
     }
     const auto frame = frameAtX (view(), (double) e.position.x - grabOffset - waveArea.getX());
@@ -1673,7 +2726,7 @@ void TakeEditorPanel::mouseDrag (const juce::MouseEvent& e)
             loopEnd = leftward ? loopAnchor : frame;
             dragging = leftward ? handleStart : handleEnd;
             if (snapActive())
-                snapLoop (loopStart, loopEnd, ! leftward, take.grid, sampleRate, length);
+                snapLoop (loopStart, loopEnd, ! leftward, take.grid, sampleRate, length, snapStepBeats());
             clampCrop (loopStart, loopEnd, length, minLen, ! leftward);
             if (loopStart != oldStart || loopEnd != oldEnd)
             {
@@ -1686,6 +2739,26 @@ void TakeEditorPanel::mouseDrag (const juce::MouseEvent& e)
     moveHandleTo (frame);
 }
 
+void TakeEditorPanel::loopBodyMoveTo (juce::int64 pointerFrame)
+{
+    using namespace TakeEditorMath;
+    const auto len = loopEnd - loopStart;
+    auto s = pointerFrame - loopBodyOffset;
+    if (snapActive() && testMutant.load() != mutLoopBodyNoSnap)
+    {
+        auto se = s + len;
+        snapLoop (s, se, false, take.grid, sampleRate, length, snapStepBeats()); // the start snaps: grid, 0, file end
+    }
+    s = juce::jlimit ((juce::int64) 0, juce::jmax ((juce::int64) 0, length - len), s);
+    if (s != loopStart)
+    {
+        loopStart = s;
+        loopEnd = testMutant.load() == mutLoopBodyNoKeep ? juce::jmax (loopEnd, s + 1) : s + len;
+        repaint (loopLane.getUnion (waveArea));
+        pointsMoved();
+    }
+}
+
 void TakeEditorPanel::mouseUp (const juce::MouseEvent&)
 {
     releaseDrag();
@@ -1694,8 +2767,22 @@ void TakeEditorPanel::mouseUp (const juce::MouseEvent&)
 void TakeEditorPanel::releaseDrag()
 {
     overviewDrag = false;
+    gridDragFrame = -1;
     const bool warpMoved = warpDrag >= 0;
     warpDrag = -1;
+    if (warpBoxX0 >= 0)
+    {
+        // R3: the box select ends: the markers whose pennant is inside it.
+        const auto v = view();
+        const int a = juce::jmin (warpBoxX0, warpBoxX1), b = juce::jmax (warpBoxX0, warpBoxX1);
+        const bool add = warpBoxAdd;
+        warpBoxX0 = warpBoxX1 = -1;
+        if (b - a < 3)
+            selectWarpInFrames (1, 0, add); // a still click: clear (Shift: keep)
+        else
+            selectWarpInFrames (TakeEditorMath::frameAtX (v, (double) (a - warpLane.getX())), TakeEditorMath::frameAtX (v, (double) (b - warpLane.getX())), add);
+        repaint (warpLane);
+    }
     if (warpMoved)
         refreshButtons(); // a hand move turns Reset markers and Apply warp on at once
     // Round 2b: a marker let go while the preview plays renders the warp again (on
@@ -1703,12 +2790,18 @@ void TakeEditorPanel::releaseDrag()
     if (warpMoved && onAuditionState && onAuditionState() != 0)
         auditionPlay();
     endDrag();
+    endGesture(); // endDrag does it too; this covers a press that took no drag
 }
 
 bool TakeEditorPanel::removeWarpMarker (int i)
 {
-    if (i < 0 || ! WarpMarkers::removeAt (warpMarkers, (std::size_t) i))
+    if (i < 0 || (std::size_t) i >= warpMarkers.size())
         return false;
+    const Step step (*this);
+    const auto src = warpMarkers[(std::size_t) i].srcFrame;
+    if (! WarpMarkers::removeAt (warpMarkers, (std::size_t) i))
+        return false;
+    warpSelSrc.erase (std::remove (warpSelSrc.begin(), warpSelSrc.end(), src), warpSelSrc.end());
     markersEdited = true;
     warpTagBpm = 0.0;
     refreshButtons();
@@ -1721,10 +2814,11 @@ int TakeEditorPanel::addWarpMarkerAtX (double xInWave)
     ensureWarp();
     if (! warpButton.getToggleState() || length <= 0 || warpMarkers.size() < 2)
         return -1;
+    const Step step (*this);
     // x is a warped position (the markers are drawn at dst): back to the source frame.
     auto src = WarpMarkers::mapFrame (warpMarkers, TakeEditorMath::frameAtX (view(), xInWave), false);
     if (snapGridButton.getToggleState() && gridIsUsable())
-        src = juce::jlimit ((juce::int64) 0, length, TakeEdit::snapToGrid (src, sampleRate, take.grid.bpm, take.grid.downbeatSec));
+        src = juce::jlimit ((juce::int64) 0, length, snapToStep (src));
     const int at = WarpMarkers::insertAt (warpMarkers, src);
     if (at >= 0)
     {
@@ -1754,6 +2848,7 @@ void TakeEditorPanel::warpMarkerDoubleClicked (int i)
 {
     if (i < 0 || (std::size_t) i >= warpMarkers.size())
         return;
+    const Step step (*this);
     if (removeWarpMarker (i)) // double-click removes a marker; the end anchors reset instead
         return;
     WarpMarkers::resetOne (warpMarkers, (std::size_t) i);
@@ -1766,10 +2861,113 @@ void TakeEditorPanel::warpDragMove (juce::int64 frame, bool shiftDown)
 {
     // Horizontal only: dstFrame follows the pointer, clamped between the neighbours.
     const auto before = warpMarkers[(std::size_t) warpDrag].dstFrame;
-    WarpMarkers::moveTo (warpMarkers, (std::size_t) warpDrag, warpDragTarget (frame, shiftDown), length);
+    const auto target = warpDragTarget (frame, shiftDown);
+    WarpMarkers::moveTo (warpMarkers, (std::size_t) warpDrag, target, length);
     warpTagBpm = 0.0; // a hand move: the tag tempo comes from the markers
-    if (warpMarkers[(std::size_t) warpDrag].dstFrame != before)
+    const auto now = warpMarkers[(std::size_t) warpDrag].dstFrame;
+    if (now != target && TakeEditorMath::testMutant.load() != TakeEditorMath::mutWarpLimitNever)
+    {
+        // R2: the drag hit its limit: the marker turns red and the lane says which.
+        const bool left = target < now;
+        const bool edge = left ? warpDrag == 0 : (std::size_t) warpDrag + 1 >= warpMarkers.size();
+        warpLimitMarker = warpDrag;
+        warpLimitText = juce::String ("Marker limit: ") + (edge ? (left ? "take start" : "take end") : (left ? "previous marker" : "next marker"));
+        warpLimitMs = juce::Time::getMillisecondCounter();
+        repaint (warpLane);
+        repaint (readoutLabel.getBounds());
+    }
+    if (now != before)
         repaint (warpLane.getUnion (waveArea));
+    if (TakeEditorMath::testMutant.load() == TakeEditorMath::mutDragStepPerMove && gestureOpen)
+    {
+        endGesture(); // teeth: one undo step per drag move
+        beginGesture();
+    }
+}
+
+bool TakeEditorPanel::warpSelectedAt (int i) const
+{
+    if (i < 0 || (std::size_t) i >= warpMarkers.size())
+        return false;
+    return std::find (warpSelSrc.begin(), warpSelSrc.end(), warpMarkers[(std::size_t) i].srcFrame) != warpSelSrc.end();
+}
+
+std::vector<bool> TakeEditorPanel::warpSelectionMask() const
+{
+    std::vector<bool> out (warpMarkers.size(), false);
+    for (std::size_t i = 0; i < warpMarkers.size(); ++i)
+        out[i] = warpSelectedAt ((int) i);
+    return out;
+}
+
+void TakeEditorPanel::selectWarpMarker (int i, bool toggle)
+{
+    if (i < 0 || (std::size_t) i >= warpMarkers.size())
+        return;
+    const auto src = warpMarkers[(std::size_t) i].srcFrame;
+    const bool was = warpSelectedAt (i);
+    if (! toggle)
+        warpSelSrc.clear();
+    if (toggle && was)
+        warpSelSrc.erase (std::remove (warpSelSrc.begin(), warpSelSrc.end(), src), warpSelSrc.end());
+    else
+        warpSelSrc.push_back (src);
+    refreshButtons();
+    repaint (warpLane.getUnion (waveArea));
+}
+
+int TakeEditorPanel::selectWarpInFrames (juce::int64 d0, juce::int64 d1, bool add)
+{
+    // Every marker with dst inside d0..d1 (d1 < d0 selects none); add keeps the others.
+    if (! add)
+        warpSelSrc.clear();
+    int n = 0;
+    for (std::size_t i = 0; i < warpMarkers.size(); ++i)
+        if (warpMarkers[i].dstFrame >= d0 && warpMarkers[i].dstFrame <= d1)
+        {
+            if (! warpSelectedAt ((int) i))
+                warpSelSrc.push_back (warpMarkers[i].srcFrame);
+            ++n;
+        }
+    refreshButtons();
+    repaint (warpLane.getUnion (waveArea));
+    return n;
+}
+
+int TakeEditorPanel::selectWarpInLoop()
+{
+    ensureWarp();
+    if (! hasLoop())
+        return 0;
+    if (TakeEditorMath::testMutant.load() == TakeEditorMath::mutSelLoopNoBounds)
+        return selectWarpInFrames (0, length, false);
+    return selectWarpInFrames (loopStart, loopEnd, false);
+}
+
+int TakeEditorPanel::quantizeSelected()
+{
+    // R3: the selected markers to the Quantize grid on the take's grid in effect (take.grid
+    // follows the Grid row edits), at the strength in the box.
+    ensureWarp();
+    if (waiting || length <= 0)
+        return 0;
+    const Step undoStep (*this);
+    const double step =TakeEditorMath::quantizeChoiceBeats (quantizeBox.getSelectedItemIndex());
+    const int moved = TakeEditorMath::quantizeMarkers (warpMarkers, warpSelectionMask(), TakeEditorMath::testMutant.load() == TakeEditorMath::mutQuantDetectedGrid ? detectedGrid : take.grid, sampleRate, length, step, quantizeStrengthBox.getValue());
+    if (moved > 0)
+    {
+        warpTagBpm = 0.0; // a hand move: the tag tempo comes from the markers
+        refreshButtons();
+        repaint (warpLane.getUnion (waveArea));
+        if (onAuditionState && onAuditionState() != 0)
+            auditionPlay();
+    }
+    return moved;
+}
+
+juce::String TakeEditorPanel::quantizeHint() const
+{
+    return "Shift: free drag";
 }
 
 bool TakeEditorPanel::shotDragWarp (int marker, double dstSec, bool snap)
@@ -1778,6 +2976,8 @@ bool TakeEditorPanel::shotDragWarp (int marker, double dstSec, bool snap)
     ensureWarp();
     if (length <= 0 || marker < 0 || (std::size_t) marker >= warpMarkers.size())
         return false;
+    endGesture();
+    beginGesture(); // as a mouse down: the drag is one undo step
     warpDrag = marker;
     warpDragMove ((juce::int64) std::llround (dstSec * sampleRate), ! snap);
     releaseDrag();
@@ -1793,7 +2993,7 @@ juce::int64 TakeEditorPanel::warpDragTarget (juce::int64 dst, bool shiftDown) co
 {
     // Snap to the take's beat grid (fixed, from the measured tempo); Shift is free.
     if (! shiftDown && gridIsUsable())
-        dst = juce::jlimit ((juce::int64) 0, length, TakeEdit::snapToGrid (dst, sampleRate, take.grid.bpm, take.grid.downbeatSec));
+        dst = juce::jlimit ((juce::int64) 0, length, snapToStep (dst));
     return dst;
 }
 
@@ -1869,14 +3069,25 @@ void TakeEditorPanel::mouseMove (const juce::MouseEvent& e)
 {
     const bool onHandle = handleAt (e.getPosition()) != TakeEditorMath::handleNone || flagAt (e.getPosition()) != TakeEditorMath::handleNone
                           || warpMarkerAt (e.getPosition()) >= 0;
-    setMouseCursor (onHandle ? juce::MouseCursor::LeftRightResizeCursor : juce::MouseCursor::NormalCursor);
+    setMouseCursor (onHandle ? juce::MouseCursor::LeftRightResizeCursor
+                    : loopBodyAt (e.getPosition()) ? juce::MouseCursor::DraggingHandCursor : juce::MouseCursor::NormalCursor);
+}
+
+bool TakeEditorPanel::loopBodyAt (juce::Point<int> p) const
+{
+    // R2: the loop bar between the flags (not on a flag), where a drag moves the whole loop.
+    if (length <= 0 || ! hasLoop() || ! loopLane.contains (p) || flagAt (p) != TakeEditorMath::handleNone)
+        return false;
+    const auto v = view();
+    const double xs = loopLane.getX() + TakeEditorMath::xOfFrame (v, loopStart), xe = loopLane.getX() + TakeEditorMath::xOfFrame (v, loopEnd);
+    return (double) p.x > xs && (double) p.x < xe;
 }
 
 juce::String TakeEditorPanel::getTooltip()
 {
     if (length <= 0 || ! loopLane.contains (getMouseXYRelative()))
         return {};
-    return hasLoop() ? "Drag a flag to move the loop start or end. Right click here to clear the loop."
+    return hasLoop() ? "Drag a flag to move the loop start or end, or the bar to move the whole loop. Right click here to clear the loop."
                      : "Click or drag here to set a loop";
 }
 
@@ -1972,12 +3183,17 @@ void TakeEditorPanel::resetCrop()
 {
     if (! opened || length <= 0)
         return;
+    const Step step (*this);
     cropStart = 0;
     cropEnd = length;
     loopStart = loopEnd = -1; // Reset clears the loop too
+    take.edit.fadeInMs = take.edit.fadeOutMs = take.edit.loopXfadeMs = take.edit.gainDb = 0.0; // and the level row
+    take.edit.reverse = false;
+    reverseButton.setToggleState (false, juce::dontSendNotification);
     if (! waiting)
         resultHeld = false;
     writeEdit();
+    syncLevelBoxes();
     refreshTexts();
     repaint (loopLane.getUnion (waveArea).expanded (1));
 }
@@ -2025,8 +3241,21 @@ void TakeEditorPanel::refreshButtons()
     const bool loop = length > 0 && hasLoop();
     applyButton.setEnabled (opened && ! waiting && crop && peakError.isEmpty() && TakeEditorMath::fitApplyAllowed (fitButton.getToggleState(), fitBpm));
     exportButton.setEnabled (opened && ! waiting && loop && peakError.isEmpty()); // one job at a time: off while Apply waits too
-    resetButton.setEnabled (opened && (crop || loop));
+    resetButton.setEnabled (opened && (crop || loop || (length > 0 && take.edit.hasLevel())));
+    undoButton.setEnabled (opened && ! waiting && ! undoStack.empty());
+    redoButton.setEnabled (opened && ! waiting && ! redoStack.empty());
     playButton.setEnabled (opened && length > 0 && peakError.isEmpty());
+    {
+        // R1b: the grid row needs a tempo inside the range (detected or by hand) and a known length.
+        const bool g = opened && ! waiting && length > 0 && sampleRate > 0.0 && gridIsUsable();
+        for (auto* b : { &gridEarlierButton, &gridLaterButton, &gridBpmDownButton, &gridBpmUpButton })
+            b->setEnabled (g);
+        gridHalfButton.setEnabled (g && take.grid.bpm * 0.5 >= TakeEdit::kMinBpm);
+        gridDoubleButton.setEnabled (g && take.grid.bpm * 2.0 <= TakeEdit::kMaxBpm);
+        gridSetButton.setEnabled (g); // a press with no playhead and no click does nothing
+        gridBpmField.setEnabled (g);
+        gridResetButton.setEnabled (opened && ! waiting && take.gridEdit.set);
+    }
     {
         const auto minLen = TakeEditorMath::minCropLength (sampleRate);
         auto hs = loopStart, he = loopEnd, ds = loopStart, de = loopEnd;
@@ -2042,6 +3271,14 @@ void TakeEditorPanel::refreshButtons()
         warpHostButton.setEnabled (markers && ! waiting && gridIsUsable() && warpTargetBpm() > 0.0);
         warpResetButton.setEnabled ((moved || (markers && markersEdited && TakeEditorMath::testMutant.load() != TakeEditorMath::mutResetMovedOnly)) && ! waiting); // an added or removed marker counts too
         applyWarpButton.setEnabled (moved && ! waiting);
+        bool anySel = false;
+        for (std::size_t i = 0; i < warpMarkers.size() && ! anySel; ++i)
+            anySel = warpSelectedAt ((int) i);
+        warpSelLoopButton.setEnabled (markers && hasLoop());
+        quantizeBox.setEnabled (markers && gridIsUsable());
+        quantizeStrengthBox.setEnabled (markers && gridIsUsable());
+        quantizeButton.setEnabled (markers && anySel && gridIsUsable() && ! waiting);
+        refreshReadouts2();
     }
     stretchButton.setEnabled (opened && ((! waiting && stretchName.isNotEmpty() && stretchFrom > 0.0) || TakeEditorMath::testMutant.load() == TakeEditorMath::mutFitStretchLoose));
     if (! resultHeld)
@@ -2051,9 +3288,72 @@ void TakeEditorPanel::refreshButtons()
     }
 }
 
+juce::String TakeEditorPanel::gridOffsetText() const
+{
+    // readouts2: the downbeat minus the anchor, wrapped to the nearest beat (the grid row
+    // wraps the downbeat by whole beats and bars), in whole ms.
+    if (! opened || ! gridIsUsable() || ! (take.grid.bpm > 0.0))
+        return {};
+    const double beat = 60.0 / take.grid.bpm;
+    double d = take.grid.downbeatSec - gridAnchorSec;
+    d -= beat * std::round (d / beat);
+    const auto ms = (int) std::lround (d * 1000.0);
+    if (ms == 0)
+        return "offset 0 ms";
+    return juce::String (ms > 0 ? "+" : "") + juce::String (ms) + " ms";
+}
+
+juce::String TakeEditorPanel::warpGestureHint()
+{
+    // The real gestures: mouseDoubleClick (empty lane or wave adds; on a marker,
+    // warpMarkerDoubleClicked removes it) and mouseDown in the warp lane (Alt + click removes).
+    if (TakeEditorMath::testMutant.load() == TakeEditorMath::mutR2HintWrong)
+        return "Click to add a marker, right-click to remove";
+    return "Double-click: add marker. Double-click or Alt + click a marker: remove";
+}
+
+juce::String TakeEditorPanel::warpInfoText() const
+{
+    if (! opened || length <= 0 || ! (sampleRate > 0.0))
+        return {};
+    int n = 0, first = -1;
+    for (std::size_t i = 0; i < warpMarkers.size(); ++i)
+        if (warpSelectedAt ((int) i))
+        {
+            if (first < 0)
+                first = (int) i;
+            ++n;
+        }
+    if (n == 0)
+        return warpGestureHint();
+    if (n == 1 || TakeEditorMath::testMutant.load() == TakeEditorMath::mutR2CountAsOne)
+        return "1 marker at " + juce::String ((double) warpMarkers[(std::size_t) first].dstFrame / sampleRate, 3) + " s";
+    return juce::String (n) + " markers selected";
+}
+
+void TakeEditorPanel::sendClick()
+{
+    if (onAuditionClick)
+        onAuditionClick (clickButton.getToggleState(), take.grid.bpm, take.grid.downbeatSec);
+}
+
+void TakeEditorPanel::refreshReadouts2()
+{
+    sendClick(); // the grid may have moved
+    gridOffsetLabel.setText (gridOffsetText(), juce::dontSendNotification);
+    warpInfoLabel.setText (warpInfoText(), juce::dontSendNotification);
+}
+
+bool TakeEditorPanel::readouts2FitForTest() const
+{
+    return textFits (gridOffsetLabel) && textFits (warpInfoLabel) && ! gridOffsetLabel.getBounds().isEmpty() && ! warpInfoLabel.getBounds().isEmpty()
+        && getLocalBounds().contains (gridOffsetLabel.getBounds()) && getLocalBounds().contains (warpInfoLabel.getBounds());
+}
+
 std::vector<TakeEditorPanel::Area> TakeEditorPanel::areasForTest() const
 {
     return { { "Title", titleLabel.getBounds(), false, false },      { "Close", closeButton.getBounds(), true, true },
+             { "Undo", undoButton.getBounds(), true, true },         { "Redo", redoButton.getBounds(), true, true },
              { "Info line", infoLabel.getBounds(), false, false },   { "Time ruler", rulerArea, false, false },
              { "Warp lane + markers", warpLane, true, false },        { "Loop lane + loop flags", loopLane, true, false },
              { "Waveform + crop handles", waveArea, true, false },   { "Scroll bar", scrollArea, true, false },
@@ -2067,13 +3367,29 @@ std::vector<TakeEditorPanel::Area> TakeEditorPanel::areasForTest() const
              { "Loop", loopButton.getBounds(), true, true },
              { "Loop /2", loopHalfButton.getBounds(), true, true }, { "Loop x2", loopDoubleButton.getBounds(), true, true },
              { "Grid resolution", gridResBox.getBounds(), true, true },
+             { "Grid resolution label", gridResLabel.getBounds(), false, false }, { "Tempo unit", tempoUnit.getBounds(), false, false },
              { "Zoom row (empty)", zoomRow, false, false },
+             { "Fade in label", fadeInLabel.getBounds(), false, false }, { "Fade in", fadeInBox.getBounds(), true, true },
+             { "Fade out label", fadeOutLabel.getBounds(), false, false }, { "Fade out", fadeOutBox.getBounds(), true, true },
+             { "Loop xfade label", xfadeLabel.getBounds(), false, false }, { "Loop xfade", xfadeBox.getBounds(), true, true },
+             { "Gain label", gainLabel.getBounds(), false, false }, { "Gain", gainBox.getBounds(), true, true },
+             { "Normalize", normalizeButton.getBounds(), true, true }, { "Reverse", reverseButton.getBounds(), true, true }, { "Peak", peakLabel.getBounds(), false, false },
              { "Repeats label", repeatsLabel.getBounds(), false, false }, { "Repeats box", repeatsBox.getBounds(), true, true },
              { "Result line", resultLabel.getBounds(), false, false }, { "Reset", resetButton.getBounds(), true, true },
              { "Cancel", cancelButton.getBounds(), true, true },     { "Export loop", exportButton.getBounds(), true, true },
              { "Apply crop", applyButton.getBounds(), true, true },
              { "Warp", warpButton.getBounds(), true, true },          { "Warp to host", warpHostButton.getBounds(), true, true },
-             { "Reset markers", warpResetButton.getBounds(), true, true }, { "Apply warp", applyWarpButton.getBounds(), true, true } };
+             { "Reset markers", warpResetButton.getBounds(), true, true }, { "Apply warp", applyWarpButton.getBounds(), true, true },
+             { "Select in loop", warpSelLoopButton.getBounds(), true, true }, { "Quantize grid", quantizeBox.getBounds(), true, true },
+             { "Quantize strength", quantizeStrengthBox.getBounds(), true, true }, { "Quantize", quantizeButton.getBounds(), true, true },
+             { "Quantize to label", quantizeToLabel.getBounds(), false, false }, { "Quantize strength label", quantizeStrengthLabel.getBounds(), false, false },
+             { "Grid label", gridLabel.getBounds(), false, false }, { "Grid Set 1", gridSetButton.getBounds(), true, true },
+             { "Grid earlier", gridEarlierButton.getBounds(), true, true }, { "Grid later", gridLaterButton.getBounds(), true, true },
+             { "Grid bpm -", gridBpmDownButton.getBounds(), true, true }, { "Grid bpm field", gridBpmField.getBounds(), true, true },
+             { "Grid bpm +", gridBpmUpButton.getBounds(), true, true }, { "Grid half", gridHalfButton.getBounds(), true, true },
+             { "Grid double", gridDoubleButton.getBounds(), true, true }, { "Reset grid", gridResetButton.getBounds(), true, true },
+             { "Grid offset", gridOffsetLabel.getBounds(), false, false }, { "Warp marker line", warpInfoLabel.getBounds(), false, false }, // readouts2: +2 areas
+             { "Click", clickButton.getBounds(), true, true } }; // metronome: +1 area, a button
 }
 
 //==============================================================================
@@ -2084,14 +3400,17 @@ void TakeEditorPanel::resized()
     const auto c = getLocalBounds().reduced (kPad, 0);
     const int x = c.getX(), w = c.getWidth();
     auto row = [x, w] (int y, int h) { return juce::Rectangle<int> (x, y, w, h); };
-    titleLabel.setBounds (x, 12, w - 96, 28);
+    titleLabel.setBounds (x, 12, w - 96 - 124, 28);
     closeButton.setBounds (c.getRight() - 88, 12, 88, 28);
+    redoButton.setBounds (c.getRight() - 88 - 8 - 56, 12, 56, 28);   // R4
+    undoButton.setBounds (c.getRight() - 88 - 8 - 56 - 4 - 56, 12, 56, 28);
     infoLabel.setBounds (row (44, 18));
     rulerArea = row (66, 18);
     warpLane = row (86, 22);   // slice 6
     loopLane = row (112, 20);  // slice 2
     const auto oldWave = waveArea;
-    waveArea = row (kAboveWave, juce::jmax (40, getHeight() - kFixedRows));
+    const int gridWrap = w < kGridOneRowW ? kGridWrapH : 0;
+    waveArea = row (kAboveWave, juce::jmax (40, getHeight() - kFixedRows - gridWrap));
     const int by = waveArea.getBottom();
     {
         // Scroll bar row: -, +, Fit at the right (24 px tall, ending above the readout),
@@ -2131,7 +3450,7 @@ void TakeEditorPanel::resized()
     fitButton.setBounds (fr.removeFromLeft (110));
     fr.removeFromLeft (4);
     tempoField.setBounds (fr.removeFromLeft (72));
-    fr.removeFromLeft (8);
+    tempoUnit.setBounds (fr.removeFromLeft (30)); // gap round 1: the unit of the tempo field
     const bool tight = TakeEditorMath::testMutant.load() == TakeEditorMath::mutFitRowTight;
     stretchButton.setBounds (fr.removeFromRight (120).translated (tight ? -100 : 0, 0));
     fr.removeFromRight (tight ? 90 : 8);
@@ -2148,28 +3467,100 @@ void TakeEditorPanel::resized()
     zoomRow.removeFromLeft (8);
     loopButton.setBounds (zoomRow.removeFromLeft (64));
     zoomRow.removeFromLeft (8);
-    loopHalfButton.setBounds (zoomRow.removeFromLeft (48));
+    loopHalfButton.setBounds (zoomRow.removeFromLeft (60)); // gap round 1: "Loop /2", "Loop x2"
     zoomRow.removeFromLeft (4);
-    loopDoubleButton.setBounds (zoomRow.removeFromLeft (48));
+    loopDoubleButton.setBounds (zoomRow.removeFromLeft (60));
     // Warp controls (round 3): their own row under the zoom row, so the zoom row keeps
     // its width and every button stays at least 48x24 at the small sizes.
     {
-        auto wr = row (by + 152, 28);
+        // R1b: the grid row. Every button 48 x 24 or more; below kGridOneRowW wide the
+        // half, double and reset buttons wrap onto a second row under Set.
+        auto gr = row (by + 152, 28);
+        gridLabel.setBounds (gr.removeFromLeft (34));
+        gridSetButton.setBounds (gr.removeFromLeft (48));
+        gr.removeFromLeft (4);
+        gridEarlierButton.setBounds (gr.removeFromLeft (48));
+        gr.removeFromLeft (2);
+        gridLaterButton.setBounds (gr.removeFromLeft (48));
+        gr.removeFromLeft (8);
+        gridBpmDownButton.setBounds (gr.removeFromLeft (48));
+        gr.removeFromLeft (2);
+        gridBpmField.setBounds (gr.removeFromLeft (64));
+        gridBpmUnit.setBounds (gr.removeFromLeft (30)); // R2: "BPM" next to the value
+        gridBpmUpButton.setBounds (gr.removeFromLeft (48));
+        gr.removeFromLeft (8);
+        if (gridWrap > 0)
+            gr = row (by + 152 + kGridWrapH, 28).withTrimmedLeft (34);
+        gridHalfButton.setBounds (gr.removeFromLeft (60)); // R2: "Grid /2", "Grid x2": not the loop /2 x2
+        gr.removeFromLeft (2);
+        gridDoubleButton.setBounds (gr.removeFromLeft (60));
+        gr.removeFromLeft (4);
+        gridOffsetLabel.setBounds (gr.removeFromLeft (TakeEditorMath::testMutant.load() == TakeEditorMath::mutR2Narrow ? 20 : 72)); // readouts2
+        gr.removeFromLeft (4);
+        clickButton.setBounds (gr.removeFromLeft (60)); // metronome
+        gridResetButton.setBounds (gr.removeFromRight (88));
+    }
+    {
+        auto wr = row (by + gridWrap + 186, 28);
         warpButton.setBounds (wr.removeFromLeft (64));
         wr.removeFromLeft (4);
         warpHostButton.setBounds (wr.removeFromLeft (100));
-        wr.removeFromLeft (8);
-        warpResetButton.setBounds (wr.removeFromLeft (110));
-        wr.removeFromLeft (6);
+        wr.removeFromLeft (4);
+        warpResetButton.setBounds (wr.removeFromLeft (96));
+        wr.removeFromLeft (2);
+        gridResLabel.setBounds (wr.removeFromLeft (46)); // gap round 2: "Warp res" names the grid resolution box
+        wr.removeFromLeft (2);
         gridResBox.setBounds (wr.removeFromLeft (60)); // phase 2: grid resolution, in the gap before Apply warp
         applyWarpButton.setBounds (wr.removeFromRight (110)); // at the right end of the warp row: the bottom row is full at 490 wide
     }
-    resultLabel.setBounds (row (by + 186, 20));
-    auto b = row (by + 212, 32);
+    {
+        // R3: the quantize row: Select in loop, the note value, the strength, Quantize.
+        auto qr = row (by + gridWrap + 220, 28);
+        warpSelLoopButton.setBounds (qr.removeFromLeft (110));
+        qr.removeFromLeft (4);
+        quantizeToLabel.setBounds (qr.removeFromLeft (22));
+        qr.removeFromLeft (2);
+        quantizeBox.setBounds (qr.removeFromLeft (80));
+        qr.removeFromLeft (4);
+        quantizeStrengthLabel.setBounds (qr.removeFromLeft (52));
+        qr.removeFromLeft (2);
+        quantizeStrengthBox.setBounds (qr.removeFromLeft (100));
+        qr.removeFromLeft (4);
+        quantizeButton.setBounds (qr.removeFromLeft (84));
+    }
+    warpInfoLabel.setBounds (row (by + gridWrap + 250, 18)); // readouts2: the warp marker line
+    {
+        // F1: the level row: In, Out, Xf, Gain boxes, Normalize, the peak readout.
+        // F2 levelfit: boxes of 100 px (84 px text box = 62 px after the label border, so '2000 ms' and '-24.0 dB' show whole)
+        // on two lines: In, Out, Xf on the first; Gain, Normalize, peak on the second.
+        const bool old = testOldLevelLayout.load(); // teeth LF_OLD_LAYOUT: the F1 one-line 62 px layout
+        const int boxW = old ? 62 : 100, textW = old ? 46 : 84;
+        auto lr = row (by + gridWrap + 276, 28);
+        const std::pair<juce::Label*, juce::Slider*> cells[] = { { &fadeInLabel, &fadeInBox }, { &fadeOutLabel, &fadeOutBox },
+                                                                 { &xfadeLabel, &xfadeBox }, { &gainLabel, &gainBox } };
+        const int labelW[] = { 16, 24, 16, 28 };
+        for (int i = 0; i < 4; ++i)
+        {
+            if (i == 3 && ! old)
+                lr = row (by + gridWrap + 310, 28);
+            cells[i].second->setTextBoxStyle (juce::Slider::TextBoxLeft, false, textW, 28);
+            cells[i].first->setBounds (lr.removeFromLeft (labelW[i]));
+            lr.removeFromLeft (1);
+            cells[i].second->setBounds (lr.removeFromLeft (boxW));
+            lr.removeFromLeft (3);
+        }
+        normalizeButton.setBounds (lr.removeFromLeft (70));
+        lr.removeFromLeft (4);
+        reverseButton.setBounds (lr.removeFromLeft (48));
+        lr.removeFromLeft (4);
+        peakLabel.setBounds (lr);
+    }
+    resultLabel.setBounds (row (by + gridWrap + 344, 20));
+    auto b = row (by + gridWrap + 370, 32);
     resetButton.setBounds (b.removeFromLeft (80));
     applyButton.setBounds (b.removeFromRight (120));
     b.removeFromRight (8);
-    exportButton.setBounds (b.removeFromRight (120).translated (TakeEditorMath::testMutant.load() == TakeEditorMath::mutButtonsOverlap ? 28 : 0, 0));
+    exportButton.setBounds (b.removeFromRight (TakeEditorMath::testMutant.load() == TakeEditorMath::mutExportTextNarrow ? 64 : 120).translated (TakeEditorMath::testMutant.load() == TakeEditorMath::mutButtonsOverlap ? 28 : 0, 0));
     b.removeFromRight (8);
     cancelButton.setBounds (b.removeFromRight (90));
     if (waveArea.getWidth() != oldWave.getWidth() || waveArea.getHeight() != oldWave.getHeight())
@@ -2399,8 +3790,11 @@ void TakeEditorPanel::paint (juce::Graphics& g)
     {
         const auto v = view();
         const float y = (float) warpLane.getY() + 3.0f, hh = (float) warpLane.getHeight() - 6.0f;
-        for (const auto& m : warpMarkers)
+        const float limitAlpha = warpLimitMarker >= 0
+            ? 1.0f - juce::jlimit (0.0f, 1.0f, (float) (juce::Time::getMillisecondCounter() - warpLimitMs) / (float) kWarpLimitFadeMs) : 0.0f;
+        for (size_t mi = 0; mi < warpMarkers.size(); ++mi)
         {
+            const auto& m = warpMarkers[mi];
             const double mx = TakeEditorMath::xOfFrame (v, m.dstFrame);
             if (mx < -5.0 || mx > (double) warpLane.getWidth() + 5.0)
                 continue; // out of the zoomed view
@@ -2413,9 +3807,54 @@ void TakeEditorPanel::paint (juce::Graphics& g)
             tag.lineTo (x, y + hh);
             tag.lineTo (x - 5.0f, y + hh * 0.6f);
             tag.closeSubPath();
-            g.setColour (m.moved() ? kAmber : kAccent);
+            const bool sel = warpSelectedAt ((int) mi);
+            const auto base = sel ? kBright : (m.moved() ? kAmber : kAccent);
+            g.setColour ((int) mi == warpLimitMarker ? base.interpolatedWith (juce::Colours::red, limitAlpha) : base);
             g.fillPath (tag);
+            if (sel)
+            {
+                // R3: a selected marker: white with a ring in its own colour and a bar under it.
+                g.setColour (m.moved() ? kAmber : kAccent);
+                g.strokePath (tag, juce::PathStrokeType (1.5f));
+                g.fillRect (x - 5.0f, (float) warpLane.getBottom() - 2.0f, 10.0f, 2.0f);
+            }
         }
+        if (warpBoxX0 >= 0 && warpBoxX1 != warpBoxX0)
+        {
+            const int a = juce::jmin (warpBoxX0, warpBoxX1), b = juce::jmax (warpBoxX0, warpBoxX1);
+            const juce::Rectangle<int> box (a, warpLane.getY() + 1, b - a, warpLane.getHeight() - 2);
+            g.setColour (kBright.withAlpha (0.12f));
+            g.fillRect (box);
+            g.setColour (kBright.withAlpha (0.6f));
+            g.drawRect (box, 1);
+        }
+        // R3 fix: lane cues sit right-aligned inside the lane, clear of the end marker tag,
+        // on a dark backing so they read over markers; the text is never clipped.
+        auto laneCue = [&] (const juce::String& text, juce::Colour colour, float alpha)
+        {
+            const juce::Font font (juce::FontOptions (11.0f, juce::Font::bold));
+            juce::GlyphArrangement ga;
+            ga.addLineOfText (font, text, 0.0f, 0.0f);
+            const int tw = (int) std::ceil (ga.getBoundingBox (0, -1, true).getWidth()) + 2;
+            // Gap round 2: right end of the crop/loop readout line under the waveform, so it
+            // covers no marker and no ruler number (the left ruler end hid bar 1).
+            auto area = readoutLabel.getBounds().reduced (0, 1);
+            const int w = juce::jmin (area.getWidth(), tw + 8);
+            const auto box = TakeEditorMath::testMutant.load() == TakeEditorMath::mutCueOnLane
+                                 ? warpLane.reduced (0, 2).withTrimmedRight (16).removeFromRight (w)
+                                 : area.removeFromRight (w);
+            g.setColour (kBg.withAlpha (0.85f * alpha));
+            g.fillRoundedRectangle (box.toFloat(), 3.0f);
+            g.setColour (colour.withAlpha (alpha));
+            g.setFont (font);
+            g.drawText (text, box.reduced (4, 0), juce::Justification::centredLeft, false);
+        };
+        if (! (warpLimitMarker >= 0 && limitAlpha > 0.0f) && warpHostNote.isNotEmpty())
+            laneCue (warpHostNote, juce::Colour (0xffffb040), 1.0f); // B1: Warp to host with no host tempo
+        else if (! (warpLimitMarker >= 0 && limitAlpha > 0.0f))
+            laneCue (quantizeHint(), kBright.withAlpha (0.85f), 1.0f); // R3: how to drag free of the grid snap
+        if (warpLimitMarker >= 0 && limitAlpha > 0.0f)
+            laneCue (warpLimitText, juce::Colour (0xffff5a5a), juce::jlimit (0.0f, 1.0f, 2.0f * limitAlpha)); // full opacity for the first half of the fade
     }
 
     // Waveform
