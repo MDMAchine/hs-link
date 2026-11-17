@@ -67,6 +67,11 @@ namespace TakeEditorMath
     void loopFromEditData (const TakeEdit::EditData& edit, juce::int64 length, juce::int64& start, juce::int64& end);
     // e with these loop points; anything that is not start >= 0 and end > start stores -1, -1.
     TakeEdit::EditData withLoop (TakeEdit::EditData e, juce::int64 start, juce::int64 end);
+    // The section Export loop renders: the loop bar when it is set, else the S/E crop when
+    // it frames a section (narrower than the whole take, E > S). False when there is none,
+    // and then Export loop is greyed.
+    bool exportLoopRange (juce::int64 cropStart, juce::int64 cropEnd, juce::int64 loopStart, juce::int64 loopEnd,
+                          juce::int64 length, juce::int64& start, juce::int64& end);
     // The loop a click at frame in the empty loop lane makes: from the click on, one
     // eighth of the take long (at least minLen), moved back when it would pass the end.
     void loopAtClick (juce::int64 frame, juce::int64 length, juce::int64 minLen, juce::int64& start, juce::int64& end);
@@ -149,6 +154,8 @@ namespace TakeEditorMath
     constexpr double kGridBpmStep = 0.01, kGridBpmShiftStep = 0.1;     // - + and Shift + - +
     // The grid bpm field text: two decimals, "" for no tempo.
     juce::String gridBpmText (double bpm);
+    // CONF bar text: tempo-measure confidence (0..1) as "NN%", "" when not finite.
+    juce::String confPercentText (double confidence);
     // The finest snap step: 1/64 beat. A step that is not finite or not positive is 1 beat.
     constexpr double kMinSnapStepBeats = 1.0 / 64.0;
     double clampStepBeats (double stepBeats);
@@ -271,6 +278,11 @@ namespace TakeEditorMath
     // with a seam warning "Loop made: <name>. Ends do not join cleanly (-0.52); try moving
     // a flag." (level 1) or "... Ends join badly, the level dips (-0.75); try moving a
     // flag." (level 2).
+    // q3c: those long seam words do not fit the footer at the minimum panel width, so the
+    // line now reads "Loop made: <name>. Seam not clean (-0.52), move a flag" (level 1) or
+    // "Loop made: <name>. Bad seam, level dips (-0.75), move a flag" (level 2); the long
+    // words stay in the tooltip (resultTipText). mutSeamLongWords = the old long words.
+    juce::String resultTipText (const HotStepLinkProcessor::TakeEditReport& report, const TakeEdit::EditOptions& asked);
     juce::String resultText (const HotStepLinkProcessor::TakeEditReport& report, const TakeEdit::EditOptions& asked);
     // zeromove: where Zero crossing moved the cuts, e.g. 'cuts moved: start +0.8 ms, end -1.2 ms'
     // (signed, + = later in the file). Empty when the snap was not asked or not applied.
@@ -364,13 +376,21 @@ namespace TakeEditorMath
                   mutQuantNoStrength, mutQuantDetectedGrid, mutSelLoopNoBounds, mutLoopBodyNoSnap, mutLoopBodyStillWrites,
                   mutUndoSkipsGrid, mutDragStepPerMove,
                   mutCueOnLane, mutLoopMovesOther, mutWarpResetsNoHost, mutGridDropsHand, mutFitIgnoresTakeBpm,
-                  mutExportTextStatic, mutExportTextNarrow,
-                  mutR2OffsetNoReset, mutR2CountAsOne, mutR2HintWrong, mutR2Narrow,
-                  mutZeroMoveHidden };
+                  mutExportTextStatic, mutExportTextNarrow, mutSeamLongWords,
+                  mutR2OffsetNoReset, mutR2CountAsOne, mutR2HintWrong, mutR2Narrow, mutBpmFieldNarrow,
+                  mutZeroMoveHidden, mutExportLoopOnly, mutWarpNoFallback, mutWarpNoTip,
+                  mutWarpNoNear100Skip, mutWarpNoFlagClear, mutNoBpmDrag, mutWarpLabelsUnderDim,
+                  mutFitTypedFollowsHost, mutFitNoClipTip, mutRulerShift8,
+                  mutDblClickResets, mutBarLabel20 }; // mutDblClickResets = a double-click on a marker resets it (old behaviour); mutBarLabel20 = bar labels thin at 20 px, not kMinBarLabelPx // mutRulerShift8 = bar ticks drawn 8 px right of their frame // jobA: typed tempo ignored at open; fit readout clip tooltip dropped
+    // F4e: mutWarpNoNear100Skip = a region within 0.5 % of 100 still gets a label; mutWarpNoFlagClear = a label may sit under the S / E flag.
+    // F4d: mutWarpNoFallback = a speed label too wide with its percent sign is dropped (no bare number);
+    // mutWarpNoTip = hovering a warped region gives the plain waveform hint, not its full percent.
+    // exportse: mutExportLoopOnly = Export loop is enabled by the loop bar only (S/E framing ignored).
     // zeromove: mutZeroMoveHidden = the result line never says where the zero crossing moved the cuts.
     // readouts2: mutR2OffsetNoReset = Set 1 keeps the old offset zero; mutR2CountAsOne = several selected
     // markers read as '1 marker at'; mutR2HintWrong = the hint names gestures the code does not have;
     // mutR2Narrow = the grid offset readout is laid out 20 px wide.
+    // mutBpmFieldNarrow = the grid bpm field is laid out 48 px wide (the old - + stepper layout).
     // readouts1: mutExportTextStatic = the Export loop button keeps its plain text when Repeats changes;
     // mutExportTextNarrow = the Export loop button is laid out 64 px wide, too narrow for 'Export loop x4'.
     // mutFitIgnoresTakeBpm = open() fills the Fit to bars tempo from the typed or host value, not the take's.
@@ -378,7 +398,15 @@ namespace TakeEditorMath
     // B2: mutLoopMovesOther = a flag drag snaps the other flag too (before B1);
     // mutWarpResetsNoHost = the editor passes the manual tempo as the Warp to host tempo (B3 bug);
     // mutGridDropsHand = a grid edit rebuilds hand-placed warp markers on the new bar starts.
+    // The selector exists in test builds only (HSLINK_TEST_HOOKS). Product code asks through
+    // these two helpers; without the define they answer mutNone / false, so no mutant can run.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> testMutant;
+    inline int teMutantId() { return testMutant.load(); }
+#else
+    inline int teMutantId() { return mutNone; }
+#endif
+    inline bool teMutant (int id) { return teMutantId() == id; }
 }
 
 // The take editor screen: an opaque panel over the Generate plate. Slice 1: waveform
@@ -387,6 +415,50 @@ namespace TakeEditorMath
 // in the snap row, and beats on the ruler. Slice 4: the fit row (Fit to bars, tempo
 // field, bars readout, Stretch to fit). It holds no processor: the editor wires the callbacks and drives
 // tick() from its VBlank tick (no timer of its own).
+// D1b: one stepper layout for every value box with +/- : [- 16][value][+ 16], 24 tall,
+// the same shape as the Grid BPM numbox. JUCE puts both buttons on the right; this moves
+// the left one (the decrement) in front of the value after every JUCE layout pass.
+class StepperSlider : public juce::Slider
+{
+public:
+    static constexpr int kButtonW = 16;
+#if defined (HSLINK_TEST_HOOKS)
+    static inline std::atomic<bool> testJuceLayout { false }; // teeth: keep JUCE's [value][-][+]
+#endif
+    void resized() override
+    {
+        juce::Slider::resized();
+#if defined (HSLINK_TEST_HOOKS)
+        const bool juceLayout = testJuceLayout.load();
+#else
+        const bool juceLayout = false;
+#endif
+        if (juceLayout || getSliderStyle() != juce::Slider::IncDecButtons)
+            return;
+        juce::Component* text = nullptr;
+        juce::Button* bs[2] = { nullptr, nullptr };
+        int n = 0;
+        for (auto* c : getChildren())
+        {
+            if (auto* b = dynamic_cast<juce::Button*> (c))
+            {
+                if (n < 2)
+                    bs[n++] = b;
+            }
+            else if (dynamic_cast<juce::Label*> (c) != nullptr)
+                text = c;
+        }
+        if (n != 2 || text == nullptr || getWidth() < 3 * kButtonW)
+            return;
+        if (bs[0]->getX() > bs[1]->getX())
+            std::swap (bs[0], bs[1]); // bs[0] = decrement (JUCE puts it left of the increment)
+        const int h = getHeight();
+        bs[0]->setBounds (0, 0, kButtonW, h);
+        text->setBounds (kButtonW, 0, getWidth() - 2 * kButtonW, h);
+        bs[1]->setBounds (getWidth() - kButtonW, 0, kButtonW, h);
+    }
+};
+
 class TakeEditorPanel : public juce::Component,
                         public juce::TooltipClient,
                         private juce::ScrollBar::Listener
@@ -404,6 +476,7 @@ public:
         bool warpMarkersEdited = false;
         double warpTagBpm = 0.0;
         double takeBpm = 0.0;     // the take's measured or estimated tempo, 0 = none: Fit to bars opens on it
+        TempoMeasure::Result tempo; // F1: the take's measurement (onsets, level), level none = not measured
     };
 
     TakeEditorPanel();
@@ -439,6 +512,18 @@ public:
     // render uses. Nothing happens when nothing changed. The points are not moved, and
     // a drag that is on goes on: its next step snaps on the new grid.
     void setLiveGrid (const TakeEditorMath::Grid& grid, const juce::String& tempoText);
+    // F1: the take's measurement for AUTO-WARP, kept current like the grid.
+    void setLiveTempo (const TempoMeasure::Result& tempo) { take.tempo = tempo; refreshButtons(); }
+    // F1: AUTO-WARP (test hook = the button's onClick). Returns the marker count placed
+    // from tracked beats, 0 when the measurement gave none (grid markers then).
+#if defined (HSLINK_TEST_HOOKS)
+    int autoWarpForTest() { return autoWarp(); }
+    bool autoWarpEnabledForTest() const { return autoWarpButton.isEnabled(); }
+#endif
+    struct AutoWarpInfo { double bpm = 0.0, downbeatSec = 0.0, hostBpm = 0.0, confidence = 0.0; int level = 0, beats = 0, markers = 0; };
+#if defined (HSLINK_TEST_HOOKS)
+    const AutoWarpInfo& lastAutoWarpForTest() const { return lastAutoWarp; }
+#endif
 
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -451,6 +536,7 @@ public:
     int addWarpMarkerAtX (double xInWave);
     bool removeWarpMarker (int index); // Alt + click; never the end anchors
     void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override; // wheel: zoom about the pointer; Shift or horizontal: pan
+#if defined (HSLINK_TEST_HOOKS)
     double getZoomForTest() const { return zoom; }
     juce::int64 getViewStartForTest() const { return viewStart; }
     void zoomByForTest (double factor, double anchorX) { zoomBy (factor, anchorX); }
@@ -458,18 +544,33 @@ public:
     TakeEditorMath::View viewForTest() const { return view(); }
     juce::Rectangle<int> waveAreaForTest() const { return waveArea; }
     juce::Rectangle<int> scrollAreaForTest() const { return scrollArea; }
+#endif
+
+#if defined (HSLINK_TEST_HOOKS)
+    float waveGainForTest() const { return waveGain; }
+    float wavePeakFillForTest() const { return waveGain * wavePeakAbs; }
     juce::Rectangle<int> overviewAreaForTest() const { return overviewArea; }
     bool zoomInEnabledForTest() const { return zoomInButton.isEnabled(); }
     void zoomToLoopForTest() { zoomToLoop(); }
+#endif
     // Zooms so the window [startSec, startSec + spanSec) fills the waveform (clamped).
+#if defined (HSLINK_TEST_HOOKS)
     void zoomToSecondsForTest (double startSec, double spanSec) { zoomToFrames ((juce::int64) std::llround (startSec * sampleRate), (juce::int64) std::llround ((startSec + spanSec) * sampleRate)); }
+#endif
+    // Ruler vs seconds axis (rulergrid test): the x the bar ticks and second ticks are painted at.
+#if defined (HSLINK_TEST_HOOKS)
+    std::vector<std::pair<int, int>> rulerBarTicksForTest();     // (bar number, panel x)
+    std::vector<std::pair<double, int>> axisTicksForTest() const; // (seconds, panel x)
     double xOfSecondsForTest (double sec) const { return TakeEditorMath::xOfFrame (view(), (juce::int64) std::llround (sec * sampleRate)); }
     juce::Range<double> scrollRangeForTest() const { return scrollBar.getCurrentRange(); }
     double scrollTotalForTest() const { return scrollBar.getMaximumRangeLimit() - scrollBar.getMinimumRangeLimit(); }
     juce::Rectangle<int> loopLaneForTest() const { return loopLane; }
+#endif
     // What paint draws: the S and E grips and the two loop flags (false = off view).
+#if defined (HSLINK_TEST_HOOKS)
     bool cropGripDrawnForTest (bool endGrip) const { return gripShown (endGrip ? cropEnd : cropStart); }
     bool loopFlagDrawnForTest (bool endFlag) const { return hasLoop() && gripShown (endFlag ? loopEnd : loopStart); }
+#endif
     juce::String getTooltip() override; // the loop lane says how it is used
 
     // setTakeEdit, requestTakeEdit and getTakeEditReport of the processor. onApply
@@ -512,7 +613,9 @@ public:
     std::function<void (bool)> onAuditionLoop;
     // Metronome: the Click toggle, with the take's grid tempo and first beat (seconds).
     std::function<void (bool on, double bpm, double downbeatSec)> onAuditionClick;
+#if defined (HSLINK_TEST_HOOKS)
     juce::Button& clickButtonForTest() { return clickButton; }
+#endif
     // F1: the crop region (frames of the file) and the level shaping of the take for the audition.
     std::function<void (juce::int64 cropStart, juce::int64 cropEnd, juce::int64 length, const TakeEdit::EditData&)> onAuditionLevel;
     // The loop brace moved (start, end, length in frames of the file, as onAuditionPlay):
@@ -535,13 +638,16 @@ public:
     // Tests: the clock of the Apply timeout and of the drag write throttle
     // (milliseconds, wraps like juce::Time::getMillisecondCounter, which it is when
     // this is empty).
+#if defined (HSLINK_TEST_HOOKS)
     std::function<juce::uint32()> clockForTest;
+#endif
     // Test hooks (teeth), all false in the plugin. testMatchByName: a report is taken
     // only when its sourceName equals the take's name, as before the ticket.
     // testNoTimeout: an Apply waits for ever. testKeepExpiredTicket: the ticket is kept
     // after the timeout and a late report is shown.
     // testClockAtClick: the timeout counts from the click whatever onJobState says, as
     // before the job state.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testMatchByName, testNoTimeout, testKeepExpiredTicket, testClockAtClick;
     static std::atomic<bool> testOpenWipesWarp; // teeth TS_OPEN_WIPES_WARP: open ignores the take's stored warp
     static std::atomic<bool> testUndoClearedOnOpen; // teeth UNDO_CLEARED_ON_OPEN: open starts every take with an empty history
@@ -549,13 +655,17 @@ public:
     juce::Slider& levelBoxForTest (int i) { juce::Slider* b[] = { &fadeInBox, &fadeOutBox, &xfadeBox, &gainBox }; return *b[juce::jlimit (0, 3, i)]; }
     static std::atomic<bool> testNoFocusGrab; // teeth: a click inside the panel does not take keyboard focus
     static std::atomic<bool> testNoCtrlCharMap; // teeth: Ctrl+letter control codes (0x1A) are not mapped back to letters
+#endif
 
     // Test access (no display): handle frames, a drag given in frames, the peak state.
+#if defined (HSLINK_TEST_HOOKS)
     juce::int64 getCropStartForTest() const { return cropStart; }
     juce::int64 getCropEndForTest() const { return cropEnd; }
     juce::int64 getLengthForTest() const { return length; }
     bool headerReadyForTest() const { return length > 0; }
+#endif
     // F1 level row test hooks
+#if defined (HSLINK_TEST_HOOKS)
     void setLevelForTest (double fadeIn, double fadeOut, double xfade, double gain)
     {
         fadeInBox.setValue (fadeIn, juce::sendNotificationSync); fadeOutBox.setValue (fadeOut, juce::sendNotificationSync);
@@ -575,8 +685,10 @@ public:
         bool peaksReadyForTest() const { return peaks != nullptr && peaks->ok; }
     bool peaksFailedForTest() const { return peakError.isNotEmpty(); }
     juce::Thread::ThreadID peaksThreadForTest() const { return peaks != nullptr ? peaks->buildThread : juce::Thread::ThreadID(); }
+#endif
     // The same path as the mouse: begin takes the handle, drag moves it to a frame
     // (clamped, throttled write), end is the mouse up (always writes).
+#if defined (HSLINK_TEST_HOOKS)
     void beginDragForTest (TakeEditorMath::Handle h) { endGesture(); beginGesture(); dragging = h; dragLoop = false; grabOffset = 0.0; }
     void dragToFrameForTest (juce::int64 frame) { moveHandleTo (frame); }
     void endDragForTest() { endDrag(); }
@@ -584,11 +696,13 @@ public:
     void clickApplyForTest() { applyCrop(); }
     void clickResetForTest() { resetCrop(); }
     bool applyEnabledForTest() const { return applyButton.isEnabled(); }
+#endif
     // Slice 2, the loop. Flag frames (-1 = no loop); a flag drag by frame: begin takes
     // the start or end flag (no flag while no loop is set), dragToFrameForTest and
     // endDragForTest are the ones of the crop handles. createLoopForTest is the click
     // in the empty loop lane at a frame followed by the mouse up; clearLoopForTest the
     // right click in the lane. flagAtForTest is the pick of a pointer position.
+#if defined (HSLINK_TEST_HOOKS)
     juce::int64 getLoopStartForTest() const { return loopStart; }
     juce::int64 getLoopEndForTest() const { return loopEnd; }
     bool hasLoopForTest() const { return hasLoop(); }
@@ -598,8 +712,11 @@ public:
     TakeEditorMath::Handle flagAtForTest (juce::Point<int> p) const { return flagAt (p); }
     void setRepeatsForTest (int n) { repeatsBox.setValue ((double) n, juce::sendNotificationSync); }
     juce::String exportTextForTest() const { return exportButton.getButtonText(); }
+#endif
     // The Export loop text at the look's 12 pt bold fits the button less its 4 px side margins.
+#if defined (HSLINK_TEST_HOOKS)
     bool exportTextFitsForTest (float* textW = nullptr, int* roomW = nullptr) const;
+    bool f4WidthsForTest(); // F4: prints every width it checks; true when all fit
     int getRepeatsForTest() const { return repeats(); }
     void clickExportLoopForTest() { exportLoop(); }
     bool exportLoopEnabledForTest() const { return exportButton.isEnabled(); }
@@ -608,29 +725,41 @@ public:
     bool resultIsWarningForTest() const; // the result line is amber
     bool resultFitsForTest() const;      // the text of the result line is not wider than its row
     bool readoutFitsForTest() const;
+#endif
     // Shows this report as the report of an edit asked with these options: the display
     // path of tick() without a job.
+#if defined (HSLINK_TEST_HOOKS)
     void showReportForTest (const HotStepLinkProcessor::TakeEditReport& r, const TakeEdit::EditOptions& asked) { askedOptions = asked; showReport (r); }
     const TakeEdit::EditOptions& askedOptionsForTest() const { return askedOptions; }
     bool waitingForTest() const { return waiting; }
     juce::uint64 waitTicketForTest() const { return waitTicket; } // 0 = no Apply is waited for
     juce::String resultTextForTest() const { return resultLabel.getText(); }
+    juce::String resultTipForTest() { return resultLabel.getTooltip(); }
+    float resultTextPxForTest() const;   // q3c: drawn width of the result text, px
+    int resultRowPxForTest() const { return resultLabel.getWidth(); }
     bool resultIsErrorForTest() const; // the result line is in the error colour
     juce::String readoutTextForTest() const { return readoutLabel.getText(); }
+#endif
     // The playhead (Mock-up B): frame -1 = hidden. set = what tick() does with a position.
+#if defined (HSLINK_TEST_HOOKS)
     void setPlayheadForTest (juce::int64 frame) { setPlayhead (frame); }
     juce::int64 playheadFrameForTest() const { return playheadFrame; }
     juce::String playheadTextForTest() const { return playheadValue.getText(); }
+#endif
     // The playhead readout is a right-aligned overlay inside the ruler strip, shown, and its
     // text fits unclipped. boundsOut = the overlay rect. The width override (0 = default) lets
     // a test show the check fails when the box is too small for the text.
+#if defined (HSLINK_TEST_HOOKS)
     bool playheadFitsForTest (juce::Rectangle<int>* boundsOut = nullptr) const;
     juce::Rectangle<int> rulerAreaForTest() const { return rulerArea; }
     void setPlayheadOverlayWidthForTest (int w) { playheadOverlayW = w; resized(); }
+#endif
     // Right-hand x limit for ruler ticks and labels: they stop short of the playhead overlay.
     // The x limit paintRuler uses now (panel coordinates).
     int rulerClipNow() const;
+#if defined (HSLINK_TEST_HOOKS)
     bool playheadShownForTest() const { return playheadValue.isVisible(); }
+#endif
     static int rulerClipRight (int rulerRight, int rulerWidth, int overlayW) noexcept
     {
         return rulerRight - juce::jmax (0, juce::jmin (rulerWidth, overlayW)) - 4; // 4 px gap before the overlay
@@ -642,6 +771,7 @@ public:
     // they stay as they are when another take is opened). set = the state without a
     // click; click = what a click does (Button::setToggleState with a notification, the
     // onClick path). The two button references are for real mouse events.
+#if defined (HSLINK_TEST_HOOKS)
     void setSnapGridForTest (bool on) { snapGridButton.setToggleState (on, juce::dontSendNotification); snapChanged(); }
     bool getSnapGridForTest() const { return snapGridButton.getToggleState(); }
     void setZeroCrossingForTest (bool on) { zeroButton.setToggleState (on, juce::dontSendNotification); snapChanged(); }
@@ -658,36 +788,50 @@ public:
     int noteToneForTest() const { return noteTone; } // 0 plain, 1 amber
     bool noteIsAmberForTest() const;
     bool noteFitsForTest() const; // the note, wrapped to the width of its label, is not higher than the label
+#endif
     // The beat lines the ruler paints now; x in panel coordinates. Empty = the ruler shows seconds.
+#if defined (HSLINK_TEST_HOOKS)
     std::vector<TakeEditorMath::BeatLine> beatLinesForTest() const;
     int getResolutionForTest() const { return gridResolution; }
+#endif
     double snapStepBeats() const;      // R1: the snap step in beats, = the finest ruler division now
     juce::int64 snapToStep (juce::int64 frame) const; // R1: nearest line snapStepBeats() apart (warp markers)
     void stepResolution (int delta);   // the grid resolution box steps (phase 2), per panel, not saved
     void scaleLoopLength (bool doubleIt); // /2 and x2 (phase 2), GUI and edit state only
+#if defined (HSLINK_TEST_HOOKS)
     bool rulerShowsBeatsForTest() const { return gridIsUsable() && length > 0; }
+#endif
     // Slice 4, fit to bars. The toggle and the tempo are per panel (not saved; the
     // toggle is off in a new editor, both stay when another take is opened).
     // setFitBpmForTest is the text typed into the tempo field and the return key.
+#if defined (HSLINK_TEST_HOOKS)
     void setFitBarsForTest (bool on) { fitButton.setToggleState (on, juce::dontSendNotification); fitChanged(); }
     bool getFitBarsForTest() const { return fitButton.getToggleState(); }
     void setFitBpmForTest (const juce::String& typed) { tempoField.setText (typed, juce::dontSendNotification); tempoTyped(); }
     double getFitBpmForTest() const { return fitBpm; }
+#endif
     // The Fit to bars tempo only when the user typed it, else 0 (the host default is not one).
     double userFitBpm() const { return tempoByUser ? userBpm : 0.0; }
+#if defined (HSLINK_TEST_HOOKS)
     juce::String tempoFieldTextForTest() const { return tempoField.getText(); }
     juce::String fitTextForTest() const { return barsLabel.getText(); }
     bool fitTextFitsForTest() const { return textFits (barsLabel); }
+    juce::String fitTipForTest() { return barsLabel.getTooltip(); }
+    int fitLabelHeightForTest() const { return barsLabel.getHeight(); }
     bool fitIsAmberForTest() const;   // the fit readout is in the warning colour
+#endif
     // Every line of the fit readout fits between the borders of its label and the
     // lines are not higher than it. widest and lines are given back for the printout.
+#if defined (HSLINK_TEST_HOOKS)
     bool fitInsideForTest (int& widest, int& lines, int& labelW) const;
     bool stretchEnabledForTest() const { return stretchButton.isEnabled(); }
     void clickStretchForTest() { stretchToFit(); }
     juce::Button& fitButtonForTest() { return fitButton; }
     juce::Button& stretchButtonForTest() { return stretchButton; }
+#endif
     // Round 2a, warp markers (model and lane, no audio stretch yet). The markers are
     // auto-placed on the bar starts of the take's grid once the length is known.
+#if defined (HSLINK_TEST_HOOKS)
     const std::vector<WarpMarkers::Marker>& warpMarkersForTest() const { ensureWarp(); return warpMarkers; }
     void dragWarpForTest (int index, juce::int64 dstFrame) { ensureWarp(); WarpMarkers::moveTo (warpMarkers, (std::size_t) index, dstFrame, length); repaint(); }
     void auditionPlayForTest() { auditionPlay(); }
@@ -698,22 +842,45 @@ public:
     void resetWarpForTest (int index) { WarpMarkers::resetOne (warpMarkers, (std::size_t) index); repaint(); }
     int warpMarkerAtForTest (juce::Point<int> p) const { return warpMarkerAt (p); }
     juce::Rectangle<int> warpLaneForTest() const { return warpLane; }
+#endif
     // Round 3: the warp buttons as a click does them.
+#if defined (HSLINK_TEST_HOOKS)
     void clickWarpToHostForTest() { warpToHost(); }
     void clickResetMarkersForTest() { resetMarkers(); }
     void clickApplyWarpForTest() { applyWarp(); }
+    void clickCutSpliceForTest() { cutSplice(); }
+    bool cutSpliceEnabledForTest() const { return cutSpliceButton.isEnabled(); }
     bool warpToHostEnabledForTest() const { return warpHostButton.isEnabled(); }
     bool resetMarkersEnabledForTest() const { return warpResetButton.isEnabled(); }
     bool applyWarpEnabledForTest() const { return applyWarpButton.isEnabled(); }
+#endif
     // Dev shot hooks (Standalone --shot-* flags): marker drag via the mouse path, zoom to a range.
     bool shotDragWarp (int marker, double dstSec, bool snap);
     void shotZoom (double startSec, double endSec);
+    // F4c: the warp speed labels paintWarp draws (empty text = skipped), with the paint font width and column.
+    struct WarpLabel { int seg; double pct; juce::String text; float width; int room; int x; juce::String tip; juce::Rectangle<int> rect; bool flagHit; };
+    // F4e: the S / E crop flag rectangles as painted (panel coordinates).
+    std::vector<juce::Rectangle<int>> cropFlagRects() const;
+    // F4e: the label paintWarp draws for region pct between columns x0..x1 (empty = none) and its plate rect.
+    juce::String warpLabelFor (double pct, int x0, int x1, juce::Rectangle<int>& rect) const;
+#if defined (HSLINK_TEST_HOOKS)
+    std::vector<WarpLabel> warpLabelsForTest() const;
+#endif
+    static juce::String warpLabelText (double pct, int room);
+    // F4d: the full percent of the warped region under panel x (empty = none), the waveform tooltip there.
+    juce::String warpTipAt (int x) const;
+#if defined (HSLINK_TEST_HOOKS)
+    static float warpTextWidthForTest (const juce::String& t) { return textWidthOf (t, juce::FontOptions (10.0f)); }
+#endif
     // R2: the marker limit cue (marker index, -1 = none, and its lane text) and the grid row labels.
+#if defined (HSLINK_TEST_HOOKS)
     int warpLimitMarkerForTest() const { return warpLimitMarker; }
     juce::String warpLimitTextForTest() const { return warpLimitText; }
     juce::String warpHostNoteForTest() const { return warpHostNote; }
     juce::StringArray gridRowTextsForTest() const { return { gridEarlierButton.getButtonText(), gridLaterButton.getButtonText(), gridHalfButton.getButtonText(), gridDoubleButton.getButtonText(), gridBpmUnit.getText() }; }
+#endif
     // R3: marker selection and quantize, as the clicks do them.
+#if defined (HSLINK_TEST_HOOKS)
     void selectWarpMarkerForTest (int i, bool shift) { ensureWarp(); selectWarpMarker (i, shift); }
     int selectWarpInFramesForTest (juce::int64 d0, juce::int64 d1, bool add) { ensureWarp(); return selectWarpInFrames (d0, d1, add); }
     int clickSelectInLoopForTest() { return selectWarpInLoop(); }
@@ -721,17 +888,24 @@ public:
     int warpSelectedCountForTest() const { int n = 0; for (bool b : warpSelectionMask()) n += b ? 1 : 0; return n; }
     void setQuantizeForTest (int choice, double strengthPct) { quantizeBox.setSelectedItemIndex (choice, juce::dontSendNotification); quantizeStrengthBox.setValue (strengthPct, juce::dontSendNotification); }
     int clickQuantizeForTest() { return quantizeSelected(); }
+    int clickPinForTest (bool pin) { return setPinSelected (pin); }
+    bool pinAddEnabledForTest() const { return pinAddButton.isEnabled(); }
+    bool pinRemoveEnabledForTest() const { return pinRemoveButton.isEnabled(); }
     bool quantizeEnabledForTest() const { return quantizeButton.isEnabled(); }
     bool selectInLoopEnabledForTest() const { return warpSelLoopButton.isEnabled(); }
     juce::String warpLaneHintForTest() const { return quantizeHint(); }
     void setWarpBoxForTest (int x0, int x1) { warpBoxX0 = x0; warpBoxX1 = x1; repaint(); } // shot: a box mid-drag
     void setWarpForTest (bool on) { warpButton.setToggleState (on, juce::dontSendNotification); refreshButtons(); }
+#endif
     // The warp redraw (4eed68e): the source frame a wave column at warped frame d reads,
     // the dst a marker drag lands on (Shift = free), and a double-click on marker i.
+#if defined (HSLINK_TEST_HOOKS)
     juce::int64 columnSourceForTest (juce::int64 d) const { return columnSource (d); }
     juce::int64 warpDragTargetForTest (juce::int64 dst, bool shift) const { return warpDragTarget (dst, shift); }
     void doubleClickWarpMarkerForTest (int i) { ensureWarp(); warpMarkerDoubleClicked (i); }
+#endif
     // R1b beatgrid editing: the grid row, as a click does it.
+#if defined (HSLINK_TEST_HOOKS)
     void gridSetDownbeatForTest (juce::int64 frame) { setGridDownbeat (frame); }
     void gridNudgeForTest (double deltaSec) { applyGridEdit (TakeEditorMath::gridShifted (take.grid, deltaSec)); }
     void gridBpmStepForTest (double delta) { gridBpmStep (delta); }
@@ -743,16 +917,21 @@ public:
     const TakeEditorMath::Grid& detectedGridForTest() const { return detectedGrid; }
     const TakeEdit::GridEdit& gridEditForTest() const { return take.gridEdit; }
     juce::String gridBpmTextForTest() const { return gridBpmField.getText(); }
+    juce::String confTextForTest() const { return confBarText(); }
+    juce::Label& gridBpmFieldForTest() { return gridBpmField; }
     void setClickFrameForTest (juce::int64 f) { lastClickFrame = f; refreshButtons(); }
     bool gridSetEnabledForTest() const { return gridSetButton.isEnabled(); }
     bool gridResetEnabledForTest() const { return gridResetButton.isEnabled(); }
     bool gridHalfEnabledForTest() const { return gridHalfButton.isEnabled(); }
     bool gridDoubleEnabledForTest() const { return gridDoubleButton.isEnabled(); }
+#endif
     // readouts2: the grid offset readout and the warp marker line (count, time, gesture hint).
+#if defined (HSLINK_TEST_HOOKS)
     juce::String gridOffsetTextForTest() const { return gridOffsetLabel.getText(); }
     juce::String warpInfoTextForTest() const { return warpInfoLabel.getText(); }
     static juce::String warpGestureHintForTest() { return warpGestureHint(); }
     bool readouts2FitForTest() const;
+#endif
     // R4 undo and redo. One snapshot (crop, loop, take grid, warp markers) is pushed per
     // committed gesture: a button click, or a drag on its mouse up. A gesture that changes
     // nothing pushes nothing. History capped at kUndoCap; a new step clears the redo list.
@@ -770,10 +949,12 @@ public:
     static constexpr int kUndoCap = 100;
     bool undo();
     bool redo();
+#if defined (HSLINK_TEST_HOOKS)
     bool undoForTest() { return undo(); }
     bool redoForTest() { return redo(); }
     int undoDepthForTest() const { return (int) undoStack.size(); }
     int historyTakesForTest() const { return (int) histories.size(); }
+#endif
     // C3: the undo history of a take is kept for the session across Close and reopen;
     // a deleted take forgets its history. Not saved in the state.
     void forgetHistory (const juce::File& takeFile);
@@ -784,6 +965,7 @@ public:
             it = keep.contains (it->first) ? std::next (it) : histories.erase (it);
     }
     static constexpr int kHistoryTakes = 64;
+#if defined (HSLINK_TEST_HOOKS)
     int redoDepthForTest() const { return (int) redoStack.size(); }
     UndoSnapshot snapshotForTest() const { return takeSnapshot(); }
     bool undoEnabledForTest() const { return undoButton.isEnabled(); }
@@ -794,8 +976,17 @@ public:
     void beginGestureForTest() { beginGesture(); } // a mouse down
     void endGestureForTest() { endGesture(); }     // a mouse up
     void loopBodyDragForTest (juce::int64 pressFrame, juce::int64 nowFrame); // body press, one move, release
+#endif
     struct Area { juce::String name; juce::Rectangle<int> bounds; bool hit = false; bool button = false; };
+#if defined (HSLINK_TEST_HOOKS)
     std::vector<Area> areasForTest() const;
+#endif
+    // v5b R1: the layout frame, row by row (stack, wavepad, zoom, cards1, cards2, waveform),
+    // each item an Area plus a group id; set in resized(), the takelayout check reads it.
+    struct LayoutItem { juce::String row; int group = 0; Area area; };
+#if defined (HSLINK_TEST_HOOKS)
+    std::vector<LayoutItem> layoutRowsForTest() const;
+#endif
 
 private:
     // What the pool job and the panel share. The job holds this block and nothing else.
@@ -854,13 +1045,22 @@ private:
     void showReport (const HotStepLinkProcessor::TakeEditReport& r);
     void exportLoop();
     bool textFits (const juce::Label&) const;
+    static float textWidthOf (const juce::String&, const juce::Font&);
+    void tipWhenClipped (juce::Label&, const juce::String& baseTip) const;
+    juce::String resultTip; // q3c: long seam words for the result line tooltip, else empty
+    void refreshClipTips();
     void updateExportText();
+#if defined (HSLINK_TEST_HOOKS)
     juce::uint32 nowMs() const { return clockForTest ? clockForTest() : juce::Time::getMillisecondCounter(); }
+#else
+    juce::uint32 nowMs() const { return juce::Time::getMillisecondCounter(); }
+#endif
     TakeEdit::EditOptions askedOptions;
     void applyCrop();
     void resetCrop();
     // Slice 3
     bool gridIsUsable() const { return TakeEditorMath::gridUsable (take.grid, sampleRate); }
+    juce::String confBarText() const { return gridIsUsable() && take.grid.measured ? TakeEditorMath::confPercentText (take.tempo.confidence) : juce::String(); }
     bool snapActive() const { return snapGridButton.getToggleState() && gridIsUsable(); }
     void snapChanged(); // a toggle changed: the note
     void refreshNote();
@@ -885,9 +1085,13 @@ private:
     void setResult (const juce::String& text, int tone);
     bool resultHeld = false; // a result of this take is shown; the "move a handle" hint does not replace it
     void refreshTexts();
+    juce::String fitHeaderMeta();
     void refreshButtons();
     // Audition
     void auditionPlay();
+    // Live warp: a marker edit while the preview plays (state 2) sends the warp at once
+    // (the audition renders again and swaps it in place); while loading it plays again.
+    void sendAuditionWarp();
     void auditionStop();
     juce::int64 sentRegionStart = -2, sentRegionEnd = -2; // the region last given to the audition
     void refreshAudition(); // the Play and Stop buttons from onAuditionState
@@ -917,6 +1121,7 @@ private:
     int selectWarpInFrames (juce::int64 d0, juce::int64 d1, bool add); // dst inside d0..d1
     int selectWarpInLoop();
     int quantizeSelected();
+    int setPinSelected (bool pin); // F3: +PIN (true) / -PIN (false) on the selected markers
     juce::String quantizeHint() const;
     // R2: dragging the loop bar body moves the whole loop; pointer frame minus loopStart.
     bool loopBodyDrag = false;
@@ -929,9 +1134,11 @@ private:
     void warpMarkerDoubleClicked (int i); // remove, or reset an end anchor
     void ensureWarp() const;
     void storeWarp(); // C1: hands the warp to onSetWarp
+    int autoWarp(); // F1: grid + warp markers from the tracked beats, one undo step
     Take openedWarp; // C1: the take as opened; Cancel stores its warp again
     int warpMarkerAt (juce::Point<int> p) const;
     void paintWarp (juce::Graphics&) const;
+    void paintWarpLabels (juce::Graphics&) const; // F4f: drawn after the out-of-crop dim
     // Round 3: the warp buttons. warpTagBpm: the tempo Warp to host warped to (the acid
     // tempo of Apply warp); 0 after a hand move or a reset (then the markers tell it).
     double warpTagBpm = 0.0;
@@ -941,6 +1148,7 @@ private:
     // R1b beatgrid editing. detectedGrid: the grid from detection (open, setLiveGrid);
     // take.grid = effectiveGrid (detectedGrid, take.gridEdit).
     TakeEditorMath::Grid detectedGrid;
+    AutoWarpInfo lastAutoWarp; // F1: what the last AUTO-WARP did (test print)
     juce::int64 lastClickFrame = -1;     // the last press on the ruler or the waveform, -1 = none
     juce::int64 gridDragFrame = -1;      // Ctrl/Cmd + drag on the ruler: the press frame, -1 = none
     TakeEditorMath::Grid gridDragFrom;   // the grid at that press
@@ -953,6 +1161,7 @@ private:
     void resetGrid();
     juce::int64 gridSetFrame() const;    // the playhead when shown, else lastClickFrame
     void applyWarp();
+    void cutSplice();
     int playheadX() const;          // x in panel coordinates, -1 when hidden or out of view
     // Horizontal zoom and pan (not persisted). zoom 1 = whole take.
     double zoom = 1.0;
@@ -968,6 +1177,23 @@ private:
 
     // One source for bounds: set in resized(), used by paint and the mouse code.
     juce::Rectangle<int> rulerArea, warpLane, loopLane, waveArea, scrollArea, overviewArea, snapRow, fitRow, zoomRow;
+    juce::Rectangle<int> axisArea; // D2: seconds axis under the waveform
+    float wavePeakAbs = 0.0f;
+    float waveGain = 1.0f;         // D2: display-only waveform gain (tallest peak at kWavePeakFill)
+    static constexpr float kWavePeakFill = 0.88f;
+    void paintSecondsAxis (juce::Graphics&) const;
+    int rulerBarX (double beatX) const;                       // one source for the bar tick x (paint and test)
+    int axisTickX (double t, double t0, double pxPerSec) const; // one source for the seconds tick x
+    // v5b R1 frame: wave panel (ruler..scroll bar) beside the GRID EDIT pad, the zoom row and
+    // the two card rows anchored to the plate bottom; the planned waveform takes the spare height.
+    juce::Rectangle<int> wavePanelFrame, waveFrame, gridPadFrame, zoomFrame, footerFrame;
+    juce::Rectangle<int> footerTextFrame; // F4b: the footer slice between Reset and Cancel
+    juce::Rectangle<int> cardFrames[4]; // TIMING & GRID, WARP & QUANTIZE, FADES & LEVEL, REGION & SPLICE
+    void paintLayoutFrame (juce::Graphics&) const;
+    // Round C1/C2: captions above every card value and the LCD wells behind the value text.
+    std::vector<std::pair<juce::Rectangle<int>, juce::String>> cardCaptions;
+    std::vector<juce::Rectangle<int>> lcdRects;
+    void styleLcdValues();
     juce::Image waveImage;
     bool waveDirty = true;
     std::uint64_t waveWarpSig = 0; // warp state the wave image was drawn with
@@ -975,6 +1201,10 @@ private:
     void paintRuler (juce::Graphics&) const;
 
     juce::Label titleLabel, infoLabel, readoutLabel, resultLabel;
+    juce::String infoFull;           // r5: the whole header meta; resized() drops trailing parts to fit, never cuts
+    juce::Rectangle<int> posCaption; // r5: the 'POS' caption left of the playhead readout (painted)
+    juce::Rectangle<int> playheadBoxBounds; // r5
+    int gridLcdY = 24;               // r5: BPM LCD top inside the GRID EDIT card (rows spread over the card)
     // The tempo field: a label that, while its text is empty, shows a placeholder (when
     // idle and in its text editor).
     struct TempoLabel : juce::Label
@@ -985,20 +1215,21 @@ private:
     };
     juce::Label repeatsLabel, noteLabel, barsLabel, playheadValue;
     TempoLabel tempoField;
-    juce::ToggleButton snapGridButton { "Snap to grid" }, zeroButton { "Zero crossing" }, fitButton { "Fit to bars" },
-                       loopButton { "Loop" };
+    // v5b R2b: lit buttons (TextButton, clicking toggles), no checkbox glyph.
+    juce::TextButton snapGridButton { "Snap" }, zeroButton { "Zero-X" }, fitButton { "Fit to bars" },
+                     loopButton { "Loop" };
     juce::TextButton playButton { "Play" }, stopButton { "Stop" }, loopHalfButton { "Loop /2" }, loopDoubleButton { "Loop x2" };
-    juce::Slider repeatsBox;
-    juce::Slider gridResBox; // manual grid resolution (phase 2): -6..6, 0 = automatic
-    juce::TextButton closeButton { "Close" }, resetButton { "Reset" }, cancelButton { "Cancel" }, applyButton { "Apply crop" },
+    StepperSlider repeatsBox;
+    StepperSlider gridResBox; // manual grid resolution (phase 2): -6..6, 0 = automatic
+    juce::TextButton closeButton { "Close" }, resetButton { "Reset" }, cancelButton { "Cancel" }, applyButton { "Send to takes" },
                      exportButton { "Export loop" }, stretchButton { "Stretch to fit" };
-    juce::ToggleButton warpButton { "Warp" };
+    juce::TextButton warpButton { "WARP" };
     juce::TextButton warpSelLoopButton { "Select in loop" }, quantizeButton { "Quantize" };
     juce::ComboBox quantizeBox;
     juce::Slider quantizeStrengthBox; // 0..100 %
     // F1: the level row: fade in, fade out, loop crossfade (ms), gain (dB), Normalize, peak.
     juce::Label fadeInLabel, fadeOutLabel, xfadeLabel, gainLabel, peakLabel;
-    juce::Slider fadeInBox, fadeOutBox, xfadeBox, gainBox;
+    StepperSlider fadeInBox, fadeOutBox, xfadeBox, gainBox;
     juce::TextButton normalizeButton { "Normalize" };
     juce::TextButton reverseButton { "Rev" }; // Reverse: a toggle, EditData::reverse
     void setReverse (bool on);                // one undo step, writeEdit
@@ -1009,11 +1240,24 @@ private:
     void refreshPeakLabel();
     void sendAuditionLevel();
     juce::TextButton warpHostButton { "Warp to host" }, warpResetButton { "Reset markers" }, applyWarpButton { "Apply warp" };
-    juce::TextButton zoomOutButton { "-" }, zoomInButton { "+" }, zoomFitButton { "Fit" }, zoomLoopButton { "Loop" };
+    juce::TextButton zoomOutButton { "-" }, zoomInButton { "+" }, zoomFitButton { "Fit" }, zoomLoopButton { "Loop zoom" };
     // R1b: the grid row.
-    juce::Label gridLabel, gridBpmField, gridBpmUnit;
+    // F4e: the grid bpm field also drags. Vertical drag past 4 px: up raises, 0.1 bpm per px
+    // (Shift 0.01), clamped to kMinBpm..kMaxBpm, live, one undo step per gesture. A plain
+    // click still opens the text editor.
+    struct BpmDragLabel : juce::Label
+    {
+        TakeEditorPanel* owner = nullptr;
+        bool dragActive = false;
+        double startBpm = 0.0;
+        void mouseDown (const juce::MouseEvent&) override;
+        void mouseDrag (const juce::MouseEvent&) override;
+        void mouseUp (const juce::MouseEvent&) override;
+    };
+    juce::Label gridLabel, gridBpmUnit;
+    BpmDragLabel gridBpmField;
     juce::Label gridOffsetLabel, warpInfoLabel; // readouts2
-    juce::ToggleButton clickButton { "Click" }; // metronome on the audition, audition only
+    juce::TextButton clickButton { "Click" }; // metronome on the audition, audition only
     void sendClick();
     double gridAnchorSec = 0.0;                 // readouts2: the downbeat the offset counts from
     juce::String gridOffsetText() const;
@@ -1023,8 +1267,18 @@ private:
     juce::Label tempoUnit, gridResLabel; // gap round 1: "BPM" after the Fit to bars tempo, "Res" before the grid resolution box
     juce::Label quantizeToLabel, quantizeStrengthLabel; // the quantize row words, as gridLabel
     juce::TextButton gridSetButton { "Set 1" }, gridEarlierButton { "< 1ms" }, gridLaterButton { "1ms >" },
-                     gridBpmDownButton { "-" }, gridBpmUpButton { "+" }, gridHalfButton { "Grid /2" }, gridDoubleButton { "Grid x2" },
+                     gridHalfButton { "/2" }, gridDoubleButton { "x2" },
                      gridResetButton { "Reset grid" };
+    // v5b R2b: controls the inventory places that had no code yet.
+    juce::Label hostBpmLabel;                                                        // #44 TIMING row A
+    juce::Label regionStartLabel, regionEndLabel, regionLengthLabel, regionFramesLabel; // #67-70 REGION row A
+    juce::TextButton autoWarpButton { "AUTO-WARP" }, pinAddButton { "+PIN" }, pinRemoveButton { "-PIN" }; // #34, #40, #41
+    juce::TextButton cutSpliceButton { "Cut / Splice" };                             // #72
+    double hostBpmShown = -2.0;
+    void refreshHostBpm();
+    void refreshRegionLabels();
+    void syncFooterLine(); // resultLabel replaces readoutLabel while it shows
+    void paintGridLcd (juce::Graphics& g) const;
     // R4 undo
     std::vector<UndoSnapshot> undoStack, redoStack;
     struct History { std::vector<UndoSnapshot> undo, redo; juce::uint64 used = 0; };

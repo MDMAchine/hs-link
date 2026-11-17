@@ -70,5 +70,7 @@ namespace TakeStretch
     // Tests only, null in the plugin: when not null it replaces the random token of the
     // temporary name ("<dest name>.<token>.stretching"); the pointer must stay valid
     // while set.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<const char*> testPartToken;
+#endif
 }

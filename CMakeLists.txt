@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.22)
 set(PLUGIN_TARGET "HOTSTEP_LINK")
 set(PLUGIN_CODE   "Hslk")
 
-project(${PLUGIN_TARGET} VERSION 0.5.23)
+project(${PLUGIN_TARGET} VERSION 0.5.24)
 # project(VERSION) is the single version source: juce_add_plugin inherits it as JucePlugin_VersionString;
 # the console test app gets the same define below.
 set(CMAKE_CXX_STANDARD 17)
@@ -106,6 +106,7 @@ target_sources(HSLINK_Tests PRIVATE
 target_include_directories(HSLINK_Tests PRIVATE source third_party)
 target_compile_definitions(HSLINK_Tests PRIVATE
     HSLINK_STUB_DEFAULT_PATH="${HSLINK_STUB_DEFAULT}"
+    HSLINK_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 HSLINK_TEST_HOOKS=1
     JucePlugin_Name="HOT-STEP LINK" JucePlugin_VersionString="${PROJECT_VERSION}" NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
 if(HSLINK_TEETH)
@@ -125,6 +126,16 @@ if(HSLINK_TEETH)
     target_compile_definitions(HSLINK_MidiDrumTest PRIVATE HSLINK_TEETH_${HSLINK_TEETH}=1)
 endif()
 target_link_libraries(HSLINK_MidiDrumTest PRIVATE juce::juce_audio_basics juce::juce_audio_formats juce::juce_recommended_config_flags)
+
+# Console test for the chord export (C2). -DHSLINK_TEETH=CHORD_NO_SMOOTH, CHORD_ROOT_SWAP or CHORD_LOW_FLOOR (CHORD_NO_KEY informational: no fixture where the key bonus decides).
+juce_add_console_app(HSLINK_MidiChordTest PRODUCT_NAME "HSLINK_MidiChordTest")
+target_sources(HSLINK_MidiChordTest PRIVATE tests/MidiChordTest.cpp)
+target_include_directories(HSLINK_MidiChordTest PRIVATE source)
+target_compile_definitions(HSLINK_MidiChordTest PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
+if(HSLINK_TEETH)
+    target_compile_definitions(HSLINK_MidiChordTest PRIVATE HSLINK_TEETH_${HSLINK_TEETH}=1)
+endif()
+target_link_libraries(HSLINK_MidiChordTest PRIVATE juce::juce_audio_basics juce::juce_audio_formats juce::juce_recommended_config_flags)
 
 # Console test for the melody export (M2) and the shared hits/melody origin (G1).
 # HSLINK_MELODY_OLD_API=1 on this target builds against the pre-origin notes API (teeth).
@@ -177,7 +188,7 @@ target_sources(HSLINK_EditorExportTest PRIVATE
     source/TakeEdit.cpp source/TakePeaks.cpp source/TakeEditorPanel.cpp source/WavTempoTag.cpp)
 target_include_directories(HSLINK_EditorExportTest PRIVATE source third_party)
 target_compile_definitions(HSLINK_EditorExportTest PRIVATE
-    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
+    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 HSLINK_TEST_HOOKS=1
     JucePlugin_Name="HOT-STEP LINK" JucePlugin_VersionString="${PROJECT_VERSION}" NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
 target_link_libraries(HSLINK_EditorExportTest PRIVATE
     juce::juce_audio_utils juce::juce_audio_processors juce::juce_dsp
@@ -191,7 +202,7 @@ target_sources(HSLINK_TakeEditorFlowTest PRIVATE
     source/TakeEdit.cpp source/TakePeaks.cpp source/TakeEditorPanel.cpp source/WavTempoTag.cpp)
 target_include_directories(HSLINK_TakeEditorFlowTest PRIVATE source third_party)
 target_compile_definitions(HSLINK_TakeEditorFlowTest PRIVATE
-    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
+    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 HSLINK_TEST_HOOKS=1
     JucePlugin_Name="HOT-STEP LINK" JucePlugin_VersionString="${PROJECT_VERSION}" NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
 target_link_libraries(HSLINK_TakeEditorFlowTest PRIVATE
     juce::juce_audio_utils juce::juce_audio_processors juce::juce_dsp
@@ -223,7 +234,7 @@ target_compile_options(HSLINK_CloseSpanTest PRIVATE /Zi)
 target_link_options(HSLINK_CloseSpanTest PRIVATE /DEBUG)
 target_compile_definitions(HSLINK_CloseSpanTest PRIVATE
     HSLINK_STUB_DEFAULT_PATH="${HSLINK_STUB_DEFAULT}"
-    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
+    JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 HSLINK_TEST_HOOKS=1
     JucePlugin_Name="HOT-STEP LINK" JucePlugin_VersionString="${PROJECT_VERSION}" NOMINMAX=1 WIN32_LEAN_AND_MEAN=1)
 target_link_libraries(HSLINK_CloseSpanTest PRIVATE
     juce::juce_audio_utils juce::juce_audio_processors juce::juce_dsp

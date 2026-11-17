@@ -12,6 +12,7 @@
 // Needs node and the contract stub (HSLINK_STUB, default HSLINK_STUB_DEFAULT_PATH from CMake).
 // Scratch under <cwd>/bypass_upload_scratch, removed at the end.
 #include "PluginProcessor.h"
+#include "TestSettingsRedirect.h"
 
 #include <cmath>
 #include <cstdio>
@@ -64,6 +65,7 @@ juce::AudioBuffer<float> runBlock (HotStepLinkProcessor& p, const juce::AudioBuf
 
 int main()
 {
+    HslinkTestSettingsRedirect settingsRedirect ("bypassupload"); // never the real user settings; first, before any processor
     juce::ScopedJuceInitialiser_GUI init;
     auto scratch = juce::File::getCurrentWorkingDirectory().getChildFile ("bypass_upload_scratch");
     scratch.deleteRecursively();

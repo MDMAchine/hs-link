@@ -23,7 +23,9 @@ namespace TakeEdit
     // F1 level teeth (tests only): 0 none, 1 no user fades, 2 no loop xfade, 3 no gain.
     enum { lvMutNone = 0, lvMutNoFade, lvMutNoXfade, lvMutNoGain, lvMutNoReverse, lvMutNoZeroSnap, lvMutRevSeamForward };
     // lvMutNoZeroSnap: the zero crossing snap finds no crossing (the cuts stay where asked).
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> testLevelMutant;
+#endif
     constexpr double kMaxUserFadeMs = 2000.0, kMaxLoopXfadeMs = 500.0, kMinGainDb = -24.0, kMaxGainDb = 24.0;
     constexpr double kDefaultFadeMs = 5.0, kDefaultZeroCrossingMs = 3.0;
 
@@ -135,6 +137,12 @@ namespace TakeEdit
         // (the tempo it plays at); 0 = the grid tempo as for a crop.
         std::vector<WarpMarkers::Marker> warp;
         double warpBpm = 0.0;
+        // F2 Cut / Splice: true = the loop region [loopStart, loopEnd) is taken out of
+        // the whole file and the two parts are joined with an equal power crossfade of
+        // max (fadeMs, loopXfadeMs) frames (at most what is left on either side). The
+        // output length is len - (loopEnd - loopStart) - crossfade. No crop, no repeats,
+        // no warp with it (refused). seamFadeSamples reports the crossfade.
+        bool cutSplice = false;
     };
 
     struct EditRequest
@@ -167,7 +175,8 @@ namespace TakeEdit
         // signed, + = later; 0 = it stayed). False = no zero crossing snap was made.
         bool zeroSnapped = false;
         juce::int64 zeroMoveStart = 0, zeroMoveEnd = 0;
-        juce::int64 seamFadeSamples = 0;    // loop render: crossfade length at each seam
+        juce::int64 seamFadeSamples = 0;    // loop render: crossfade length at each seam; cut/splice: at the join
+        juce::int64 cutRemoved = 0;         // cut/splice: frames of the region taken out
         // Loop render: the measured correlation of the two overlapped segments, signed,
         // -1..1 (see below). Near 1: the loop end runs into its own start. Near 0: the two
         // have nothing in common, or one of them is silent, or there is no crossfade
@@ -257,7 +266,11 @@ namespace TakeEdit
     // Tests only, null in the plugin: when not null it replaces the random token of the
     // temporary name ("<dest name>.<token>.editing"); the pointer must stay valid while
     // set.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<const char*> testEditPartToken;
+#endif
     // Tests only (teeth), false in the plugin: a warp render writes no tempo tags.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testUntaggedWarp;
+#endif
 }

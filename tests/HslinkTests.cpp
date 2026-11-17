@@ -1,6 +1,7 @@
 #ifndef HSLINK_STUB_DEFAULT_PATH
  #define HSLINK_STUB_DEFAULT_PATH "../HOT-Step-CPP/server/scripts/daw-contract-stub.mjs"
 #endif
+#include <limits>
 #include <stdexcept>
 #include <map>
 #include <functional>
@@ -232,7 +233,21 @@ void testDawWorkerLive()
     }
     const juce::String cmd = "node \"" + stub.getFullPathName() + "\" --ok --port 3911";
     juce::ChildProcess server;
-    check (server.start (cmd, 0), "stub started");
+    const bool spawned = server.start (cmd, 0);
+    // node cold-loads slowly on this drive: wait until the stub accepts a connection
+    // before starting the worker, so its connect backoff never races the stub's startup.
+    bool listening = false;
+    const auto tStub = juce::Time::getMillisecondCounterHiRes();
+    while (spawned && ! listening && juce::Time::getMillisecondCounterHiRes() - tStub < 30000.0)
+    {
+        juce::StreamingSocket probe;
+        listening = probe.connect ("127.0.0.1", 3911, 500);
+        if (! listening)
+            juce::Thread::sleep (100);
+    }
+    std::printf ("  stub listening=%d after %.2f s%c", (int) listening,
+                 (juce::Time::getMillisecondCounterHiRes() - tStub) / 1000.0, 10);
+    check (spawned && listening, "stub started");
 
     DawWorker w;
     w.deadlineEnabled = ! teeth;
@@ -4173,10 +4188,35 @@ static void testCollection (const juce::File& tmp)
         check (parsed && std::abs ((double) sv["bpm"] - 124.0) < 1.0e-9 && (juce::int64) sv["seed"] == 4242
                && std::abs ((double) sv["duration_s"] - 2.5) < 0.001,
                "add: sidecar bpm 124, seed 4242 and duration 2.5 s equal the take's");
-        check (parsed && sv["tags"].isArray() && sv["tags"].size() == 0 && ! (bool) sv["starred"]
+        {
+            juce::StringArray st;
+            if (const auto* arr = sv["tags"].getArray())
+                for (const auto& t : *arr)
+                    st.add (t.toString());
+            std::printf ("  add: sidecar tags [%s]%c", st.joinIntoString (",").toRawUTF8(), 10);
+            check (st.joinIntoString (",") == "sa3,124bpm,a minor,text2music",
+                   "add: sidecar tags are exactly sa3,124bpm,a minor,text2music");
+            const auto listed = p.collection.list();
+            const auto lt = listed.empty() ? juce::String ("<none>") : listed.front().tags.joinIntoString (",");
+            CollectionQuery tq;
+            tq.text = "124BPM";
+            const int nTag = (int) CollectionStore::filter (listed, tq).size();
+            std::printf ("  load: listed %d item(s), tags [%s], search '124BPM' finds %d%c", (int) listed.size(), lt.toRawUTF8(), nTag, 10);
+            check (listed.size() == 1 && lt == "sa3,124bpm,a minor,text2music" && nTag == 1,
+                   "add then list: the tags round-trip through the sidecar and are searchable");
+        }
+        {
+            const auto t1 = CollectionStore::buildTags (" ACE ", 119.6, "F# Major", "ACE");
+            const auto t2 = CollectionStore::buildTags ({}, 0.0, {}, {});
+            std::printf ("  buildTags: [%s] and [%s] (%d)%c", t1.joinIntoString (",").toRawUTF8(),
+                         t2.joinIntoString (",").toRawUTF8(), t2.size(), 10);
+            check (t1.joinIntoString (",") == "ace,120bpm,f# major" && t2.isEmpty(),
+                   "buildTags: trims, lowercases, rounds bpm, drops duplicates and empties");
+        }
+        check (parsed && sv["tags"].isArray() && ! (bool) sv["starred"]
                && sv["source"].toString() == a.stable.getFileName() && sv["added"].toString().isNotEmpty()
                && sv["created"].toString().isNotEmpty() && sv["name"].toString() == a.stable.getFileNameWithoutExtension(),
-               "add: sidecar has name, created, added, starred=false, empty tags and the source file name");
+               "add: sidecar has name, created, added, starred=false, a tags array and the source file name");
         check (collCountFiles (root, "*.tmp") == 0 && collCountFiles (root, "*.json") == 1, "add: 1 sidecar and no temp file left in the root");
 
         // 3. add the same take twice.
@@ -4647,7 +4687,7 @@ static void testCollection (const juce::File& tmp)
 }
 
 // Takes whose lasting copy fails (R1 / R2). No server, no editor. Everything lives in
-// the test's own folders: HSLINK_TEMP_ROOT and HSLINK_STABLE_ROOT / setStableRoot.
+// the test's own folders: HSLINK_TEMP_ROOT and HSLINK_TAKES_ROOT / setStableRoot.
 // HSLINK_TEETH=NO_UNSAVED_GUARD = the behaviour before the guard: no marker, cleanup by
 // age only, no notice, no background retry, no rescue, getTakes retries the copy itself.
 void testUnsavedTakes (const juce::File& tmp)
@@ -4656,12 +4696,12 @@ void testUnsavedTakes (const juce::File& tmp)
     DawWorker::unsavedGuard = ! teeth;
     std::printf ("Unsaved takes: marker, cleanup, rescue, retry%s%c", teeth ? "  [TEETH: NO_UNSAVED_GUARD]" : "", 10);
     const auto tempRoot = DawWorker::tempRoot();
-    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto blocker = tmp.getChildFile ("r1_blocker.txt"); // a regular file: no folder can be made under it
     blocker.replaceWithText ("not a folder");
     const auto goodRoot = tmp.getChildFile ("r1_good_stable");
     const juce::String markerName (DawWorker::unsavedMarkerName());
-    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_STABLE_ROOT", f.getFullPathName().toRawUTF8()); };
+    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_TAKES_ROOT", f.getFullPathName().toRawUTF8()); };
     auto waitUntil = [] (std::function<bool()> done, double limitS)
     {
         const auto s0 = juce::Time::getMillisecondCounterHiRes();
@@ -4765,7 +4805,7 @@ void testUnsavedTakes (const juce::File& tmp)
 
     // 4. A later start that still cannot write: nothing changes.
     {
-        auto p = std::make_unique<HotStepLinkProcessor>(); // HSLINK_STABLE_ROOT is still the file
+        auto p = std::make_unique<HotStepLinkProcessor>(); // HSLINK_TAKES_ROOT is still the file
         const bool passed = waitUntil ([&] { return p->rescuePasses.load() > 0; }, 10.0);
         const auto textNow = marker.loadFileAsString();
         std::printf ("  start with the root still broken: rescue pass done=%d, take=%d (%lld bytes), marker=%d unchanged=%d%c",
@@ -4841,8 +4881,57 @@ void testUnsavedTakes (const juce::File& tmp)
         check (! marker2.existsAsFile(), "the marker is removed once the copy succeeded");
     }
 
+    // 7. Shutdown sweep with a failed lasting copy: the take list alone keeps the temp
+    // WAV (marker guard off, so only the list rule can protect it). Then a run whose copy
+    // is repaired: the take is repointed and the sweep removes the temp folder.
+    if (! teeth)
+    {
+        DawWorker::unsavedGuard = false;
+        juce::File sweepTake;
+        juce::int64 bytesBefore = 0;
+        int unsavedAtClose = -1;
+        {
+            auto p = std::make_unique<HotStepLinkProcessor>();
+            waitUntil ([&] { return p->rescuePasses.load() > 0; }, 10.0);
+            p->setStableRoot (blocker);
+            sweepTake = p->daw.getTakesFolder().getChildFile ("job7_sweep_take0.wav");
+            check (collWriteWav (sweepTake, 1.0), "sweep: temp take written");
+            bytesBefore = sweepTake.getSize();
+            p->registerTakeAndWait (makeJob (7, "sweep", sweepTake), 0);
+            { const auto l = p->getTakes(); unsavedAtClose = (l.size() == 1 && l[0].stable == juce::File()) ? 1 : 0; }
+        } // destructor: last copy pass fails again, then the temp sweep
+        std::printf ("  sweep: unsaved at close %d, temp exists after sweep %d (%lld of %lld bytes)%c",
+                     unsavedAtClose, (int) sweepTake.existsAsFile(), (long long) sweepTake.getSize(), (long long) bytesBefore, 10);
+        check (unsavedAtClose == 1 && bytesBefore > 10000 && sweepTake.existsAsFile() && sweepTake.getSize() == bytesBefore,
+               "sweep: a take whose lasting copy failed keeps its temp WAV after the shutdown sweep");
+        sweepTake.getParentDirectory().deleteRecursively(); // the test's own leftover
+
+        const auto repairRoot = tmp.getChildFile ("r1_sweep_repair");
+        juce::File tempB, stableB;
+        {
+            auto p = std::make_unique<HotStepLinkProcessor>();
+            waitUntil ([&] { return p->rescuePasses.load() > 0; }, 10.0);
+            p->retryBaseMs = 100;
+            p->retryMaxMs = 400;
+            p->setStableRoot (blocker);
+            tempB = p->daw.getTakesFolder().getChildFile ("job8_sweep_take0.wav");
+            collWriteWav (tempB, 1.0);
+            p->registerTakeAndWait (makeJob (8, "sweep repair", tempB), 0);
+            const bool failed = p->getTakes().size() == 1 && p->getTakes()[0].stable == juce::File();
+            p->setStableRoot (repairRoot);
+            waitUntil ([&] { auto l = p->getTakes(); stableB = l.empty() ? juce::File() : l[0].stable; return stableB != juce::File(); }, 10.0);
+            std::printf ("  sweep repair: failed first %d, stable '%s' (%lld bytes, temp %lld)%c", (int) failed,
+                         stableB.getFullPathName().toRawUTF8(), (long long) stableB.getSize(), (long long) tempB.getSize(), 10);
+            check (failed && stableB.existsAsFile() && stableB.isAChildOf (repairRoot) && stableB.getSize() == tempB.getSize(),
+                   "sweep repair: a later successful copy repoints the take to the lasting file");
+        }
+        std::printf ("  sweep repair after close: temp exists %d, lasting exists %d%c", (int) tempB.existsAsFile(), (int) stableB.existsAsFile(), 10);
+        check (! tempB.existsAsFile() && stableB.existsAsFile(), "sweep repair: once saved, the sweep removes the temp copy and the lasting one stays");
+        DawWorker::unsavedGuard = true;
+    }
+
     DawWorker::unsavedGuard = true;
-    _putenv_s ("HSLINK_STABLE_ROOT", savedEnv.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedEnv.toRawUTF8());
 }
 
 // Counts log lines (the saver and worker threads log too).
@@ -4880,12 +4969,12 @@ void testTakeProtection (const juce::File& tmp)
     std::printf ("Take protection: marker fallback, close without copies%s%c",
                  teethMarker ? "  [TEETH: NO_MARKER_FALLBACK]" : teethClose ? "  [TEETH: NO_SHUTDOWN_GUARD]" : "", 10);
     const auto tempRoot = DawWorker::tempRoot();
-    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto blocker = tmp.getChildFile ("t1_blocker.txt"); // a regular file: no folder can be made under it
     blocker.replaceWithText ("not a folder");
     const juce::String markerName (DawWorker::unsavedMarkerName());
     const juce::String wording ("could not be listed for recovery");
-    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_STABLE_ROOT", f.getFullPathName().toRawUTF8()); };
+    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_TAKES_ROOT", f.getFullPathName().toRawUTF8()); };
     auto waitUntil = [] (std::function<bool()> done, double limitS)
     {
         const auto s0 = juce::Time::getMillisecondCounterHiRes();
@@ -5107,7 +5196,7 @@ void testTakeProtection (const juce::File& tmp)
             d.deleteRecursively();
     HotStepLinkProcessor::testCopyDelayMs = 0;
     HotStepLinkProcessor::shutdownGuard = true;
-    _putenv_s ("HSLINK_STABLE_ROOT", savedEnv.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedEnv.toRawUTF8());
 }
 
 // R5: two writers never replace each other's lasting take. Everything is inside the
@@ -5317,9 +5406,9 @@ void testExclusiveTakes (const juce::File& tmp)
     // 5. Rescue of the same marked folder twice, and from two instances at once.
     {
         const int S = 30000;
-        const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+        const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
         const auto root = base.getChildFile ("rescue_stable");
-        _putenv_s ("HSLINK_STABLE_ROOT", root.getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", root.getFullPathName().toRawUTF8());
         const auto tempRoot = DawWorker::tempRoot();
         const juce::String name ("r5_rescued_auto_t1_0bpm.wav");
         const auto tab = juce::String::charToString ((juce::juce_wchar) 9);
@@ -5402,7 +5491,7 @@ void testExclusiveTakes (const juce::File& tmp)
         check (dirB.getChildFile ("job9_r5_take0.wav").getSize() == S, "the temp original is still there");
         p1.reset();
         p2.reset();
-        _putenv_s ("HSLINK_STABLE_ROOT", savedEnv.toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", savedEnv.toRawUTF8());
     }
 
     ExclusiveFile::testLegacyOverwrite = false;
@@ -5450,11 +5539,11 @@ void testCopyAbort (const juce::File& tmp)
     std::printf ("Copy abort: a close waits for one file call, not for the attempt%s%c", teeth ? "  [TEETH: NO_COPY_ABORT]" : "", 10);
     using ExclusiveFile::CopyResult;
     const auto tempRoot = DawWorker::tempRoot();
-    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto blocker = tmp.getChildFile ("v1_blocker.txt"); // a regular file: no folder can be made under it
     blocker.replaceWithText ("not a folder");
     const juce::String markerName (DawWorker::unsavedMarkerName());
-    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_STABLE_ROOT", f.getFullPathName().toRawUTF8()); };
+    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_TAKES_ROOT", f.getFullPathName().toRawUTF8()); };
     auto nowMs = [] { return juce::Time::getMillisecondCounterHiRes(); };
     auto waitUntil = [&nowMs] (std::function<bool()> done, double limitS)
     {
@@ -5658,7 +5747,7 @@ void testCopyAbort (const juce::File& tmp)
     ExclusiveFile::testStepHook = nullptr;
     ExclusiveFile::testIgnoreAbort = false;
     v1hook::reset();
-    _putenv_s ("HSLINK_STABLE_ROOT", savedEnv.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedEnv.toRawUTF8());
 }
 
 // Take identity and the record-before-copy order (design round R1; W3, W4, N1, N2).
@@ -5798,7 +5887,7 @@ void testTakeIdentity (const juce::File& tmp)
     std::printf ("Take identity and record-before-copy (R1)%s%c",
                  teethId ? "  [TEETH: NO_TAKE_ID]" : teethRec ? "  [TEETH: NO_EARLY_RECORD]" : "", 10);
     const auto tempRoot = DawWorker::tempRoot();
-    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto blocker = tmp.getChildFile ("r1b_blocker.txt"); // a regular file: no folder can be made under it
     blocker.replaceWithText ("not a folder");
     const juce::String markerName (DawWorker::unsavedMarkerName());
@@ -5806,7 +5895,7 @@ void testTakeIdentity (const juce::File& tmp)
     const auto tab = juce::String::charToString ((juce::juce_wchar) 9);
     const juce::int64 kTakeBytes = 96044; // 1 s, 48 kHz, 16 bit, mono
     const juce::int64 dayMs = (juce::int64) 24 * 3600 * 1000;
-    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_STABLE_ROOT", f.getFullPathName().toRawUTF8()); };
+    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_TAKES_ROOT", f.getFullPathName().toRawUTF8()); };
     auto waitUntil = [] (std::function<bool()> done, double limitS)
     {
         const auto s0 = juce::Time::getMillisecondCounterHiRes();
@@ -6255,7 +6344,7 @@ void testTakeIdentity (const juce::File& tmp)
     HotStepLinkProcessor::testStopAfterRecord = false;
     HotStepLinkProcessor::recordBeforeCopy = true;
     DawWorker::takeIdInName = true;
-    _putenv_s ("HSLINK_STABLE_ROOT", savedEnv.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedEnv.toRawUTF8());
 }
 
 // Y1: a rename that fails after a complete download never costs the take. Y2: a capture
@@ -6276,7 +6365,7 @@ void testTakeFinalise (const juce::File& tmp)
     std::printf ("Rename retry and capture name form (Y1, Y2)%s%c",
                  teethKeep ? "  [TEETH: NO_RENAME_KEEP]" : teethForm ? "  [TEETH: NO_CAPTURE_FORM]" : "", 10);
     const auto tempRoot = DawWorker::tempRoot();
-    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedEnv = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto blocker = tmp.getChildFile ("y12_blocker.txt"); // a regular file: no folder can be made under it
     blocker.replaceWithText ("not a folder");
     const juce::String markerName (DawWorker::unsavedMarkerName());
@@ -6285,7 +6374,7 @@ void testTakeFinalise (const juce::File& tmp)
     const juce::int64 kTakeBytes = 96044; // 1 s, 48 kHz, 16 bit, mono
     const juce::int64 dayMs = (juce::int64) 24 * 3600 * 1000;
     const int kAll = 1000000; // "every rename fails"
-    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_STABLE_ROOT", f.getFullPathName().toRawUTF8()); };
+    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_TAKES_ROOT", f.getFullPathName().toRawUTF8()); };
     auto waitUntil = [] (std::function<bool()> done, double limitS)
     {
         const auto s0 = juce::Time::getMillisecondCounterHiRes();
@@ -6679,12 +6768,12 @@ void testTakeFinalise (const juce::File& tmp)
     DawWorker::testFailPublish = 0;
     DawWorker::keepUnpublished = true;
     DawWorker::captureByForm = true;
-    _putenv_s ("HSLINK_STABLE_ROOT", savedEnv.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedEnv.toRawUTF8());
 }
 
 // Round 2 of the take store: the session lock (L), protect by default and saved.log (P),
 // takes whose bytes are still in a .part file (G). Everything stays inside the injected
-// roots: each group gets its own HSLINK_TEMP_ROOT and HSLINK_STABLE_ROOT under tmp, so
+// roots: each group gets its own HSLINK_TEMP_ROOT and HSLINK_TAKES_ROOT under tmp, so
 // the counts of removed folders are exact. Runtime teeth, read here only:
 // HSLINK_TEETH=NO_SESSION_LOCK clears ExclusiveFile::sessionLockEnabled,
 // HSLINK_TEETH=NO_DEFAULT_PROTECT clears DawWorker::protectByDefault,
@@ -6800,7 +6889,7 @@ void testSessionLockAndParts (const juce::File& tmp)
     std::printf ("Session lock, saved.log and .part rescue (round 2: L, P, G)%s%c",
                  teethLock ? "  [TEETH: NO_SESSION_LOCK]" : teethProt ? "  [TEETH: NO_DEFAULT_PROTECT]"
                  : teethPart ? "  [TEETH: NO_PART_RESCUE]" : teethRec2 ? "  [TEETH: NO_EARLY_RECORD2]" : "", 10);
-    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto savedTemp = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEMP_ROOT", {});
     const auto blocker = tmp.getChildFile ("r2_blocker.txt"); // a regular file: no folder can be made under it
     blocker.replaceWithText ("not a folder");
@@ -6811,14 +6900,14 @@ void testSessionLockAndParts (const juce::File& tmp)
     const auto tab = juce::String::charToString ((juce::juce_wchar) 9);
     const juce::int64 dayMs = (juce::int64) 24 * 3600 * 1000;
     const int kAll = 1000000;
-    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_STABLE_ROOT", f.getFullPathName().toRawUTF8()); };
+    auto setEnvRoot = [] (const juce::File& f) { _putenv_s ("HSLINK_TAKES_ROOT", f.getFullPathName().toRawUTF8()); };
     // A fresh temp root and a fresh lasting root for one group. Returns the lasting root.
     auto useRoots = [&] (const juce::String& tag)
     {
         _putenv_s ("HSLINK_TEMP_ROOT", tmp.getChildFile ("r2_" + tag + "_temp").getFullPathName().toRawUTF8());
         DawWorker::tempRoot().createDirectory();
         const auto good = tmp.getChildFile ("r2_" + tag + "_stable");
-        _putenv_s ("HSLINK_STABLE_ROOT", good.getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", good.getFullPathName().toRawUTF8());
         return good;
     };
     auto waitUntil = [] (std::function<bool()> done, double limitS)
@@ -7757,13 +7846,13 @@ void testSessionLockAndParts (const juce::File& tmp)
     DawWorker::protectByDefault = ! teethProt;      // the two run-wide switches stay as r2ApplyGlobalTeeth set them
     DawWorker::partRescueEnabled = ! teethPart;
     _putenv_s ("HSLINK_TEMP_ROOT", savedTemp.toRawUTF8());
-    _putenv_s ("HSLINK_STABLE_ROOT", savedStable.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedStable.toRawUTF8());
 }
 
 // Round 3 of the take store (review items B1 and B2). B1: a folder without owner.lock
 // is a folder of an older build or of a lockless instance, never a proven dead session.
 // B2: a zero-byte file is not a take and never blocks the takes after it. Everything
-// stays inside the injected roots (HSLINK_TEMP_ROOT, HSLINK_STABLE_ROOT, one pair per
+// stays inside the injected roots (HSLINK_TEMP_ROOT, HSLINK_TAKES_ROOT, one pair per
 // group). Runtime teeth, read here only (r2ApplyGlobalTeeth sets them for the whole run):
 // HSLINK_TEETH=NO_LEGACY_GUARD sets ExclusiveFile::testNoLegacyGuard (the rescue and the
 // cleanup create owner.lock anywhere, a folder without one counts as dead, no lockless
@@ -7778,7 +7867,7 @@ void testLegacyAndZeroByte (const juce::File& tmp)
     const bool teethZero = teethVar == "NO_ZERO_SKIP";
     std::printf ("Legacy folders, lockless instances and zero-byte files (round 3: B1, B2)%s%c",
                  teethLegacy ? "  [TEETH: NO_LEGACY_GUARD]" : teethZero ? "  [TEETH: NO_ZERO_SKIP]" : "", 10);
-    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto savedTemp = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEMP_ROOT", {});
     const auto blocker = tmp.getChildFile ("b12_blocker.txt"); // a regular file: no folder can be made under it
     blocker.replaceWithText ("not a folder");
@@ -7793,7 +7882,7 @@ void testLegacyAndZeroByte (const juce::File& tmp)
         _putenv_s ("HSLINK_TEMP_ROOT", tmp.getChildFile ("b12_" + tag + "_temp").getFullPathName().toRawUTF8());
         DawWorker::tempRoot().createDirectory();
         const auto good = tmp.getChildFile ("b12_" + tag + "_stable");
-        _putenv_s ("HSLINK_STABLE_ROOT", good.getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", good.getFullPathName().toRawUTF8());
         return good;
     };
     auto waitUntil = [] (std::function<bool()> done, double limitS)
@@ -8115,7 +8204,7 @@ void testLegacyAndZeroByte (const juce::File& tmp)
     DawWorker::testEmptyDownloads = 0;
     ExclusiveFile::testSessionLockFails = false;
     _putenv_s ("HSLINK_TEMP_ROOT", savedTemp.toRawUTF8());
-    _putenv_s ("HSLINK_STABLE_ROOT", savedStable.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedStable.toRawUTF8());
 }
 
 // Take store plan test 4 (round 4, adoption). A dead folder (owner.lock nobody holds)
@@ -8130,14 +8219,14 @@ void testAdoptPastEmpty (const juce::File& tmp)
     const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
     const bool teeth = teethVar == "ADOPT_STOPS_ON_EMPTY";
     std::printf ("Take store test 4: adoption past an empty take%s%c", teeth ? "  [TEETH: ADOPT_STOPS_ON_EMPTY]" : "", 10);
-    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto savedTemp = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEMP_ROOT", {});
     const auto nl = juce::String::charToString ((juce::juce_wchar) 10);
     const auto tab = juce::String::charToString ((juce::juce_wchar) 9);
     _putenv_s ("HSLINK_TEMP_ROOT", tmp.getChildFile ("t4_temp").getFullPathName().toRawUTF8());
     DawWorker::tempRoot().createDirectory();
     const auto good = tmp.getChildFile ("t4_stable");
-    _putenv_s ("HSLINK_STABLE_ROOT", good.getFullPathName().toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", good.getFullPathName().toRawUTF8());
     auto copies = [] (const juce::File& root, juce::int64 bytes, int fill)
     {
         int n = 0;
@@ -8188,7 +8277,7 @@ void testAdoptPastEmpty (const juce::File& tmp)
     check (dupes == 0 && second == 0, "T4: a second pass makes 0 duplicates");
     check (deadRemoved, "T4: the dead folder is removed (1) once its take is saved (no switch: under the teeth the folder goes with its take unsaved)");
     _putenv_s ("HSLINK_TEMP_ROOT", savedTemp.toRawUTF8());
-    _putenv_s ("HSLINK_STABLE_ROOT", savedStable.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedStable.toRawUTF8());
 }
 
 // W1. An adopted folder whose scan stopped early (zeroByteSkip off: it stops at the empty
@@ -8199,7 +8288,7 @@ void testAdoptKeepWhole (const juce::File& tmp)
 {
     const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_KEEP_GUARD";
     std::printf ("Take store W1: adopted folders that may hold unlisted takes are kept%s%c", teeth ? "  [TEETH: NO_KEEP_GUARD]" : "", 10);
-    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto savedTemp = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEMP_ROOT", {});
     const auto nl = juce::String::charToString ((juce::juce_wchar) 10);
     const auto tab = juce::String::charToString ((juce::juce_wchar) 9);
@@ -8210,7 +8299,7 @@ void testAdoptKeepWhole (const juce::File& tmp)
         _putenv_s ("HSLINK_TEMP_ROOT", tmp.getChildFile (run == 0 ? "w1a_temp" : "w1b_temp").getFullPathName().toRawUTF8());
         DawWorker::tempRoot().createDirectory();
         const auto good = tmp.getChildFile (run == 0 ? "w1a_stable" : "w1b_stable");
-        _putenv_s ("HSLINK_STABLE_ROOT", good.getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", good.getFullPathName().toRawUTF8());
         const auto dead = DawWorker::tempRoot().getChildFile ("session_w1dead_" + ExclusiveFile::uniqueToken (6));
         dead.createDirectory();
         const auto unlisted = dead.getChildFile ("b_unlisted.wav");
@@ -8244,12 +8333,12 @@ void testAdoptKeepWhole (const juce::File& tmp)
                (juce::String ("W1 (") + what + "): the unlisted take and its folder are both kept (teeth: NO_KEEP_GUARD)").toRawUTF8());
     }
     _putenv_s ("HSLINK_TEMP_ROOT", savedTemp.toRawUTF8());
-    _putenv_s ("HSLINK_STABLE_ROOT", savedStable.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedStable.toRawUTF8());
 }
 
 // Round 3 of the take store, second half: the saver thread makes every lasting copy (S),
 // the close decides keep-or-delete from memory (D), riders and review items (C).
-// Everything stays inside the injected roots (one HSLINK_TEMP_ROOT and HSLINK_STABLE_ROOT
+// Everything stays inside the injected roots (one HSLINK_TEMP_ROOT and HSLINK_TAKES_ROOT
 // pair per group). A share that does not answer is the ExclusiveFile step hook (gate or
 // delay). Runtime teeth, read here only, each applied to the groups named:
 // HSLINK_TEETH=WORKER_COPIES sets HotStepLinkProcessor::testWorkerCopies (S1, S3, S4, S5);
@@ -8328,7 +8417,7 @@ void testSaverOwnsCopies (const juce::File& tmp)
                  teethWorker ? "  [TEETH: WORKER_COPIES]" : teethProbes ? "  [TEETH: DTOR_PROBES]" : teethSignal ? "  [TEETH: LATE_WORKER_SIGNAL]"
                  : teethMarker ? "  [TEETH: NO_LEGACY_MARKER_KEEP]" : teethWake ? "  [TEETH: NO_SAVER_WAKE]" : teethAbort ? "  [TEETH: NO_COPY_ABORT in D3]"
                  : teethHand ? "  [TEETH: NO_HANDOVER_GUARD]" : "", 10);
-    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto savedTemp = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEMP_ROOT", {});
     const auto blocker = tmp.getChildFile ("r3s_blocker.txt"); // a regular file: no folder can be made under it
     blocker.replaceWithText ("not a folder");
@@ -8344,7 +8433,7 @@ void testSaverOwnsCopies (const juce::File& tmp)
         _putenv_s ("HSLINK_TEMP_ROOT", tmp.getChildFile ("r3s_" + tag + "_temp").getFullPathName().toRawUTF8());
         DawWorker::tempRoot().createDirectory();
         const auto good = tmp.getChildFile ("r3s_" + tag + "_stable");
-        _putenv_s ("HSLINK_STABLE_ROOT", good.getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", good.getFullPathName().toRawUTF8());
         return good;
     };
     auto waitUntil = [&nowMs] (std::function<bool()> done, double limitS)
@@ -9171,7 +9260,7 @@ void testSaverOwnsCopies (const juce::File& tmp)
     ExclusiveFile::testSessionLockFails = false;
     r3hook::reset();
     _putenv_s ("HSLINK_TEMP_ROOT", savedTemp.toRawUTF8());
-    _putenv_s ("HSLINK_STABLE_ROOT", savedStable.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedStable.toRawUTF8());
 }
 
 // Round 5 of the take store: the cancellable byte copy and the close (K).
@@ -9179,7 +9268,7 @@ void testSaverOwnsCopies (const juce::File& tmp)
 // saver is blocked in a synchronous OS read (IoCanceller); K5 the stale cleanup stops at
 // close; K6 one cleanup call (X1); K7, K8 ensureFolder retries (X3); K9 an existing .part
 // name is never deleted (X5); K10 the folder race. Everything stays inside the test's own
-// folder and one injected HSLINK_TEMP_ROOT and HSLINK_STABLE_ROOT pair per group.
+// folder and one injected HSLINK_TEMP_ROOT and HSLINK_TAKES_ROOT pair per group.
 // Runtime teeth, read here only:
 // HSLINK_TEETH=NO_COPY_CANCEL clears ExclusiveFile::copyCancelEnabled in K1 and K3 (in K3
 // ioCancelEnabled too: the code before this round had neither, and a 995 from the close
@@ -9277,7 +9366,7 @@ void testCancellableCopy (const juce::File& tmp)
                  (teethCopy || teethIo || teethStop || teethClean || teethRetry || teethDelete) ? "  [TEETH: " : "",
                  teethCopy ? "NO_COPY_CANCEL]" : teethIo ? "NO_IO_CANCEL]" : teethStop ? "NO_CLEANUP_STOP]" : teethClean ? "LEGACY_PART_CLEANUP]"
                  : teethRetry ? "LEGACY_FOLDER_RETRY]" : teethDelete ? "LEGACY_PART_DELETE]" : "", 10);
-    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto savedTemp = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEMP_ROOT", {});
     const juce::String markerName (DawWorker::unsavedMarkerName());
     const juce::String logName (DawWorker::savedLogName());
@@ -9301,7 +9390,7 @@ void testCancellableCopy (const juce::File& tmp)
         _putenv_s ("HSLINK_TEMP_ROOT", tmp.getChildFile ("r5k_" + tag + "_temp").getFullPathName().toRawUTF8());
         DawWorker::tempRoot().createDirectory();
         const auto good = tmp.getChildFile ("r5k_" + tag + "_stable");
-        _putenv_s ("HSLINK_STABLE_ROOT", good.getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", good.getFullPathName().toRawUTF8());
         return good;
     };
     auto copies = [] (const juce::File& root, juce::int64 bytes, int fill)
@@ -9716,7 +9805,96 @@ void testCancellableCopy (const juce::File& tmp)
     r5hook::reset();
     unit.deleteRecursively(); // made by this test
     _putenv_s ("HSLINK_TEMP_ROOT", savedTemp.toRawUTF8());
-    _putenv_s ("HSLINK_STABLE_ROOT", savedStable.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedStable.toRawUTF8());
+}
+
+// Card 65840a44 r2: per-backend ignored-settings table, notes and editor greying.
+static juce::Slider* ignFindSliderFor (juce::Component& root, juce::RangedAudioParameter* prm)
+{
+    const auto r = prm->getNormalisableRange();
+    for (auto* c : root.getChildren())
+    {
+        if (auto* s = dynamic_cast<juce::Slider*> (c);
+            s != nullptr && s->getMinimum() == (double) r.start && s->getMaximum() == (double) r.end
+            && std::abs (s->getValue() - (double) r.convertFrom0to1 (prm->getValue())) < 1.0e-3)
+            return s;
+        if (auto* d = ignFindSliderFor (*c, prm))
+            return d;
+    }
+    return nullptr;
+}
+
+static void testIgnoredSettings()
+{
+    using R = DawJobRequest;
+    std::printf ("ignored settings (card 65840a44)%c", 10);
+    const char* ids[] = { "minimax-m3", "sa3", "yue2", "ace", "heartmula", "" };
+    for (auto* id : ids)
+    {
+        const auto m = R::ignoredFieldsForBackend (id);
+        std::printf ("  mask('%s') = 0x%x%c", id, (unsigned) m, 10);
+        const bool want = juce::String (id) == "minimax-m3" ? (m == (juce::uint32) R::ignDuration) : (m == 0);
+        check (want, (juce::String ("ignoredFieldsForBackend '") + id + "' is "
+                      + (juce::String (id) == "minimax-m3" ? "Duration only" : "0")).toRawUTF8());
+    }
+    const auto n1 = R::ignoredFieldsNote (R::ignDuration, "minimax-m3");
+    const auto n0 = R::ignoredFieldsNote (0, "minimax-m3");
+    std::printf ("  note(Duration) = '%s'  note(0) = '%s'%c", n1.toRawUTF8(), n0.toRawUTF8(), 10);
+    check (n1.contains ("Duration"), "ignoredFieldsNote Duration mask names Duration");
+    check (n0.isEmpty(), "ignoredFieldsNote mask 0 is empty");
+
+    R rq; rq.durationS = 15.0; rq.bpm = 120.0;
+    const auto im = R::ignoredNote (rq, "minimax-m3");
+    const auto is = R::ignoredNote (rq, "sa3");
+    std::printf ("  ignoredNote dur=15 minimax='%s' sa3='%s'%c", im.toRawUTF8(), is.toRawUTF8(), 10);
+    check (im.contains ("Duration") && ! im.contains ("BPM"), "ignoredNote minimax-m3 with Duration set lists Duration only");
+    check (is.isEmpty(), "ignoredNote sa3 with Duration set is empty");
+    R rq0; rq0.durationS = 0.0;
+    const auto ia = R::ignoredNote (rq0, "minimax-m3");
+    std::printf ("  ignoredNote dur=Auto minimax='%s'%c", ia.toRawUTF8(), 10);
+    check (ia.isEmpty(), "ignoredNote minimax-m3 with Duration Auto is empty");
+
+    struct Dm { double a, g; bool flag; const char* why; };
+    const Dm cases[] = {
+        { 15, 20.1, true,  "34 pct, 5.1 s" }, { 15, 15.0, false, "exact" },
+        { 15, 16.4, false, "9.3 pct, under 10 pct" }, { 60, 65, false, "8.3 pct" },
+        { 10, 11.5, false, "15 pct but 1.5 s, under the 2 s rule" }, { 0, 20, false, "asked 0" } };
+    for (const auto& c : cases)
+    {
+        const auto s = R::durationMismatchNote ("MiniMax-M3", c.a, c.g);
+        std::printf ("  mismatch(%g, %g) = '%s' (%s)%c", c.a, c.g, s.toRawUTF8(), c.why, 10);
+        bool ok = c.flag ? (s.isNotEmpty() && s.contains ("20.1") && s.contains ("15")) : s.isEmpty();
+        check (ok, (juce::String ("durationMismatchNote ") + juce::String (c.a) + " vs " + juce::String (c.g)
+                    + (c.flag ? " flags with both numbers" : " is empty") + " (" + c.why + ")").toRawUTF8());
+    }
+
+    // Editor greying, headless: editor built with the backend param set, sliders found by
+    // the APVTS range they are attached to.
+    auto editorCase = [] (const juce::String& id)
+    {
+        HotStepLinkProcessor p;
+        int idx = -1;
+        for (int i = 0; i < 64; ++i)
+            if (HotStepLinkProcessor::backendIdForIndex (i) == id) { idx = i; break; }
+        auto* bp = p.apvts.getParameter ("backend");
+        check (idx >= 0 && bp != nullptr, ("editor: backend index for " + id + " found").toRawUTF8());
+        if (idx < 0 || bp == nullptr) return;
+        bp->setValueNotifyingHost (bp->convertTo0to1 ((float) idx));
+        std::printf ("  editor %s: index %d, selected '%s'%c", id.toRawUTF8(), idx, p.getSelectedBackendId().toRawUTF8(), 10);
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        const char* params[] = { "duration", "guidance", "steps", "variation" };
+        for (auto* pid : params)
+        {
+            auto* s = ignFindSliderFor (*ed, p.apvts.getParameter (pid));
+            const int en = s != nullptr ? (s->isEnabled() ? 1 : 0) : -1;
+            std::printf ("    %s slider found=%d enabled=%d%c", pid, s != nullptr ? 1 : 0, en, 10);
+            const bool wantOff = id == "minimax-m3" && juce::String (pid) == "duration";
+            check (s != nullptr && en == (wantOff ? 0 : 1),
+                   (juce::String ("editor ") + id + " " + pid + (wantOff ? " disabled" : " enabled")).toRawUTF8());
+        }
+    };
+    editorCase ("minimax-m3");
+    editorCase ("sa3");
 }
 
 // Round 6 of the take store: the editor's refresh and paint make no file-system call (N),
@@ -9729,6 +9907,9 @@ void testCancellableCopy (const juce::File& tmp)
 // Round 7 (G): HSLINK_TEETH=THUMB_FROM_LASTING sets TakeGrid::testThumbFromLasting (G1, G2, G3: a cell's
 // waveform is read from the lasting copy again); HSLINK_TEETH=NO_TEMP_FALLBACK sets
 // TakeGrid::testNoTempFallback (N8: a click and Export use the lasting path only).
+// HSLINK_TEETH=THUMB_NO_SPACING sets TakeCell::testThumbNoSpacing (G10b, G10d: the retries of a
+// cell's waveform read are not spaced); HSLINK_TEETH=SELECT_IN_HANDOVER sets
+// HotStepLinkEditor::testSelectInHandOver (G11: a take still being handed over is selected at once).
 // A check labelled [informational] cannot fail under either: a regression guard, not PASS evidence.
 namespace r6hook
 {
@@ -9751,7 +9932,7 @@ void testEditorNoPolling (const juce::File& tmp)
     std::printf ("The editor refresh makes no file call; cells keyed by name; rescue checks closing first (round 6: N; round 7: G)%s%c",
                  teethStats ? "  [TEETH: EDITOR_STATS]" : teethProbe ? "  [TEETH: RESCUE_PROBE_BEFORE_CLOSING]"
                  : teethThumb ? "  [TEETH: THUMB_FROM_LASTING]" : teethNoFallback ? "  [TEETH: NO_TEMP_FALLBACK]" : "", 10);
-    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+    const auto savedStable = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
     const auto savedTemp = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEMP_ROOT", {});
     const juce::String markerName (DawWorker::unsavedMarkerName());
     const auto nl = juce::String::charToString ((juce::juce_wchar) 10);
@@ -9775,7 +9956,7 @@ void testEditorNoPolling (const juce::File& tmp)
         _putenv_s ("HSLINK_TEMP_ROOT", tmp.getChildFile ("r6n_" + tag + "_temp").getFullPathName().toRawUTF8());
         DawWorker::tempRoot().createDirectory();
         const auto good = tmp.getChildFile ("r6n_" + tag + "_stable");
-        _putenv_s ("HSLINK_STABLE_ROOT", good.getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", good.getFullPathName().toRawUTF8());
         return good;
     };
     auto started = [&waitUntil] (HotStepLinkProcessor& p) { return waitUntil ([&p] { return p.rescuePasses.load() > 0; }, 20.0); };
@@ -10272,7 +10453,7 @@ void testEditorNoPolling (const juce::File& tmp)
         const auto good = useRoots ("keep");
         const auto blocker = unit.getChildFile ("n6_blocker.txt"); // a regular file: no folder can be made under it
         blocker.replaceWithText ("not a folder");
-        _putenv_s ("HSLINK_STABLE_ROOT", blocker.getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_TAKES_ROOT", blocker.getFullPathName().toRawUTF8());
         auto p = std::make_unique<HotStepLinkProcessor>();
         const bool up = started (*p);
         const auto a = mkTake (*p, 650, "r6 kept cell", 96000, 0x7a);
@@ -10422,6 +10603,290 @@ void testEditorNoPolling (const juce::File& tmp)
         TakeGrid::testNoThumbFallback = false;
     }
 
+    // G10. A cell made between "listed" and "published": registerTake lists the take
+    // with its final temp path while the bytes are still in <name>.wav.part, so the
+    // cell's thumbnail is given a file that is not there yet. After the rename the path
+    // is the same; the cell has to read it again or it stays on "loading...".
+    // Counter: EditorFs::tagCell = thumbnail source sets (1 per cell made, 1 per retry).
+    {
+        const auto g10Dir = unit.getChildFile ("g10");
+        g10Dir.createDirectory();
+        juce::AudioFormatManager fm;
+        fm.registerBasicFormats();
+        juce::AudioThumbnailCache cache (8);
+        const int dataBytes = 96000; // r1bWriteWav: mono, 16 bit, 48000 Hz
+        const double wantSec = (double) (dataBytes / 2) / 48000.0; // 1.000 s
+        auto mkCell = [&] (const juce::String& name)
+        {
+            TakeGrid::Cell c;
+            c.key = name;
+            c.temp = c.file = g10Dir.getChildFile (name);
+            return c;
+        };
+        // a. Listed, not published.
+        {
+            const auto c = mkCell ("g10_race.wav");
+            const auto part = g10Dir.getChildFile ("g10_race.wav.part");
+            const bool wrote = r1bWriteWav (part, dataBytes, 0x31);
+            const auto c0 = snap();
+            const auto src0 = TakeGrid::thumbSourceOf (c);
+            TakeCell cell (c.key, "g10_race", src0, 0, fm, cache);
+            const bool sameFile = cell.thumbFile == c.temp, absent = ! c.temp.existsAsFile();
+            const double len0 = cell.thumbLengthForTest();
+            for (int i = 0; i < 10; ++i)
+                cell.repointThumbIfGone (TakeGrid::thumbSourceOf (c)); // refreshes inside the window
+            const int setsWaiting = diff (c0, snap()).v[EditorFs::tagCell];
+            const bool published = part.moveFileTo (c.temp); // the publish
+            cell.repointThumbIfGone (TakeGrid::thumbSourceOf (c));
+            const double len1 = cell.thumbLengthForTest();
+            for (int i = 0; i < 10; ++i)
+                cell.repointThumbIfGone (TakeGrid::thumbSourceOf (c));
+            const int setsEnd = diff (c0, snap()).v[EditorFs::tagCell];
+            std::printf ("  G10a wrote .part=%d, cell file is the temp path=%d, temp absent when the cell was made=%d (want 1 1 1); thumbnail length before publish %.4f s (want 0.0000); source sets after 10 refreshes in the window: %d (want 1, the cell's own); published=%d; length after publish and 1 refresh %.4f s (want %.4f, within 0.0010); source sets after 10 more refreshes: %d (want 2)%c",
+                         (int) wrote, (int) sameFile, (int) absent, len0, setsWaiting, (int) published, len1, wantSec, setsEnd, 10);
+            check (wrote && sameFile && absent && len0 == 0.0 && setsWaiting == 1,
+                   "G10a [informational]: a cell made before the publish has the temp path, no file, length 0, and the refreshes in the window open nothing (1 source set)");
+            check (published && std::abs (len1 - wantSec) <= 0.001,
+                   "G10a: one refresh after the publish the thumbnail has the file's length (1.0000 s within 0.0010; unfixed: 0.0000)");
+            check (setsEnd == 2, "G10a: the published file was read once more and never again (2 source sets after 10 more refreshes; unfixed: 1)");
+        }
+        // b. A file that never reads (0 bytes, then junk bytes): retried kThumbRetries (9)
+        // times, no more, and the retries are at least TakeCell::kThumbRetryGapMs (1000 ms)
+        // apart. The clock is the test's (TakeCell::testThumbClock).
+        // Teeth: HSLINK_TEETH=THUMB_NO_SPACING, and THUMB_CAP_3 (the cap of 3 as it was).
+        juce::uint32 fakeMs = 500000;
+        TakeCell::testThumbClock = [&fakeMs] { return fakeMs; };
+        TakeCell::testThumbNoSpacing = teethVar == "THUMB_NO_SPACING";
+        TakeCell::testThumbRetryCap = teethVar == "THUMB_CAP_3" ? 3 : 0;
+        const int thumbCap = TakeCell::testThumbRetryCap > 0 ? TakeCell::testThumbRetryCap : TakeCell::kThumbRetries;
+        const juce::uint32 lastRetryMs = (juce::uint32) ((TakeCell::kThumbRetries - 1) * TakeCell::kThumbRetryGapMs); // 8000
+        for (int k = 0; k < 2; ++k)
+        {
+            const auto c = mkCell (k == 0 ? "g10_empty.wav" : "g10_junk.wav");
+            if (k == 0)
+                c.temp.create();
+            else
+                c.temp.replaceWithText ("this is not a wave file at all, only text bytes 0123456789");
+            const auto c0 = snap();
+            const juce::uint32 t0 = fakeMs;
+            TakeCell cell (c.key, "g10_bad", TakeGrid::thumbSourceOf (c), 0, fm, cache);
+            auto setsNow = [&] { return diff (c0, snap()).v[EditorFs::tagCell]; };
+            auto refresh30 = [&] { for (int i = 0; i < 30; ++i) cell.repointThumbIfGone (TakeGrid::thumbSourceOf (c)); };
+            // 30 refreshes inside one second (33 ms apart, the last at t0 + 957 ms).
+            int sets[3] = { 0, 0, 0 };
+            const int ex0 = TakeCell::testThumbExistsCalls.load();
+            for (int i = 0; i < 30; ++i)
+            {
+                fakeMs = t0 + (juce::uint32) (i * 33);
+                cell.repointThumbIfGone (TakeGrid::thumbSourceOf (c));
+                if (i == 0 || i == 2 || i == 29)
+                    sets[i == 0 ? 0 : i == 2 ? 1 : 2] = setsNow();
+            }
+            const int exFirstSecond = TakeCell::testThumbExistsCalls.load() - ex0;
+            fakeMs = t0 + 999;
+            refresh30();
+            const int setsAt999 = setsNow();
+            fakeMs = t0 + 1000;
+            refresh30();
+            const int setsAt1000 = setsNow();
+            fakeMs = t0 + 2000;
+            refresh30();
+            const int setsAt2000 = setsNow();
+            for (juce::uint32 ms = 3000; ms < lastRetryMs; ms += 1000)
+            {
+                fakeMs = t0 + ms;
+                refresh30();
+            }
+            const int setsBeforeLast = setsNow();
+            fakeMs = t0 + lastRetryMs;
+            refresh30();
+            const int setsAtLast = setsNow();
+            const int ex1 = TakeCell::testThumbExistsCalls.load();
+            fakeMs = t0 + lastRetryMs + 1000;
+            refresh30();
+            fakeMs = t0 + 63000;
+            refresh30();
+            const int setsCapped = setsNow(), exCapped = TakeCell::testThumbExistsCalls.load() - ex1;
+            const double len = cell.thumbLengthForTest();
+            const int wantSets = 1 + TakeCell::kThumbRetries; // 10
+            std::printf ("  G10b %s file (%d bytes): source sets after 1, 3 and 30 refreshes inside one second: %d %d %d (want 2 2 2: the cell's own + 1 retry; unfixed 2 4 4), file checks in that second %d (want 1); at +999 ms %d (want 2), at +1000 ms %d (want 3), at +2000 ms %d (want 4); retry cap in use %d (want %d): at +%d ms %d (want %d), at +%d ms %d (want %d); after 60 more refreshes at +%d and +63000 ms %d (want %d), file checks by those 60 refreshes of the capped cell %d (want 0); length %.4f s (want 0.0000)%c",
+                         k == 0 ? "empty" : "junk", (int) c.temp.getSize(), sets[0], sets[1], sets[2], exFirstSecond, setsAt999, setsAt1000, setsAt2000,
+                         thumbCap, TakeCell::kThumbRetries, (int) lastRetryMs - 1000, setsBeforeLast, wantSets - 1, (int) lastRetryMs, setsAtLast, wantSets,
+                         (int) lastRetryMs + 1000, setsCapped, wantSets, exCapped, len, 10);
+            check (sets[0] == 2 && sets[1] == 2 && sets[2] == 2 && exFirstSecond == 1 && setsAt999 == 2,
+                   k == 0 ? "G10b: an empty file is read again once by 30 refreshes inside one second, with 1 file check (source sets 2 2 2, and 2 at +999 ms; teeth: THUMB_NO_SPACING gives 2 4 4)"
+                          : "G10b: a file that is not audio is read again once by 30 refreshes inside one second, with 1 file check (source sets 2 2 2, and 2 at +999 ms; teeth: THUMB_NO_SPACING gives 2 4 4)");
+            check (setsAt1000 == 3 && setsAt2000 == 4 && len == 0.0,
+                   "G10b: the 2nd and 3rd retry come 1000 ms apart (source sets 3 at +1000 ms, 4 at +2000 ms; teeth: THUMB_NO_SPACING gives 4 4)");
+            check (setsBeforeLast == wantSets - 1 && setsAtLast == wantSets && setsCapped == wantSets,
+                   "G10b: the 9th retry comes 8000 ms after the first and there is no 10th (source sets 9 at +7000 ms, 10 at +8000 ms, 10 after 60 more refreshes up to +63000 ms; teeth: THUMB_CAP_3 gives 4 4 4)");
+            check (exCapped == 0, "G10b [informational]: a cell that used its 9 retries makes 0 file checks in 60 refreshes");
+        }
+        // d, e. A file that is there but does not read at first (held by another program,
+        // here: empty) and reads later. Refreshes every 100 ms of the test clock, 10 s long.
+        // e is the cover the cap of 9 buys: a file that reads only 5.5 s after the publish.
+        // Teeth for e and the 2.5 s case: HSLINK_TEETH=THUMB_CAP_3 (last read at 2000 ms).
+        for (int k = 0; k < 4; ++k)
+        {
+            const juce::uint32 validAt = k == 0 ? 1500 : k == 1 ? 2500 : k == 2 ? 5500 : 8500;
+            const auto c = mkCell (k == 0 ? "g10_late15.wav" : k == 1 ? "g10_late25.wav" : k == 2 ? "g10_late55.wav" : "g10_late85.wav");
+            c.temp.create();
+            const auto c0 = snap();
+            fakeMs += 100000;
+            const juce::uint32 t0 = fakeMs;
+            TakeCell cell (c.key, "g10_late", TakeGrid::thumbSourceOf (c), 0, fm, cache);
+            bool wrote = false;
+            double lenBefore = -1.0;
+            int loadedAt = -1, lastTryAt = -1, refreshes = 0, setsSeen = 1;
+            for (juce::uint32 dt = 0; dt <= 10000; dt += 100)
+            {
+                fakeMs = t0 + dt;
+                if (dt == validAt)
+                {
+                    lenBefore = cell.thumbLengthForTest();
+                    wrote = r1bWriteWav (c.temp, dataBytes, 0x33);
+                }
+                cell.repointThumbIfGone (TakeGrid::thumbSourceOf (c));
+                ++refreshes;
+                const int now = diff (c0, snap()).v[EditorFs::tagCell];
+                if (now != setsSeen)
+                    lastTryAt = (int) dt;
+                setsSeen = now;
+                if (loadedAt < 0 && cell.thumbLengthForTest() > 0.0)
+                    loadedAt = (int) dt;
+            }
+            const double len = cell.thumbLengthForTest();
+            const int sets = diff (c0, snap()).v[EditorFs::tagCell];
+            const int tries = sets - 1; // without the cell's own
+            const int wantTries = k == 0 ? 3 : k == 1 ? 4 : k == 2 ? 7 : TakeCell::kThumbRetries;
+            const int wantLoadedAt = k == 0 ? 2000 : k == 1 ? 3000 : k == 2 ? 6000 : -1;
+            std::printf ("  G10%s file empty at the publish, valid %d ms later=%d: retry cap %d (shipped %d), gap %d ms; %d refreshes over 10000 simulated ms; tries made %d (want %d), last try at +%d ms, loaded at +%d ms (want %d); length before it was valid %.4f s (want 0.0000), length at the end %.4f s (want %.4f)%c",
+                         k == 2 ? "e" : "d", (int) validAt, (int) wrote, thumbCap, TakeCell::kThumbRetries, TakeCell::kThumbRetryGapMs, refreshes, tries, wantTries,
+                         lastTryAt, loadedAt, wantLoadedAt, lenBefore, len, k == 3 ? 0.0 : wantSec, 10);
+            const bool loaded = wrote && lenBefore == 0.0 && std::abs (len - wantSec) <= 0.001 && tries == wantTries && loadedAt == wantLoadedAt;
+            if (k == 0)
+                check (loaded, "G10d: a file that reads only 1.5 s after the publish still loads (1.0000 s within 0.0010 at the 3rd retry, +2000 ms; teeth: THUMB_NO_SPACING leaves 0.0000)");
+            else if (k == 1)
+                check (loaded, "G10d: a file that reads only 2.5 s after the publish loads at the 4th retry, +3000 ms (teeth: THUMB_CAP_3 leaves 0.0000 after 3 tries)");
+            else if (k == 2)
+                check (loaded, "G10e: a file that reads only 5.5 s after the publish loads at the 7th retry, +6000 ms, and is not read again (7 tries in 10000 ms; teeth: THUMB_CAP_3 stops at 3 tries, +2000 ms, length 0.0000)");
+            else
+                check (wrote && len == 0.0 && tries == TakeCell::kThumbRetries && lastTryAt == (int) lastRetryMs,
+                       "G10d [limit]: a file that reads only 8.5 s after the publish stays at 0.0000: 9 tries, the last at +8000 ms, none after (bounded)");
+        }
+        TakeCell::testThumbClock = nullptr;
+        TakeCell::testThumbNoSpacing = false;
+        TakeCell::testThumbRetryCap = 0;
+        // c. A healthy cell is left alone.
+        {
+            const auto c = mkCell ("g10_ok.wav");
+            const bool wrote = r1bWriteWav (c.temp, dataBytes, 0x32);
+            const auto c0 = snap();
+            TakeCell cell (c.key, "g10_ok", TakeGrid::thumbSourceOf (c), 0, fm, cache);
+            const double len0 = cell.thumbLengthForTest();
+            const auto c1 = snap();
+            int answers = 0;
+            for (int i = 0; i < 30; ++i)
+                answers += cell.repointThumbIfGone (TakeGrid::thumbSourceOf (c)) ? 1 : 0;
+            const int resets = diff (c1, snap()).v[EditorFs::tagCell];
+            std::printf ("  G10c healthy cell: wrote=%d, length when made %.4f s (want %.4f), source sets by the constructor %d (want 1); 30 refreshes: %d more source sets, %d true answers (want 0 0); length after %.4f s%c",
+                         (int) wrote, len0, wantSec, diff (c0, c1).v[EditorFs::tagCell], resets, answers, cell.thumbLengthForTest(), 10);
+            check (wrote && std::abs (len0 - wantSec) <= 0.001 && diff (c0, c1).v[EditorFs::tagCell] == 1 && resets == 0 && answers == 0
+                   && std::abs (cell.thumbLengthForTest() - wantSec) <= 0.001,
+                   "G10c [guard, passes unfixed]: a cell with a loaded thumbnail (1.0000 s) is not read again by 30 refreshes (0 source sets)");
+        }
+    }
+
+    // G11. The select made when a take arrives, in the same window as G10: the take is
+    // listed (registerTake, on its own thread, held in its rename tries by 5 forced
+    // failures: waits of 50 + 100 + 200 + 400 + 750 ms) while its bytes are in
+    // <name>.wav.part. A refresh in the window must not try to select it (no file yet,
+    // "Cannot audition" note, and before the fix never tried again); the first refresh
+    // after the hand-over selects it. Teeth: HSLINK_TEETH=SELECT_IN_HANDOVER.
+    {
+        useRoots ("g11");
+        auto p = std::make_unique<HotStepLinkProcessor>();
+        const bool up = started (*p);
+        auto ed = std::make_unique<HotStepLinkEditor> (*p);
+        ed->runRefreshForTest(); // first refresh: records the keys
+        HotStepLinkEditor::testSelectInHandOver = teethVar == "SELECT_IN_HANDOVER";
+        const auto t = mkTake (*p, 700, "g11 arriving take", 96000, 0x41);
+        const auto part = DawWorker::partFileFor (t.take);
+        auto noteNow = [&] { return ed->collectionNoteForTest(); };
+        auto selectedKey = [&]
+        {
+            juce::String k;
+            for (const auto& cell : ed->getTakeGridForTest().cells)
+                if (cell.selected)
+                    k = cell.key;
+            return k;
+        };
+        int notesSeen = 0;
+        DawWorker::testFailPublish = 5;
+        std::atomic<bool> regDone { false };
+        auto* pp = p.get();
+        std::thread reg ([pp, &t, &regDone] { pp->registerTake (t.job, 0); regDone = true; });
+        Entry e0;
+        const bool listed = waitUntil ([&] { return entryOf (*p, t.name, e0) && DawWorker::testFailPublish.load() <= 4; }, 5.0);
+        const bool partThere = part.existsAsFile(), tempAbsent = ! t.take.existsAsFile();
+        ed->runRefreshForTest(); // a refresh inside the window
+        const auto note1 = noteNow();
+        const auto sel1 = p->audition.getSelected();
+        const auto key1 = selectedKey();
+        notesSeen += note1.contains ("Cannot audition") ? 1 : 0;
+        const bool cellThere = ed->getTakeCellKeysForTest().contains (t.name);
+        Entry e1;
+        entryOf (*p, t.name, e1);
+        const bool inWindow = ! regDone.load() && e1.handingOver;
+        reg.join();
+        DawWorker::testFailPublish = 0;
+        Entry e2;
+        entryOf (*p, t.name, e2);
+        const bool published = t.take.existsAsFile() && ! part.existsAsFile() && ! e2.handingOver;
+        ed->runRefreshForTest(); // the first refresh after the publish and the hand-over
+        const auto key2 = selectedKey();
+        const auto sel2 = p->audition.getSelected();
+        notesSeen += noteNow().contains ("Cannot audition") ? 1 : 0;
+        for (int i = 0; i < 10; ++i)
+        {
+            ed->runRefreshForTest();
+            notesSeen += noteNow().contains ("Cannot audition") ? 1 : 0;
+        }
+        const auto key3 = selectedKey();
+        std::printf ("  G11 start pass=%d; listed during the rename tries=%d, .part there=%d, final file absent=%d, cell made=%d, registerTake still inside and handingOver=%d (want 1 1 1 1 1)%c",
+                     (int) up, (int) listed, (int) partThere, (int) tempAbsent, (int) cellThere, (int) inWindow, 10);
+        std::printf ("  G11 refresh in the window: selected key '%s', audition file '%s' (want both empty), note '%s' (want empty)%c",
+                     key1.toRawUTF8(), sel1.getFileName().toRawUTF8(), note1.toRawUTF8(), 10);
+        std::printf ("  G11 published and handed over=%d; 1 refresh later: selected key '%s' (want '%s'), audition file '%s'; after 10 more refreshes: selected key '%s'; refreshes that showed a 'Cannot audition' note: %d of 12 (want 0)%c",
+                     (int) published, key2.toRawUTF8(), t.name.toRawUTF8(), sel2.getFileName().toRawUTF8(), key3.toRawUTF8(), notesSeen, 10);
+        check (up && listed && partThere && tempAbsent && cellThere && inWindow,
+               "G11 [informational]: the refresh ran while the take was listed, its bytes in the .part and registerTake still inside");
+        check (key1.isEmpty() && sel1 == juce::File() && note1.isEmpty(),
+               "G11: a refresh inside the window selects nothing and shows no missing-file note (teeth: SELECT_IN_HANDOVER shows the note)");
+        check (published && key2 == t.name && key3 == t.name && sel2.getFileName() == t.name,
+               "G11: the first refresh after the publish selects the arrived take, by its exact key (teeth: SELECT_IN_HANDOVER never selects it)");
+        check (notesSeen == 0, "G11: no 'Cannot audition' note in any of the 12 refreshes (teeth: SELECT_IN_HANDOVER)");
+        // A click on a take whose files are really gone still says so.
+        const bool savedT = waitUntil ([&] { Entry e; return entryOf (*p, t.name, e) && e.stable != juce::File() && e.stable.existsAsFile(); }, 20.0);
+        const auto u = mkTake (*p, 701, "g11 second take", 98000, 0x42);
+        p->registerTakeAndWait (u.job, 0);
+        ed->runRefreshForTest(); // u arrives and is selected
+        const auto keyU = selectedKey();
+        Entry eT;
+        entryOf (*p, t.name, eT);
+        const bool removed = eT.temp.deleteFile() && eT.stable.deleteFile();
+        ed->selectTakeForTest (t.name);
+        const auto noteClick = noteNow();
+        const auto keyAfterClick = selectedKey();
+        std::printf ("  G11 click on a take with no file: first take saved=%d, second take selected on arrival '%s' (want '%s'), both files of the first removed=%d; after the click: selected '%s' (want unchanged), note '%s' (want 'Cannot audition: the take's file is missing: ...')%c",
+                     (int) savedT, keyU.toRawUTF8(), u.name.toRawUTF8(), (int) removed, keyAfterClick.toRawUTF8(), noteClick.toRawUTF8(), 10);
+        check (savedT && keyU == u.name && removed && keyAfterClick == u.name && noteClick.startsWith ("Cannot audition: the take's file is missing"),
+               "G11 [guard, passes unfixed]: a click on a take whose files are gone shows the missing-file note and selects nothing");
+        HotStepLinkEditor::testSelectInHandOver = false;
+        ed.reset();
+        p.reset();
+    }
+
     TakeGrid::testEditorStats = false;
     TakeGrid::testThumbFromLasting = false;
     TakeGrid::testNoTempFallback = false;
@@ -10429,7 +10894,7 @@ void testEditorNoPolling (const juce::File& tmp)
     HotStepLinkProcessor::testBeforeRescueTake = nullptr;
     unit.deleteRecursively(); // made by this test
     _putenv_s ("HSLINK_TEMP_ROOT", savedTemp.toRawUTF8());
-    _putenv_s ("HSLINK_STABLE_ROOT", savedStable.toRawUTF8());
+    _putenv_s ("HSLINK_TAKES_ROOT", savedStable.toRawUTF8());
 }
 
 // Backend switch before the submit (S-a to S-g). The two backend requests of
@@ -10694,6 +11159,13 @@ struct BsHttpStub
     std::mutex m;
     juce::String active, lastOther;
     juce::String statusBody; // set before start(): when not empty, the heartbeat GET is answered 200 with it (default: 404)
+    juce::String backendsBody; // set before start(): when not empty, GET /api/backends is answered 200 with it (default: activeId only)
+    std::atomic<bool> statusDown { false }; // true: the heartbeat GET is answered 404 even with a statusBody
+    // true: GET /api/backends is counted and then left open with no answer at all (no
+    // headers) until stop(); the listener goes on serving other connections meanwhile.
+    std::atomic<bool> holdBackends { false };
+    std::vector<std::unique_ptr<juce::StreamingSocket>> held; // listener thread only; freed in stop() after the join
+    std::atomic<juce::int64> firstGetMs { 0 }, statusAfterGetMs { 0 }; // clock at the first backend GET and at the first status GET after it
     int port = 0;
 
     bool start (const char* activeNow)
@@ -10714,6 +11186,7 @@ struct BsHttpStub
         }
         if (th.joinable())
             th.join();
+        held.clear();
         listener.close();
     }
     juce::String url() const { return "http://127.0.0.1:" + juce::String (port); }
@@ -10728,10 +11201,12 @@ struct BsHttpStub
             if (c == nullptr || quit.load())
                 break;
             ++conns;
-            serve (*c);
+            if (serve (*c))
+                held.push_back (std::move (c));
         }
     }
-    void serve (juce::StreamingSocket& c)
+    // True = the connection is to be kept open without an answer (holdBackends).
+    bool serve (juce::StreamingSocket& c)
     {
         juce::String req;
         char buf[2048];
@@ -10763,6 +11238,10 @@ struct BsHttpStub
             {
                 ++gets;
                 code = 200;
+                if (firstGetMs.load() == 0)
+                    firstGetMs = (juce::int64) juce::Time::getMillisecondCounter();
+                if (holdBackends.load())
+                    return true;
             }
             else if (method == "POST" && path == "/api/backends/active")
             {
@@ -10773,7 +11252,9 @@ struct BsHttpStub
             else if (method == "GET" && path == "/api/v1/daw/status")
             {
                 ++status;
-                statusHit = statusBody.isNotEmpty();
+                statusHit = statusBody.isNotEmpty() && ! statusDown.load();
+                if (firstGetMs.load() != 0 && statusAfterGetMs.load() == 0)
+                    statusAfterGetMs = (juce::int64) juce::Time::getMillisecondCounter();
             }
             else if (line.isNotEmpty())
             {
@@ -10781,7 +11262,7 @@ struct BsHttpStub
                 lastOther = method + " " + path;
             }
             if (code == 200)
-                body = "{\"activeId\":\"" + active + "\"}";
+                body = method == "GET" && backendsBody.isNotEmpty() ? backendsBody : "{\"activeId\":\"" + active + "\"}";
             if (statusHit)
             {
                 code = 200;
@@ -10793,6 +11274,7 @@ struct BsHttpStub
                          + "\r\nConnection: close\r\n\r\n" + body;
         c.write (out.toRawUTF8(), (int) out.getNumBytesAsUTF8());
         c.close();
+        return false;
     }
 };
 } // namespace
@@ -11411,6 +11893,706 @@ void testBackendSwitch (const juce::File& tmpDir)
     server.kill();
 }
 
+// Backend picker availability (commit 60819f8). C-a..C-d: the pure functions as tables.
+// C-e: the real worker against BsHttpStub (real request path, listBackends on for that
+// worker). C-f, C-g: a processor and its editor against the same listener. C-h pins the
+// parameter contract. Teeth: HSLINK_TEETH=CAPS_<name> picks one DawWorker::testCapsMutant
+// (test build only, read here and not in source/). Every line prints got and want.
+void testBackendCaps()
+{
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    struct Mut { const char* name; int id; };
+    const Mut muts[] = { { "CAPS_NO_PARSE", DawWorker::capsMutNoParse }, { "CAPS_EMPTY_KNOWN", DawWorker::capsMutEmptyKnown },
+                         { "CAPS_ALL_AVAILABLE", DawWorker::capsMutAllAvailable }, { "CAPS_NO_CARRY", DawWorker::capsMutNoCarry },
+                         { "CAPS_FETCH_EVERY_BEAT", DawWorker::capsMutFetchEveryBeat }, { "CAPS_KEEP_ON_URL", DawWorker::capsMutKeepOnUrl },
+                         { "CAPS_AUTO_RESET", DawWorker::capsMutAutoReset }, { "CAPS_SKIP_APPLY", DawWorker::capsMutSkipApply },
+                         { "CAPS_OLD_FETCH_LOOP", DawWorker::capsMutOldFetchLoop }, { "CAPS_STORE_ANY_URL", DawWorker::capsMutStoreAnyUrl },
+                         { "CAPS_ITEMS_DISABLED", DawWorker::capsMutItemsDisabled }, { "CAPS_URL_AFTER_GET", DawWorker::capsMutUrlAfterGet },
+                         { "CAPS_RAW_IDS", DawWorker::capsMutRawIds }, { "CAPS_WRONG_FIELD", DawWorker::capsMutWrongField } };
+    int mut = DawWorker::capsMutNone;
+    for (const auto& m : muts)
+        if (teethVar == m.name)
+            mut = m.id;
+    DawWorker::testCapsMutant = mut;
+    std::printf ("Backend picker availability%s%s%s%c", mut != 0 ? "  [TEETH: " : "", mut != 0 ? teethVar.toRawUTF8() : "", mut != 0 ? "]" : "", 10);
+    using P = HotStepLinkProcessor;
+    const auto availStr = [] (bool known, const juce::StringArray& ids)
+    {
+        juce::String t;
+        for (int i = 0; i < P::kBackendChoices; ++i)
+            t << (P::backendAvailable (i, known, ids) ? "1" : "0");
+        return t;
+    };
+    const auto waitFor = [] (const std::function<bool()>& f, double limitS)
+    {
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        while (juce::Time::getMillisecondCounterHiRes() - t0 < limitS * 1000.0)
+        {
+            if (f())
+                return true;
+            juce::Thread::sleep (20);
+        }
+        return f();
+    };
+    const char* kBody = R"({"activeId":"ace","backends":[{"id":"ace","name":"ACE-Step"},{"id":"sa3","name":"Stable Audio 3"}]})";
+    const char* kStatus = R"({"api":1,"loaded_model":null,"base_available":true,"non_turbo_available":false})";
+
+    // C-a: parse.
+    {
+        const auto l = DawWorker::parseBackendList (200, kBody);
+        std::printf ("  C-a parse: known=%d (want 1) ids=%d '%s' (want 2 'ace,sa3')%c", (int) l.known, l.ids.size(), l.ids.joinIntoString (",").toRawUTF8(), 10);
+        check (l.known && l.ids.size() == 2 && l.ids.joinIntoString (",") == "ace,sa3",
+               "C-a: a body with activeId and two backend entries gives known and the 2 ids in server order (teeth: CAPS_NO_PARSE)");
+        const auto l2 = DawWorker::parseBackendList (200, R"({"backends":[{"id":"  ACE "},{"id":"ace"},{"id":7},{"name":"x"},{"id":""},{"id":"Sa3"}]})");
+        std::printf ("  C-a parse, untidy ids: known=%d (want 1) ids=%d '%s' (want 2 'ace,sa3')%c", (int) l2.known, l2.ids.size(), l2.ids.joinIntoString (",").toRawUTF8(), 10);
+        check (l2.known && l2.ids.joinIntoString (",") == "ace,sa3",
+               "C-a: ids are trimmed, lower-cased and de-duplicated; entries without a text id are skipped (teeth: CAPS_NO_PARSE)");
+    }
+
+    // C-b: fail open.
+    {
+        struct Bad { const char* what; int code; const char* body; };
+        const Bad bads[] = { { "empty body", 200, "" }, { "{}", 200, "{}" }, { "non-JSON", 200, "<html>busy</html>" },
+                             { "no array", 200, R"({"activeId":"ace","backends":"ace"})" }, { "HTTP 500", 500, kBody },
+                             { "no answer (0)", 0, "" }, { "empty array", 200, R"({"backends":[]})" } };
+        for (const auto& b : bads)
+        {
+            const auto l = DawWorker::parseBackendList (b.code, b.body);
+            const auto a = availStr (l.known, l.ids);
+            const int n = a.retainCharacters ("1").length();
+            std::printf ("  C-b %s: known=%d (want 0) ids=%d (want 0) available=%s = %d of 6 (want 111111 = 6 of 6)%c", b.what, (int) l.known, l.ids.size(), a.toRawUTF8(), n, 10);
+            check (! l.known && l.ids.isEmpty() && n == 6,
+                   (juce::String ("C-b: ") + b.what + " gives no list and 6 of 6 entries available"
+                    + (juce::String (b.what) == "empty array" ? " [informational, no teeth]" : " (teeth: CAPS_EMPTY_KNOWN)")).toRawUTF8());
+        }
+    }
+
+    // C-c: the table. Index to id as backendIdForIndex has it: 0 Auto, 1 sa3, 2 yue2, 3 ace,
+    // 4 minimax-m3, 5 heartmula.
+    {
+        struct Row { const char* what; juce::StringArray ids; bool known; const char* want; };
+        const Row rows[] = { { "{ace, sa3}", { "ace", "sa3" }, true, "110100" },
+                             { "{'  ACE ', 'Sa3'}", { "  ACE ", "Sa3" }, true, "110100" },
+                             { "{heartmula}", { "heartmula" }, true, "100001" },
+                             { "all five", { "sa3", "yue2", "ace", "minimax-m3", "heartmula" }, true, "111111" },
+                             { "{ace, sa3} but not known", { "ace", "sa3" }, false, "111111" } };
+        for (const auto& r : rows)
+        {
+            const auto a = availStr (r.known, r.ids);
+            std::printf ("  C-c list %s: available by index 0..5 = %s (want %s)%c", r.what, a.toRawUTF8(), r.want, 10);
+            const bool noTeeth = juce::String (r.want) == "111111";
+            check (a == r.want, (juce::String ("C-c: list ") + r.what + " gives " + r.want
+                                 + (noTeeth ? " [informational, no teeth]" : " (teeth: CAPS_ALL_AVAILABLE)")).toRawUTF8());
+        }
+        const auto note5 = P::backendUnlistedNote (5, true, { "ace", "sa3" });
+        const auto note3 = P::backendUnlistedNote (3, true, { "ace", "sa3" });
+        std::printf ("  C-c note for index 5: '%s' (want 'HeartMuLa: not available on this server'); for index 3: '%s' (want '')%c", note5.toRawUTF8(), note3.toRawUTF8(), 10);
+        check (note5 == DawWorker::backendLabel ("heartmula") + ": not available on this server" && note3.isEmpty(),
+               "C-c: the unlisted note names the selected backend and is empty for a listed one (teeth: CAPS_ALL_AVAILABLE)");
+    }
+
+    // C-d: an id the fixed list does not have.
+    {
+        const juce::StringArray ids { "sa3", "ace", "newthing-x1" };
+        const auto extra = P::backendExtras (true, ids);
+        juce::String table;
+        for (int i = 0; i < P::kBackendChoices; ++i)
+            table << (i > 0 ? "|" : "") << P::backendIdForIndex (i);
+        const auto tip = P::backendPickerTooltip (true, ids);
+        const auto wantTip = "Dimmed: not available on this server, can still be picked (" + DawWorker::backendLabel ("yue2") + ", " + DawWorker::backendLabel ("minimax-m3")
+                             + ", " + DawWorker::backendLabel ("heartmula") + ").\nThe server also lists: newthing-x1 (not selectable here).";
+        std::printf ("  C-d list {sa3, ace, newthing-x1}: extras=%d '%s' (want 1 'newthing-x1'); id table '%s' (want '|sa3|yue2|ace|minimax-m3|heartmula'); available=%s (want 110100)%c",
+                     extra.size(), extra.joinIntoString (",").toRawUTF8(), table.toRawUTF8(), availStr (true, ids).toRawUTF8(), 10);
+        std::printf ("  C-d tooltip: '%s'%c", tip.replace ("\n", " / ").toRawUTF8(), 10);
+        check (extra.size() == 1 && extra[0] == "newthing-x1" && P::backendExtras (false, ids).isEmpty(),
+               "C-d [informational, no teeth]: extras is exactly the one new id, and empty when no list is known");
+        check (table == "|sa3|yue2|ace|minimax-m3|heartmula", "C-d [informational, no teeth]: backendIdForIndex 0..5 is unchanged");
+        check (tip == wantTip, "C-d: the tooltip names the three marked entries and the extra id (teeth: CAPS_ALL_AVAILABLE)");
+    }
+
+    // C-e: the real worker. Listener A lists {ace, sa3}; listener B answers /api/backends without a list.
+    {
+        BsHttpStub a, b;
+        a.statusBody = kStatus;
+        a.backendsBody = kBody;
+        b.statusBody = kStatus;
+        const bool up = a.start ("ace") && b.start ("ace");
+        const bool safePorts = a.port != 3001 && a.port != 8085 && b.port != 3001 && b.port != 8085;
+        DawWorker w;
+        w.listBackends = true;
+        w.setEndpoint (a.url(), "test-key");
+        w.start();
+        const bool got = waitFor ([&] { return w.getSnapshot().backendsKnown; }, 12.0);
+        const auto s1 = w.getSnapshot();
+        const int gets1 = a.gets.load();
+        std::printf ("  C-e connect: listeners up=%d (ports %d, %d) list read=%d online=%d heartbeatsOk=%d known=%d ids='%s' (want 1 'ace,sa3') GET /api/backends=%d (want 1)%c",
+                     (int) up, a.port, b.port, (int) got, (int) s1.online, s1.heartbeatsOk, (int) s1.backendsKnown, s1.backendIds.joinIntoString (",").toRawUTF8(), gets1, 10);
+        check (up && safePorts && got && s1.online && s1.backendsKnown && s1.backendIds.joinIntoString (",") == "ace,sa3" && gets1 == 1,
+               "C-e: after the connect the snapshot holds the 2 ids from 1 GET /api/backends (teeth: CAPS_NO_PARSE)");
+        const int hb0 = s1.heartbeatsOk;
+        const bool beats = waitFor ([&] { return w.getSnapshot().heartbeatsOk >= hb0 + 3; }, 20.0);
+        juce::Thread::sleep (300); // a request sent after the third heartbeat would have arrived by now
+        const auto s2 = w.getSnapshot();
+        const int gets2 = a.gets.load();
+        std::printf ("  C-e 3 heartbeats later: heartbeatsOk %d -> %d (reached=%d) online=%d known=%d ids='%s' (want 1 'ace,sa3') GET /api/backends=%d (want 1)%c",
+                     hb0, s2.heartbeatsOk, (int) beats, (int) s2.online, (int) s2.backendsKnown, s2.backendIds.joinIntoString (",").toRawUTF8(), gets2, 10);
+        check (beats && s2.online && s2.backendsKnown && s2.backendIds.joinIntoString (",") == "ace,sa3",
+               "C-e: the list is still in the snapshot 3 heartbeats later (teeth: CAPS_NO_CARRY)");
+        check (beats && gets2 == 1, "C-e: still exactly 1 GET /api/backends after 3 more heartbeats (teeth: CAPS_FETCH_EVERY_BEAT)");
+        // Offline, then online again: one more GET.
+        w.offlineAfterFailures = 1;
+        a.statusDown = true;
+        const bool off = waitFor ([&] { return ! w.getSnapshot().online; }, 12.0);
+        const int getsOff = a.gets.load();
+        a.statusDown = false;
+        const bool on = waitFor ([&] { return w.getSnapshot().online && a.gets.load() > getsOff; }, 15.0);
+        const int hb1 = w.getSnapshot().heartbeatsOk;
+        const bool beat2 = waitFor ([&] { return w.getSnapshot().heartbeatsOk >= hb1 + 1; }, 10.0);
+        juce::Thread::sleep (300);
+        const auto s3 = w.getSnapshot();
+        const int gets3 = a.gets.load();
+        std::printf ("  C-e offline then online: went offline=%d (GETs so far %d) back online=%d one more heartbeat=%d known=%d ids='%s' GET /api/backends=%d (want %d = 1 more than after the 3 heartbeats)%c",
+                     (int) off, getsOff, (int) on, (int) beat2, (int) s3.backendsKnown, s3.backendIds.joinIntoString (",").toRawUTF8(), gets3, gets2 + 1, 10);
+        check (off && on && beat2 && gets3 == 2 && s3.backendsKnown && s3.backendIds.joinIntoString (",") == "ace,sa3",
+               "C-e: one offline to online change gives exactly 1 more GET /api/backends, 2 in all (teeth: CAPS_FETCH_EVERY_BEAT)");
+        // URL change: cleared at once, and B (no list) leaves it empty.
+        w.setEndpoint (b.url(), "test-key");
+        const auto s4 = w.getSnapshot();
+        std::printf ("  C-e right after the URL change: known=%d ids=%d (want 0 0)%c", (int) s4.backendsKnown, s4.backendIds.size(), 10);
+        check (! s4.backendsKnown && s4.backendIds.isEmpty(), "C-e: the list is cleared by a URL change (teeth: CAPS_KEEP_ON_URL)");
+        const bool onB = waitFor ([&] { return w.getSnapshot().online && b.gets.load() >= 1; }, 15.0);
+        juce::Thread::sleep (300);
+        const auto s5 = w.getSnapshot();
+        w.stop();
+        a.stop();
+        b.stop();
+        std::printf ("  C-e on the second listener (no list in its answer): online=%d known=%d ids=%d (want 1 0 0) its GET /api/backends=%d (want 1); first listener GETs=%d (want 2)%c",
+                     (int) onB, (int) s5.backendsKnown, s5.backendIds.size(), b.gets.load(), a.gets.load(), 10);
+        check (onB && s5.online && ! s5.backendsKnown && s5.backendIds.isEmpty() && b.gets.load() == 1,
+               "C-e [informational, no teeth]: the new server is asked once, and its answer without a list leaves nothing marked");
+    }
+
+    // C-i: a server that answers the status but never answers GET /api/backends (the
+    // connection is held open, no headers). The list request must be sent once, come back
+    // well inside the offline limit and leave the pill online and the list unknown.
+    // CAPS_OLD_FETCH_LOOP puts back the 10 s timeout and the "was offline" test on the pill.
+    {
+        BsHttpStub h;
+        h.statusBody = kStatus;
+        h.backendsBody = kBody;
+        h.holdBackends = true;
+        const bool up = h.start ("ace") && h.port != 3001 && h.port != 8085;
+        DawWorker w;
+        w.listBackends = true;
+        w.setEndpoint (h.url(), "test-key");
+        w.start();
+        const bool asked = waitFor ([&] { return h.gets.load() >= 1 && w.getSnapshot().online; }, 12.0);
+        const int hb0 = w.getSnapshot().heartbeatsOk;
+        // Sampled every 2 ms from the first GET until 3 more heartbeats are in.
+        int samples = 0, offlineSamples = 0;
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        bool beats = false;
+        while (juce::Time::getMillisecondCounterHiRes() - t0 < 60000.0)
+        {
+            const auto s = w.getSnapshot();
+            ++samples;
+            if (! s.online)
+                ++offlineSamples;
+            if (s.heartbeatsOk >= hb0 + 3)
+            {
+                beats = true;
+                break;
+            }
+            juce::Thread::sleep (2);
+        }
+        const int tookMs = (int) (juce::Time::getMillisecondCounterHiRes() - t0);
+        juce::Thread::sleep (300); // a request sent after the third heartbeat would have arrived by now
+        const auto s1 = w.getSnapshot();
+        const int gets = h.gets.load();
+        const auto gapMs = h.statusAfterGetMs.load() != 0 ? h.statusAfterGetMs.load() - h.firstGetMs.load() : (juce::int64) -1;
+        const auto a = availStr (s1.backendsKnown, s1.backendIds);
+        const int nAvail = a.retainCharacters ("1").length();
+        w.stop();
+        h.stop();
+        std::printf ("  C-i held list request: listener up=%d asked+online=%d heartbeatsOk %d -> %d (3 more reached=%d, took %d ms) GET /api/backends=%d (want 1) status GETs=%d%c",
+                     (int) up, (int) asked, hb0, s1.heartbeatsOk, (int) beats, tookMs, gets, h.status.load(), 10);
+        std::printf ("  C-i first list GET to the next heartbeat: %d ms (want under 6000; list timeout %d ms, heartbeat every %d ms, offline limit %d ms); offline samples %d of %d (want 0); online at the end=%d known=%d ids=%d available=%s = %d of 6 (want 1 0 0 111111 = 6 of 6)%c",
+                     (int) gapMs, (int) DawWorker::kBackendListTimeoutMs, (int) DawWorker::kHeartbeatMs, (int) DawWorker::kOfflineAfterMs,
+                     offlineSamples, samples, (int) s1.online, (int) s1.backendsKnown, s1.backendIds.size(), a.toRawUTF8(), nAvail, 10);
+        check (up && asked && beats && gets == 1,
+               "C-i: exactly 1 GET /api/backends over 3 more heartbeats when the request is never answered (teeth: CAPS_OLD_FETCH_LOOP)");
+        check (asked && gapMs >= 0 && gapMs < 6000,
+               "C-i: the next heartbeat comes less than 6000 ms after the list request was sent (teeth: CAPS_OLD_FETCH_LOOP)");
+        check (asked && beats && offlineSamples == 0 && s1.online,
+               "C-i: the snapshot is online in every sample from the list request to the third heartbeat (teeth: CAPS_OLD_FETCH_LOOP, timing dependent)");
+        check (! s1.backendsKnown && s1.backendIds.isEmpty() && nAvail == 6,
+               "C-i [informational, no teeth]: the list stays unknown, 6 of 6 entries available");
+        check (DawWorker::kBackendListTimeoutMs * 2 < DawWorker::kOfflineAfterMs,
+               "C-i [informational, no teeth]: the list timeout is under half the offline limit");
+    }
+
+    // C-j: an answer that arrives after the endpoint changed is dropped. The stand-in for
+    // the list request changes the endpoint while "the request is out" and then answers
+    // with a list; the new endpoint answers its status with 404, so nothing asks again.
+    {
+        BsHttpStub a, b;
+        a.statusBody = kStatus;
+        const bool up = a.start ("ace") && b.start ("ace") && a.port != 3001 && a.port != 8085 && b.port != 3001 && b.port != 8085;
+        static DawWorker* jw = nullptr;
+        static juce::String jNewUrl;
+        static std::atomic<int> jCalls { 0 };
+        static const char* jBody = nullptr;
+        DawWorker w;
+        jw = &w;
+        jNewUrl = b.url();
+        jCalls = 0;
+        jBody = kBody;
+        DawWorker::testBackendCall = [] (const juce::String&, const juce::String&, const juce::String&, juce::String& body) -> int
+        {
+            if (++jCalls == 1)
+                jw->setEndpoint (jNewUrl, "test-key");
+            body = jBody;
+            return 200;
+        };
+        w.listBackends = true;
+        w.setEndpoint (a.url(), "test-key");
+        w.start();
+        const bool called = waitFor ([&] { return jCalls.load() >= 1; }, 12.0);
+        const bool moved = waitFor ([&] { return b.status.load() >= 2; }, 12.0); // the worker is on the new endpoint and stays offline there
+        const auto s = w.getSnapshot();
+        w.stop();
+        DawWorker::testBackendCall = nullptr;
+        jw = nullptr;
+        a.stop();
+        b.stop();
+        std::printf ("  C-j answer after an endpoint change: listeners up=%d list calls=%d (want 1) new endpoint status GETs=%d online=%d (want 0) known=%d ids=%d '%s' (want 0 0 '')%c",
+                     (int) up, jCalls.load(), b.status.load(), (int) s.online, (int) s.backendsKnown, s.backendIds.size(), s.backendIds.joinIntoString (",").toRawUTF8(), 10);
+        check (up && called && moved && jCalls.load() == 1 && ! s.online && ! s.backendsKnown && s.backendIds.isEmpty(),
+               "C-j: a list answered for the old endpoint is not stored under the new one (teeth: CAPS_STORE_ANY_URL)");
+    }
+
+    // C-l: the same drop on the pre-submit path. A job that expects a backend makes
+    // ensureBackend ask GET /api/backends (the stand-in); listBackends stays off, so that
+    // is the only list request. Control first: with no endpoint change the answer is
+    // stored (known, 2 ids). Then the stand-in changes the endpoint while "the request is
+    // out": the answer belongs to the old server and must not be stored under the new one.
+    // The new endpoint answers its status with 404, so nothing else touches the list.
+    {
+        static DawWorker* lw = nullptr;
+        static juce::String lNewUrl;
+        static std::atomic<int> lCalls { 0 };
+        static const char* lBody = nullptr;
+        lBody = kBody;
+        struct Got { bool up = false, online = false, fin = false, moved = false, known = false; int calls = 0, ids = 0, gets = 0; juce::String idText, state; };
+        const auto run = [&] (bool change, const char* folder)
+        {
+            Got g;
+            BsHttpStub a, b;
+            a.statusBody = kStatus;
+            g.up = a.start ("ace") && b.start ("ace") && a.port != 3001 && a.port != 8085 && b.port != 3001 && b.port != 8085;
+            DawWorker w;
+            lw = change ? &w : nullptr;
+            lNewUrl = b.url();
+            lCalls = 0;
+            DawWorker::testBackendCall = [] (const juce::String&, const juce::String&, const juce::String&, juce::String& body) -> int
+            {
+                if (++lCalls == 1 && lw != nullptr)
+                    lw->setEndpoint (lNewUrl, "test-key");
+                body = lBody;
+                return 200;
+            };
+            w.setEndpoint (a.url(), "test-key");
+            w.setTakesFolder (juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile (folder));
+            w.start();
+            g.online = waitFor ([&] { return w.getSnapshot().online; }, 12.0);
+            const int id = w.submitGenerate (bsReq ("caps pre-submit", "ace")); // ace is active in kBody: 1 question, no switch
+            DawJob j;
+            g.fin = waitFinished (w, id, 30.0, j);
+            g.moved = ! change || waitFor ([&] { return b.status.load() >= 2; }, 12.0); // on the new endpoint, offline there
+            const auto s = w.getSnapshot();
+            w.stop();
+            DawWorker::testBackendCall = nullptr;
+            lw = nullptr;
+            g.calls = lCalls.load();
+            g.known = s.backendsKnown;
+            g.ids = s.backendIds.size();
+            g.idText = s.backendIds.joinIntoString (",");
+            g.state = DawJob::stateName (j.state);
+            g.gets = a.gets.load() + b.gets.load();
+            a.stop();
+            b.stop();
+            juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile (folder).deleteRecursively();
+            return g;
+        };
+        const auto c = run (false, "hslink_caps_l_control");
+        std::printf ("  C-l control, no endpoint change: listeners up=%d online=%d job finished=%d (%s) list questions=%d (want 1) real list GETs=%d (want 0) known=%d ids=%d '%s' (want 1 2 'ace,sa3')%c",
+                     (int) c.up, (int) c.online, (int) c.fin, c.state.toRawUTF8(), c.calls, c.gets, (int) c.known, c.ids, c.idText.toRawUTF8(), 10);
+        check (c.up && c.online && c.fin && c.calls == 1 && c.gets == 0 && c.known && c.ids == 2 && c.idText == "ace,sa3",
+               "C-l control [no teeth]: the pre-submit question stores its list when the endpoint stays (known, 'ace,sa3')");
+        const auto g = run (true, "hslink_caps_l_change");
+        std::printf ("  C-l endpoint changed during the pre-submit question: listeners up=%d online=%d job finished=%d (%s) moved=%d list questions=%d (want 1) real list GETs=%d (want 0) known=%d ids=%d '%s' (want 0 0 '')%c",
+                     (int) g.up, (int) g.online, (int) g.fin, g.state.toRawUTF8(), (int) g.moved, g.calls, g.gets, (int) g.known, g.ids, g.idText.toRawUTF8(), 10);
+        check (g.up && g.online && g.fin && g.moved && g.calls == 1 && g.gets == 0 && ! g.known && g.ids == 0,
+               "C-l: a list answered to the pre-submit question for the old endpoint is not stored under the new one (teeth: CAPS_URL_AFTER_GET)");
+    }
+
+    // C-m: the text of a marked (unlisted) Backend entry against what is behind it, as the
+    // look-and-feel paints it. One menu row is drawn 4x enlarged (so the letter stems have
+    // fully covered pixels); the text colour is the brightest pixel, the background is read
+    // at the right end of the row. WCAG 2 contrast ratio. Teeth: HSLINK_TEETH=CAPS_NO_HILITE_LIFT
+    // (the highlighted row keeps the menu-background alpha 0.6, as it was).
+    {
+        HslinkLook look;
+        const auto lum = [] (juce::Colour c)
+        {
+            const auto ch = [] (int v) { const double x = v / 255.0; return x <= 0.03928 ? x / 12.92 : std::pow ((x + 0.055) / 1.055, 2.4); };
+            return 0.2126 * ch (c.getRed()) + 0.7152 * ch (c.getGreen()) + 0.0722 * ch (c.getBlue());
+        };
+        const auto ratio = [&] (juce::Colour a, juce::Colour b)
+        {
+            const double la = lum (a), lb = lum (b);
+            return (juce::jmax (la, lb) + 0.05) / (juce::jmin (la, lb) + 0.05);
+        };
+        struct Row { juce::Colour text, back; double r = 0.0; };
+        const auto paintRow = [&] (bool highlighted, bool marked, bool oldCode)
+        {
+            const int sc = 4, w = 220, h = 24;
+            juce::Image img (juce::Image::RGB, w * sc, h * sc, true);
+            {
+                juce::Graphics g (img);
+                g.fillAll (look.findColour (juce::PopupMenu::backgroundColourId));
+                g.addTransform (juce::AffineTransform::scale ((float) sc));
+                const auto col = HslinkLook::unlistedItemColour (false); // what applyBackendAvailability gives the item
+                HslinkLook::testNoHighlightLift = oldCode;
+                look.drawPopupMenuItem (g, { 0, 0, w, h }, false, true, highlighted, false, false, "HeartMuLa", {}, nullptr, marked ? &col : nullptr);
+                HslinkLook::testNoHighlightLift = false;
+            }
+            Row row;
+            row.back = img.getPixelAt ((w - 6) * sc, (h / 2) * sc);
+            double best = -1.0;
+            for (int y = 0; y < img.getHeight(); ++y)
+                for (int x = 0; x < img.getWidth(); ++x)
+                {
+                    const auto px = img.getPixelAt (x, y);
+                    const double l = lum (px);
+                    if (l > best)
+                    {
+                        best = l;
+                        row.text = px;
+                    }
+                }
+            row.r = ratio (row.text, row.back);
+            return row;
+        };
+        const bool teethLift = teethVar == "CAPS_NO_HILITE_LIFT";
+        const auto dimMenu = paintRow (false, true, false), normMenu = paintRow (false, false, false);
+        const auto dimBarOld = paintRow (true, true, true), dimBar = paintRow (true, true, teethLift), normBar = paintRow (true, false, false);
+        const auto show = [] (const char* name, const Row& r, const char* want)
+        {
+            std::printf ("  C-m %-44s text %3d,%3d,%3d on %3d,%3d,%3d  contrast %.2f:1 %s%c", name, r.text.getRed(), r.text.getGreen(), r.text.getBlue(),
+                         r.back.getRed(), r.back.getGreen(), r.back.getBlue(), r.r, want, 10);
+        };
+        show ("marked entry on the menu background:", dimMenu, "(want 5.40 within 0.15, unchanged)");
+        show ("listed entry on the menu background:", normMenu, "(reference)");
+        show ("marked entry on the highlight bar, before:", dimBarOld, "(alpha 0.6 as it was; under 4.5)");
+        show ("marked entry on the highlight bar, now:", dimBar, "(want >= 4.50)");
+        show ("listed entry on the highlight bar:", normBar, "(reference)");
+        std::printf ("  C-m gap on the highlight bar, listed minus marked: %.2f (want >= 4.00); listed / marked %.2fx; text alpha on the bar %.2f, on the menu %.2f%c",
+                     normBar.r - dimBar.r, normBar.r / dimBar.r, (double) HslinkLook::unlistedItemColour (true).getFloatAlpha(),
+                     (double) HslinkLook::unlistedItemColour (false).getFloatAlpha(), 10);
+        check (std::abs (dimMenu.r - 5.40) <= 0.15, "C-m: a marked Backend entry on the menu background keeps its contrast (5.40:1 within 0.15, alpha 0.6 unchanged)");
+        check (dimBarOld.r < 4.5 && dimBarOld.r > 3.9, "C-m [informational]: with the menu alpha the marked entry on the highlight bar is under 4.5:1 (4.20:1, the state before)");
+        check (dimBar.r >= 4.5, "C-m: a marked Backend entry on the highlight bar has contrast 4.5:1 or better (5.1:1; teeth: CAPS_NO_HILITE_LIFT gives 4.20:1)");
+        check (normBar.r - dimBar.r >= 4.0 && dimBar.back == normBar.back,
+               "C-m: on the same highlight bar the marked entry stays clearly weaker than a listed one (listed minus marked at least 4.00 contrast points; 11.0:1 against 5.1:1)");
+    }
+
+    // C-f, C-g: processor and editor against a listener that lists {sa3, ace}; backend 5 (HeartMuLa) selected.
+    {
+        BsHttpStub http;
+        http.statusBody = kStatus;
+        http.backendsBody = R"({"activeId":"sa3","backends":[{"id":"sa3"},{"id":"ace"}]})";
+        const bool up = http.start ("sa3") && http.port != 3001 && http.port != 8085;
+        const auto backendOf = [] (HotStepLinkProcessor& q) { return juce::roundToInt (q.apvts.getRawParameterValue ("backend")->load()); };
+        const auto states = [] (HotStepLinkEditor& e)
+        {
+            juce::String t;
+            for (int i = 0; i < P::kBackendChoices; ++i)
+                t << (e.backendBoxForTest().isItemEnabled (i + 1) ? "1" : "0");
+            return t;
+        };
+        const auto marks = [] (HotStepLinkEditor& e)
+        {
+            juce::String t;
+            for (int i = 0; i < P::kBackendChoices; ++i)
+                t << (e.backendItemMarkedForTest (i) ? "1" : "0");
+            return t;
+        };
+        juce::MemoryBlock mb;
+        P::GenSettings live;
+        {
+            auto p = std::make_unique<HotStepLinkProcessor>();
+            if (auto* bp = p->apvts.getParameter ("backend"))
+                bp->setValueNotifyingHost (bp->convertTo0to1 (5.0f));
+            auto ed = std::make_unique<HotStepLinkEditor> (*p);
+            ed->runRefreshForTest();
+            const auto before = states (*ed);
+            const unsigned dimBefore = ed->roleDimmedForTest();
+            const auto marksBefore = marks (*ed);
+            std::printf ("  C-g before any server: items enabled=%s (want 111111) marked=%s (want 000000) dimmed mask=%u (want 0) text '%s' (want 'HeartMuLa')%c",
+                         before.toRawUTF8(), marksBefore.toRawUTF8(), dimBefore, ed->backendBoxForTest().getText().toRawUTF8(), 10);
+            check (before == "111111" && marksBefore == "000000" && dimBefore == 0 && ed->backendBoxForTest().getText() == "HeartMuLa",
+                   "C-g [informational, no teeth]: with no list every item is enabled, none is marked and no card is dimmed");
+            p->daw.listBackends = true;
+            const bool urlOk = p->setServerUrl (http.url());
+            const bool known = waitFor ([&] { const auto s = p->daw.getSnapshot(); return s.online && s.backendsKnown; }, 12.0);
+            ed->runRefreshForTest();
+            const auto snap = p->daw.getSnapshot();
+            const auto after = states (*ed);
+            const unsigned dim = ed->roleDimmedForTest();
+            const auto text = ed->backendBoxForTest().getText();
+            const auto tip = ed->backendBoxForTest().getTooltip();
+            const int param = backendOf (*p);
+            const auto marked = marks (*ed);
+            juce::String idTable;
+            for (int i = 0; i < P::kBackendChoices; ++i)
+                idTable << (i > 0 ? "|" : "") << P::backendIdForIndex (i);
+            std::printf ("  C-g listener up=%d url set=%d online+list=%d ids='%s': items enabled=%s (want 111111) marked=%s (want 001011 over '%s') dimmed mask=%u (want 26 = cards 1, 3, 4) text '%s' (want 'HeartMuLa')%c",
+                         (int) up, (int) urlOk, (int) known, snap.backendIds.joinIntoString (",").toRawUTF8(), after.toRawUTF8(), marked.toRawUTF8(),
+                         idTable.toRawUTF8(), dim, text.toRawUTF8(), 10);
+            std::printf ("  C-g tooltip: '%s'%c", tip.replace ("\n", " / ").toRawUTF8(), 10);
+            check (up && urlOk && known && after == "111111", "C-g: all 6 Backend items stay enabled (111111) for the list {sa3, ace} (teeth: CAPS_ITEMS_DISABLED)");
+            check (up && urlOk && known && marked == "001011" && idTable == "|sa3|yue2|ace|minimax-m3|heartmula",
+                   "C-g: the Backend items are marked as 001011 (YuE2, MiniMax-M3, HeartMuLa) for the list {sa3, ace} (teeth: CAPS_SKIP_APPLY, CAPS_ITEMS_DISABLED)");
+            check (known && dim == 26u, "C-g: role cards 1, 3 and 4 (YuE2, MiniMax-M3, HeartMuLa) are dimmed, mask 26 (teeth: CAPS_SKIP_APPLY)");
+            check (known && text == "HeartMuLa"
+                       && tip == "Selected: HeartMuLa: not available on this server.\nDimmed: not available on this server, can still be picked (YuE2, MiniMax-M3, HeartMuLa).",
+                   "C-g: the shown text stays HeartMuLa and the tooltip says it is not available (teeth: CAPS_SKIP_APPLY, CAPS_AUTO_RESET)");
+            std::printf ("  C-f backend parameter after the list arrived: %d (want 5), id '%s' (want 'heartmula')%c", param, p->getSelectedBackendId().toRawUTF8(), 10);
+            check (known && param == 5 && p->getSelectedBackendId() == "heartmula", "C-f: the backend parameter is still 5 with a list that does not have it (teeth: CAPS_AUTO_RESET)");
+            p->getStateInformation (mb);
+            live = p->captureSettings();
+            ed.reset();
+        }
+        {
+            HotStepLinkProcessor q;
+            q.setStateInformation (mb.getData(), (int) mb.getSize());
+            const int loaded = backendOf (q);
+            const auto round = P::GenSettings::fromTree (live.toTree ("S"));
+            HotStepLinkProcessor r;
+            r.applySettings (round);
+            std::printf ("  C-f saved state (%d bytes) loaded into a fresh processor: backend %d (want 5); GenSettings captured %d, after the tree round trip %d, applied to a fresh processor %d (want 5 5 5)%c",
+                         (int) mb.getSize(), loaded, live.backend, round.backend, backendOf (r), 10);
+            check (loaded == 5, "C-f: the saved and reloaded state still has backend 5 (teeth: CAPS_AUTO_RESET)");
+            check (live.backend == 5 && round.backend == 5 && backendOf (r) == 5, "C-f: the GenSettings round trip still has backend 5 (teeth: CAPS_AUTO_RESET)");
+        }
+        // C-k: an unlisted entry is picked from the menu. The pick goes through the combo
+        // (setSelectedId with a notification, as a menu click does); a menu never returns
+        // a disabled item, so the pick is made only when the item is enabled.
+        {
+            juce::MemoryBlock mb2;
+            auto p = std::make_unique<HotStepLinkProcessor>();
+            if (auto* bp = p->apvts.getParameter ("backend"))
+                bp->setValueNotifyingHost (bp->convertTo0to1 (1.0f)); // sa3, listed
+            auto ed = std::make_unique<HotStepLinkEditor> (*p);
+            p->daw.listBackends = true;
+            const bool urlOk = p->setServerUrl (http.url());
+            const bool known = waitFor ([&] { const auto s = p->daw.getSnapshot(); return s.online && s.backendsKnown; }, 12.0);
+            ed->runRefreshForTest();
+            auto& box = ed->backendBoxForTest();
+            const int paramBefore = backendOf (*p);
+            const auto marksStart = marks (*ed);
+            const bool amberBefore = box.isColourSpecified (juce::ComboBox::textColourId);
+            const bool pickable = box.isItemEnabled (3); // id 3 = index 2 = yue2, not in the list
+            if (pickable)
+                box.setSelectedId (3, juce::sendNotificationSync);
+            const int paramPicked = backendOf (*p);
+            ed->runRefreshForTest();
+            const int paramAfter = backendOf (*p);
+            const auto enabledAfter = states (*ed);
+            const auto marksAfter = marks (*ed);
+            const bool amberAfter = box.isColourSpecified (juce::ComboBox::textColourId);
+            std::printf ("  C-k url set=%d online+list=%d: backend %d (want 1) marked=%s (want 001011) amber text=%d (want 0); item id 3 pickable=%d (want 1)%c",
+                         (int) urlOk, (int) known, paramBefore, marksStart.toRawUTF8(), (int) amberBefore, (int) pickable, 10);
+            std::printf ("  C-k after the pick: backend %d (want 2), after a refresh %d (want 2) id '%s' (want 'yue2') text '%s' (want 'YuE2') enabled=%s (want 111111) marked=%s (want 001011) amber text=%d (want 1)%c",
+                         paramPicked, paramAfter, p->getSelectedBackendId().toRawUTF8(), box.getText().toRawUTF8(), enabledAfter.toRawUTF8(),
+                         marksAfter.toRawUTF8(), (int) amberAfter, 10);
+            check (known && paramBefore == 1 && pickable && paramPicked == 2,
+                   "C-k: picking the unlisted YuE2 entry in the Backend menu sets the backend parameter to 2 (teeth: CAPS_ITEMS_DISABLED)");
+            check (known && paramAfter == 2 && p->getSelectedBackendId() == "yue2" && box.getText() == "YuE2",
+                   "C-k: the picked unlisted backend is still 2 after a refresh with the list (teeth: CAPS_ITEMS_DISABLED, CAPS_AUTO_RESET)");
+            check (known && enabledAfter == "111111" && marksStart == "001011" && marksAfter == "001011" && ! amberBefore && amberAfter,
+                   "C-k: the marks stay 001011 before and after the pick, all items enabled, and the picker text turns amber (teeth: CAPS_SKIP_APPLY, CAPS_ITEMS_DISABLED)");
+            p->getStateInformation (mb2);
+            ed.reset();
+            p.reset();
+            HotStepLinkProcessor q;
+            q.setStateInformation (mb2.getData(), (int) mb2.getSize());
+            std::printf ("  C-k saved state (%d bytes) loaded into a fresh processor: backend %d (want 2)%c", (int) mb2.getSize(), backendOf (q), 10);
+            check (backendOf (q) == 2, "C-k: the saved and reloaded state has the picked backend 2 (teeth: CAPS_ITEMS_DISABLED, CAPS_AUTO_RESET)");
+        }
+        http.stop();
+    }
+
+    // C-n: a body captured from a real engine (GET /api/backends, HTTP 200, 427 bytes),
+    // committed as tests/fixtures/backends_real_3021.json. It goes through the real parser,
+    // then through a listener, the real worker and the real editor marking. The real ids
+    // are lower-case and clean and all five are listed, so nothing is marked; "variant" is
+    // NOT a real body: it is the same text with HeartMuLa's entry taken out and the other
+    // ids re-cased and padded, so that marking and the id clean-up have something to bite on.
+    // HSLINK_BACKENDS_BODY_FILE=<path> runs one more body from that file (no fixed want:
+    // the marks are checked against the parsed ids). Teeth: CAPS_RAW_IDS, CAPS_WRONG_FIELD.
+    {
+        const auto fixture = juce::File (juce::String (HSLINK_FIXTURE_DIR)).getChildFile ("backends_real_3021.json");
+        const auto real = fixture.loadFileAsString();
+        const auto top = juce::JSON::parse (real);
+        const auto* arr = top["backends"].getArray();
+        juce::String rawIds;
+        int objs = 0;
+        if (arr != nullptr)
+            for (auto& b : *arr)
+            {
+                objs += b.isObject() ? 1 : 0;
+                rawIds << (rawIds.isEmpty() ? "" : "|") << "[" << b["id"].toString() << "]";
+            }
+        std::printf ("  C-n fixture %s: %d bytes (want 427) top-level object=%d backends array=%d entries=%d objects=%d (want 5 5) activeId '%s'%c",
+                     fixture.getFileName().toRawUTF8(), (int) fixture.getSize(), (int) top.isObject(), (int) (arr != nullptr),
+                     arr != nullptr ? arr->size() : -1, objs, top["activeId"].toString().toRawUTF8(), 10);
+        std::printf ("  C-n fixture ids exactly as sent, in brackets: %s (want [ace]|[minimax-m3]|[yue2]|[sa3]|[heartmula])%c", rawIds.toRawUTF8(), 10);
+        check (fixture.getSize() == 427 && top.isObject() && arr != nullptr && arr->size() == 5 && objs == 5
+                   && rawIds == "[ace]|[minimax-m3]|[yue2]|[sa3]|[heartmula]",
+               "C-n [informational, no teeth]: the committed real body is 427 bytes, an object with a backends array of 5 objects, ids lower-case and unpadded");
+
+        auto variant = real.replace (R"(,{"id":"heartmula","displayName":"HeartMuLa","resourcePool":"gpu","active":false})", "")
+                           .replace (R"("id":"ace")", R"("id":"ACE")").replace (R"("id":"minimax-m3")", R"("id":" MiniMax-M3 ")")
+                           .replace (R"("id":"yue2")", R"("id":"YuE2")").replace (R"("id":"sa3")", R"("id":"SA3 ")");
+        std::printf ("  C-n variant (NOT a real body): %d bytes, %d fewer than the real one (want 78 fewer: 81 for the entry, 3 spaces added)%c",
+                     variant.length(), real.length() - variant.length(), 10);
+        check (real.length() - variant.length() == 78, "C-n [informational, no teeth]: the variant was built from the real text (HeartMuLa's entry out, four ids re-cased or padded)");
+
+        const auto backendOf = [] (HotStepLinkProcessor& q) { return juce::roundToInt (q.apvts.getRawParameterValue ("backend")->load()); };
+        const auto runBody = [&] (const juce::String& what, const juce::String& body, bool exact, const char* wantIds, int wantCount,
+                                  const char* wantListed, const char* wantMarked, unsigned wantDim, const char* teethText)
+        {
+            const auto tag = "C-n " + what + ": ";
+            // 1. The real parser.
+            const auto l = DawWorker::parseBackendList (200, body);
+            const auto listed = availStr (l.known, l.ids);
+            const int nListed = listed.retainCharacters ("1").length();
+            std::printf ("  %sparsed known=%d ids=%d '%s'", tag.toRawUTF8(), (int) l.known, l.ids.size(), l.ids.joinIntoString (",").toRawUTF8());
+            if (exact)
+                std::printf (" (want 1 %d '%s')", wantCount, wantIds);
+            std::printf ("; listed by index 0..5 = %s = %d of 6", listed.toRawUTF8(), nListed);
+            if (exact)
+                std::printf (" (want %s)", wantListed);
+            std::printf ("%c", 10);
+            if (exact)
+            {
+                check (l.known && l.ids.size() == wantCount && l.ids.joinIntoString (",") == wantIds,
+                       (tag + "the parser gives exactly the " + juce::String (wantCount) + " ids '" + wantIds + "' " + teethText).toRawUTF8());
+                check (listed == wantListed, (tag + "the six choices are listed as " + wantListed + " (Auto, SA3, YuE2, ACE, MiniMax-M3, HeartMuLa) " + teethText).toRawUTF8());
+            }
+            // 2. Listener, worker, editor. HeartMuLa (5) is selected before the list arrives.
+            BsHttpStub http;
+            http.statusBody = kStatus;
+            http.backendsBody = body;
+            const int banned[] = { 3001, 3011, 8085, 8087, 3021, 8187 };
+            bool up = http.start ("ace");
+            for (int b : banned)
+                up = up && http.port != b;
+            auto p = std::make_unique<HotStepLinkProcessor>();
+            if (auto* bp = p->apvts.getParameter ("backend"))
+                bp->setValueNotifyingHost (bp->convertTo0to1 (5.0f));
+            auto ed = std::make_unique<HotStepLinkEditor> (*p);
+            p->daw.listBackends = true;
+            const bool urlOk = up && p->setServerUrl (http.url());
+            const bool online = waitFor ([&] { return p->daw.getSnapshot().online && http.gets.load() >= 1; }, 12.0);
+            waitFor ([&] { return p->daw.getSnapshot().backendsKnown; }, l.known ? 12.0 : 1.0);
+            ed->runRefreshForTest();
+            const auto snap = p->daw.getSnapshot();
+            auto& box = ed->backendBoxForTest();
+            juce::String enabled, marked;
+            for (int i = 0; i < P::kBackendChoices; ++i)
+            {
+                enabled << (box.isItemEnabled (i + 1) ? "1" : "0");
+                marked << (ed->backendItemMarkedForTest (i) ? "1" : "0");
+            }
+            const unsigned dim = ed->roleDimmedForTest();
+            const int nMarked = marked.retainCharacters ("1").length();
+            const int paramAfterList = backendOf (*p);
+            const auto idAfterList = p->getSelectedBackendId();
+            const auto textAfterList = box.getText();
+            // The marks the parsed list asks for, worked out here: bit i set = choice i unlisted.
+            juce::String wantFromList;
+            unsigned dimFromList = 0;
+            for (int i = 0; i < P::kBackendChoices; ++i)
+            {
+                const bool off = listed[i] == '0';
+                wantFromList << (off ? "1" : "0");
+                if (off && i > 0)
+                    dimFromList |= 1u << (i - 1);
+            }
+            std::printf ("  %slistener up=%d url set=%d online=%d GET /api/backends=%d snapshot known=%d ids='%s'%c", tag.toRawUTF8(), (int) up, (int) urlOk, (int) online,
+                         http.gets.load(), (int) snap.backendsKnown, snap.backendIds.joinIntoString (",").toRawUTF8(), 10);
+            std::printf ("  %smenu enabled=%s (want 111111) marked=%s = %d of 6 (want %s) role cards dimmed mask=%u (want %u) listed count=%d%c", tag.toRawUTF8(),
+                         enabled.toRawUTF8(), marked.toRawUTF8(), nMarked, exact ? wantMarked : wantFromList.toRawUTF8(), dim, exact ? wantDim : dimFromList, nListed, 10);
+            check (urlOk && online && snap.backendIds.joinIntoString (",") == l.ids.joinIntoString (",") && snap.backendsKnown == l.known
+                       && (! exact || (snap.backendsKnown && snap.backendIds.joinIntoString (",") == wantIds)),
+                   (tag + "the worker's snapshot holds the same ids after 1 real GET " + (exact ? teethText : "[informational, no teeth]")).toRawUTF8());
+            check (urlOk && online && marked == (exact ? juce::String (wantMarked) : wantFromList) && dim == (exact ? wantDim : dimFromList) && marked[0] == '0',
+                   (tag + "menu marks " + (exact ? juce::String (wantMarked) : wantFromList) + " and card mask " + juce::String (exact ? wantDim : dimFromList)
+                    + ", Auto never marked " + (exact ? teethText : "[informational, no teeth]")).toRawUTF8());
+            // 3. Selection untouched by the list; every entry enabled and pickable.
+            std::printf ("  %sselected before the list 5 'heartmula'; after it: parameter %d id '%s' text '%s' (want 5 'heartmula' 'HeartMuLa')%c", tag.toRawUTF8(),
+                         paramAfterList, idAfterList.toRawUTF8(), textAfterList.toRawUTF8(), 10);
+            check (urlOk && online && paramAfterList == 5 && idAfterList == "heartmula" && textAfterList == "HeartMuLa",
+                   (tag + "the selected backend is still 5 (HeartMuLa) after the list arrived (teeth: CAPS_AUTO_RESET where it is unlisted)").toRawUTF8());
+            int picked = 0;
+            juce::String pickLog;
+            for (int i = 0; i < P::kBackendChoices; ++i)
+            {
+                if (box.isItemEnabled (i + 1))
+                    box.setSelectedId (i + 1, juce::sendNotificationSync);
+                ed->runRefreshForTest();
+                const int got = backendOf (*p);
+                picked += got == i ? 1 : 0;
+                pickLog << (i > 0 ? "," : "") << got;
+            }
+            std::printf ("  %spicking menu ids 1..6 in turn, a refresh after each: parameter %s (want 0,1,2,3,4,5) = %d of 6 picked%c", tag.toRawUTF8(), pickLog.toRawUTF8(), picked, 10);
+            check (urlOk && online && enabled == "111111" && picked == 6,
+                   (tag + "all 6 entries are enabled and each one can be picked and stays picked (teeth: CAPS_ITEMS_DISABLED, CAPS_AUTO_RESET where one is unlisted)").toRawUTF8());
+            ed.reset();
+            p.reset();
+            http.stop();
+        };
+        runBody ("real body", real, true, "ace,minimax-m3,yue2,sa3,heartmula", 5, "111111", "000000", 0u,
+                 "(teeth: CAPS_WRONG_FIELD; CAPS_RAW_IDS cannot bite here, the real ids are already clean)");
+        runBody ("variant, not real", variant, true, "ace,minimax-m3,yue2,sa3", 4, "111110", "000001", 16u, "(teeth: CAPS_RAW_IDS, CAPS_WRONG_FIELD)");
+        const auto envPath = juce::SystemStats::getEnvironmentVariable ("HSLINK_BACKENDS_BODY_FILE", {});
+        if (envPath.isNotEmpty())
+        {
+            const juce::File f (envPath);
+            std::printf ("  C-n HSLINK_BACKENDS_BODY_FILE: '%s' exists=%d %d bytes%c", f.getFileName().toRawUTF8(), (int) f.existsAsFile(), (int) f.getSize(), 10);
+            check (f.existsAsFile() && f.getSize() > 0, "C-n: the file named by HSLINK_BACKENDS_BODY_FILE exists and is not empty");
+            if (f.existsAsFile())
+                runBody ("env file body", f.loadFileAsString(), false, "", 0, "", "", 0u, "");
+        }
+    }
+
+    // C-h: the parameter contract. Passes on the code before the change: informational.
+    {
+        HotStepLinkProcessor p;
+        auto* c = dynamic_cast<juce::AudioParameterChoice*> (p.apvts.getParameter ("backend"));
+        const auto names = c != nullptr ? c->choices.joinIntoString ("|") : juce::String ("(none)");
+        const int def = c != nullptr ? juce::roundToInt (c->convertFrom0to1 (static_cast<juce::RangedAudioParameter*> (c)->getDefaultValue())) : -1;
+        std::printf ("  C-h backend choices=%d '%s' default index=%d (want 6 'Auto|SA3|YuE2|ACE|MiniMax-M3|HeartMuLa' 0), kBackendChoices=%d%c",
+                     c != nullptr ? c->choices.size() : -1, names.toRawUTF8(), def, (int) P::kBackendChoices, 10);
+        check (c != nullptr && c->choices.size() == 6 && names == "Auto|SA3|YuE2|ACE|MiniMax-M3|HeartMuLa" && def == 0 && P::kBackendChoices == 6,
+               "C-h [informational, no teeth]: 6 choices, the names and order as before, default Auto");
+    }
+    DawWorker::testCapsMutant = DawWorker::capsMutNone;
+}
+
 // The job card header and the queue row show the same word for a job. Both come from
 // DawJob::label; the header is DawJob::headline, "Job " + that word. Every DawJob::State is
 // walked, then the flag cases. The one stated difference: during a backend switch the
@@ -11842,10 +13024,37 @@ static void testMainLayoutFit()
     std::printf ("Main editor layout fit%c", 10);
     HotStepLinkProcessor p;
     HotStepLinkEditor ed (p);
+    // Quantize combo in the export row at the default size (KNOWN_ISSUES: was clipped to "Q...").
+    // Teeth: HSLINK_TEETH=QB_OLD restores the pre-ac7e6c7 sizing (72 px cap, slider sized first).
+    {
+        HotStepLinkEditor::testOldQuantLayout = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "QB_OLD";
+        ed.setSize (1182, 760);
+        ed.resized();
+        const auto& box = ed.quantizeBoxForTest();
+        const auto qb = ed.quantizeBoundsForTest(), sl = ed.quantStrengthBoundsForTest(), mm = ed.midiMenuBoundsForTest(), md = ed.midiDragBoundsForTest();
+        const auto font = ed.getLookAndFeel().getComboBoxFont (const_cast<juce::ComboBox&> (box));
+        float longest = 0.0f; juce::String longestItem;
+        for (int i = 0; i < box.getNumItems(); ++i)
+        {
+            juce::GlyphArrangement g;
+            g.addLineOfText (font, box.getItemText (i), 0.0f, 0.0f);
+            const float tw = g.getBoundingBox (0, -1, true).getWidth();
+            if (tw > longest) { longest = tw; longestItem = box.getItemText (i); }
+        }
+        // positionComboBoxText: label is w-17 wide with a 4 px left border; the arrow takes the rest.
+        const float need = longest + 4.0f + 17.0f;
+        std::printf ("  Q combo at %d x %d: x=%d w=%d, longest '%s' %.1f px + 21 px border/arrow = %.1f px need; slider x=%d..%d, menu x=%d..%d, drag x=%d..%d%c",
+                     ed.getWidth(), ed.getHeight(), qb.getX(), qb.getWidth(), longestItem.toRawUTF8(), longest, need, sl.getX(), sl.getRight(), mm.getX(), mm.getRight(), md.getX(), md.getRight(), 10);
+        check (qb.getWidth() >= 80, "Q combo at least 80 px wide at the default size");
+        check (need <= (float) qb.getWidth(), "longest Q item plus arrow fits in the combo");
+        check (! qb.intersects (sl) && ! qb.intersects (mm) && ! qb.intersects (md) && mm.getRight() <= qb.getX() && qb.getRight() <= sl.getX(),
+               "Q combo overlaps none of its export-row neighbours");
+        HotStepLinkEditor::testOldQuantLayout = false;
+    }
     juce::GlyphArrangement ga;
     ga.addLineOfText (juce::Font (juce::FontOptions (QueueListComponent::kEmptyHintFontH)), QueueListComponent::kEmptyHint, 0.0f, 0.0f);
     const float hintW = ga.getBoundingBox (0, -1, true).getWidth();
-    const struct { int w, h; } sizes[] = { { 980, 640 }, { 1080, 760 }, { 1400, 640 }, { 1400, 900 } };
+    const struct { int w, h; } sizes[] = { { 980, 640 }, { 1182, 760 }, { 1400, 640 }, { 1400, 900 } };
     for (const auto& z : sizes)
     {
         ed.setSize (z.w, z.h);
@@ -11868,8 +13077,8 @@ static void testMainLayoutFit()
     // part is whole, inside the middle plate, and nothing in it overlaps.
     const auto* cs = ed.getConstrainer();
     const int minW = cs->getMinimumWidth(), minH = cs->getMinimumHeight();
-    std::printf ("  minimum window %d x %d (want 1080 x 760)%c", minW, minH, 10);
-    check (minW == 1080 && minH == 760, "minimum window is 1080 x 760");
+    std::printf ("  minimum window %d x %d (want 1182 x 760)%c", minW, minH, 10);
+    check (minW == 1182 && minH == 760, "minimum window is 1182 x 760");
     const auto previewFits = [&ed] (int w, int h, const juce::String& what)
     {
         ed.setSize (w, h);
@@ -11902,16 +13111,16 @@ static void testMainLayoutFit()
     ed.setSize (minW, minH - 1);
     std::printf ("  one pixel shorter: card h=%d, wave h=%d (want 59, 0)%c", ed.previewCardForTest().getHeight(), ed.previewWaveForTest().getHeight(), 10);
     check (ed.previewCardForTest().getHeight() == minH - 701 && ed.previewWaveForTest().isEmpty(), "one pixel under the minimum height loses the waveform");
-    previewFits (1180, 760, "default");
+    previewFits (1182, 760, "default");
     previewFits (1400, 900, "large");
 
     // An old session: the host offers the old size, the wrappers clamp it with this constrainer.
     const struct { int w, h; } old[] = { { 980, 640 }, { 800, 500 }, { 1079, 900 }, { 1300, 700 } };
     for (const auto& z : old)
     {
-        ed.setSize (1180, 760);
+        ed.setSize (1182, 760);
         ed.getConstrainer()->setBoundsForComponent (&ed, { 0, 0, z.w, z.h }, false, false, false, false);
-        const int wantW = juce::jmax (z.w, 1080), wantH = juce::jmax (z.h, 760);
+        const int wantW = juce::jmax (z.w, 1182), wantH = juce::jmax (z.h, 760);
         std::printf ("  old size %d x %d reopens at %d x %d (want %d x %d)%c", z.w, z.h, ed.getWidth(), ed.getHeight(), wantW, wantH, 10);
         check (ed.getWidth() == wantW && ed.getHeight() == wantH, "old window size is raised to the minimum");
         previewFits (ed.getWidth(), ed.getHeight(), "reopened " + juce::String (z.w) + "x" + juce::String (z.h));
@@ -11930,9 +13139,9 @@ static void testMainLayoutFit()
         const auto url = loaded.getSavedServerUrl();
         const float lm = loaded.apvts.getRawParameterValue ("levelMatch")->load();
         const bool sizeInState = blob.toString().contains ("editorWidth");
-        std::printf ("  restored url='%s' levelMatch=%.1f, new editor %d x %d (want 1180 x 760)%c", url.toRawUTF8(), lm, reopened.getWidth(), reopened.getHeight(), 10);
+        std::printf ("  restored url='%s' levelMatch=%.1f, new editor %d x %d (want 1182 x 760)%c", url.toRawUTF8(), lm, reopened.getWidth(), reopened.getHeight(), 10);
         check (url == "http://127.0.0.1:18999" && lm > 0.5f && ! sizeInState, "restored state keeps server URL and Level match");
-        check (reopened.getWidth() == 1180 && reopened.getHeight() == 760, "restored state opens at the default size");
+        check (reopened.getWidth() == 1182 && reopened.getHeight() == 760, "restored state opens at the default size");
     }
 }
 
@@ -12020,11 +13229,16 @@ void testLiveness (const juce::File& tmpDir)
 
     // L-a: one good heartbeat, then the status request is answered 404 for good while the
     // job poll keeps coming back 200. Time limit 3000 ms, polls about every 1100 ms.
+    // Starvation guard: if the first try came up short on late samples only (every sample
+    // online) and the sampler slept far longer than asked (mean spacing over 1000 ms for a
+    // 250 ms sleep), the whole of L-a runs once more with a 60 s cap. The retry is judged
+    // by the same checks; a worker that goes offline never gets a retry.
+    for (int laTry = 0; laTry < 2; ++laTry)
     {
         // watchMs is the minimum watch; past it the watch runs on (to capMs at most) until
         // minLate samples later than limit + 500 ms are in. A starved sampler thread (load) can
         // sleep through seconds of the window, so a fixed deadline alone gave too few samples.
-        const int limitMs = 3000, watchMs = 6500, capMs = 20000, minLate = 8;
+        const int limitMs = 3000, watchMs = 6500, capMs = laTry == 0 ? 20000 : 60000, minLate = 8;
         LvHttpStub http;
         http.statusOkLeft = 1;
         const bool up = http.start();
@@ -12070,6 +13284,14 @@ void testLiveness (const juce::File& tmpDir)
         std::printf ("  L-a samples=%d offline=%d (want 0) first offline at +%lld ms (-1 = never, want -1); samples later than +%d ms: %d, online in %d of them (want all, at least %d; watch ran to +%lld ms, at least %d, cap %d); status 200=%d (want 1) status GETs=%d (want at least 2) polls 200=%d (want at least 3) last OK moved by %lld ms (want over %d) heartbeatsOk=%d (want 1) model='%s' backend='%s' (want m1 sa3)\n",
                      samples, offlineSamples, (long long) firstOfflineAge, limitMs + 500, lateSamples, lateOnline, minLate, (long long) (lvNow() - s0.lastOkMs), watchMs, capMs, http.statusOk.load(), http.status.load(),
                      http.pollsOk.load(), (long long) (s1.lastOkMs - s0.lastOkMs), limitMs, s1.heartbeatsOk, model.toRawUTF8(), backend.toRawUTF8());
+        const double laSpacing = samples > 0 ? (double) (lvNow() - s0.lastOkMs) / samples : 0.0;
+        std::printf ("  L-a try %d: mean sample spacing %.0f ms (asked 250 ms; starved over 1000 ms)%c", laTry + 1, laSpacing, 10);
+        if (laTry == 0 && t >= 0.0 && s0.online && samples > 0 && offlineSamples == 0 && lateOnline == lateSamples
+            && lateSamples < minLate && laSpacing > 1000.0)
+        {
+            std::printf ("  L-a sampler starved (%d late samples of %d): retrying L-a once with a 60000 ms cap%c", lateSamples, minLate, 10);
+            continue;
+        }
         if (! (t >= 0.0 && s0.online && samples > 0))
         {
             std::printf ("  L-a diag: waited up to 10 s for the worker to go online from 1 status answer: online after %.2f s (-1 = never), online=%d, heartbeatsOk=%d, status GETs=%d, samples taken=%d%c",
@@ -12087,6 +13309,7 @@ void testLiveness (const juce::File& tmpDir)
             counted (s1.heartbeatsOk == 1 && model == "m1" && backend == "sa3",
                      "L-a heartbeatsOk is still 1 and the status fields are those of the one heartbeat");
         }
+        break;
     }
     if (lvOnlyLa)
         return;
@@ -12134,6 +13357,9 @@ void testLiveness (const juce::File& tmpDir)
     // L-b: one good heartbeat and a good submit, then status 404 and every poll HTTP 500.
     // Time limit 3000 ms, failure limit 2. The failed polls must not move the last-good
     // time (offline at the limit) and must not count as failures (not offline before it).
+    // Starvation guard: a first try with under 10 samples before +2500 ms and no failure,
+    // drift or early offline seen runs once more; the retry is judged by the same checks.
+    for (int lbTry = 0; lbTry < 2; ++lbTry)
     {
         const int limitMs = 3000;
         LvHttpStub http;
@@ -12144,13 +13370,21 @@ void testLiveness (const juce::File& tmpDir)
         mkWorker (w, http, tmpDir.getChildFile ("lv_takes_b"), limitMs, 2);
         w.start();
         const double t = secondsUntil (w, true, 10.0);
+        const auto preSubmitOk = w.getSnapshot().lastOkMs;
         const int id = w.submitGenerate (lvReq());
         const bool submitted = lvWaitCount (http.submits, 1, 8000);
-        juce::Thread::sleep (200); // the worker has read the submit answer
-        const auto s0 = w.getSnapshot(); // the submit's 200 is the last good response
+        // No sleep and no printing before sampling: wait in short steps only until the
+        // worker has read the submit answer (the last-good time moves), then sample at once.
+        auto s0 = w.getSnapshot();
+        for (const auto tw = lvNow(); s0.lastOkMs == preSubmitOk && lvNow() - tw < 1000;)
+        {
+            juce::Thread::sleep (5);
+            s0 = w.getSnapshot(); // the submit's 200 is the last good response
+        }
         juce::int64 firstOfflineAge = -1, lastOnlineAge = -1, lastOkDrift = 0;
         int pollsWhileOnline = 0, earlyFailures = 0, earlySamples = 0;
-        std::printf ("  L-b listener 127.0.0.1:%d up=%d: online after %.2f s, job #%d submit answered 200=%d; time limit %d ms, failure limit 2; ms below are since the last good response\n",
+        juce::String lbLog; // diagnostics are buffered and printed after sampling ends
+        lbLog << juce::String::formatted ("  L-b listener 127.0.0.1:%d up=%d: online after %.2f s, job #%d submit answered 200=%d; time limit %d ms, failure limit 2; ms below are since the last good response\n",
                      http.port, (int) up, t, id, (int) submitted, limitMs);
         int lastPrinted = -1;
         while (lvNow() - s0.lastOkMs < 9000)
@@ -12167,7 +13401,7 @@ void testLiveness (const juce::File& tmpDir)
             if (polls != lastPrinted || ! s.online)
             {
                 lastPrinted = polls;
-                std::printf ("    L-b +%lld ms online=%d failures=%d last OK moved %lld ms; listener: polls answered 500=%d status GETs=%d (200: %d)\n",
+                lbLog << juce::String::formatted ("    L-b +%lld ms online=%d failures=%d last OK moved %lld ms; listener: polls answered 500=%d status GETs=%d (200: %d)\n",
                              (long long) age, (int) s.online, s.consecutiveFailures, (long long) (s.lastOkMs - s0.lastOkMs), polls,
                              http.status.load(), http.statusOk.load());
             }
@@ -12182,9 +13416,16 @@ void testLiveness (const juce::File& tmpDir)
         }
         w.stop();
         http.stop();
+        std::fputs (lbLog.toRawUTF8(), stdout);
         std::printf ("  L-b failed polls while online=%d (want at least 2) polls 200=%d (want 0); samples before +%d ms: %d, highest failures in a row there=%d (want 0); last OK moved by at most %lld ms (want 0); last online sample +%lld ms, first offline sample +%lld ms (-1 = never; want over %d and at most %d)\n",
                      pollsWhileOnline, http.pollsOk.load(), limitMs - 500, earlySamples, earlyFailures, (long long) lastOkDrift, (long long) lastOnlineAge,
                      (long long) firstOfflineAge, limitMs, limitMs + 3000);
+        if (lbTry == 0 && earlySamples < 10 && earlyFailures == 0 && lastOkDrift == 0
+            && (firstOfflineAge < 0 || firstOfflineAge > limitMs))
+        {
+            std::printf ("  L-b sampler starved (%d samples before +%d ms, want 10): retrying L-b once%c", earlySamples, limitMs - 500, 10);
+            continue;
+        }
         counted (up && t >= 0.0 && s0.online && submitted && pollsWhileOnline >= 2 && http.pollsOk.load() == 0,
                  "L-b online from one status answer, the submit accepted, at least 2 polls answered 500 while online [setup, informational]");
         counted (lastOkDrift == 0, "L-b a poll answered HTTP 500 does not move the last-good time (teeth: mutation, good = any HTTP code)");
@@ -12193,6 +13434,7 @@ void testLiveness (const juce::File& tmpDir)
         counted (firstOfflineAge > limitMs, "L-b not earlier: the first offline sample is later than the 3000 ms limit (teeth: mutation, a failed request counts)");
         counted (firstOfflineAge >= 0 && firstOfflineAge <= limitMs + 3000,
                  "L-b not never: offline within 3000 ms after the limit (teeth: mutation, good = any HTTP code)");
+        break;
     }
 
     // L-c: status never answers 200; the submit and the polls do. Good responses alone
@@ -13173,6 +14415,464 @@ namespace TempoTest
     }
 }
 
+// tempofix (round 1, tests only): H1 and M1 of the TempoMeasure review.
+// A (H1): a take that starts mid-note (a pad at full level from sample 0, no attack)
+// must not get an onset near 0, and the downbeat must sit on the first kick (0.1 beat
+// in at 120 bpm), not on the frame-0 rise of the pad.
+// B (M1): on a drifting drum take the downbeat snap moves the bar start off the fixed
+// lattice. Fixed-grid callers (MidiExport, CollectionStore gridUsable, TempoResolve,
+// PluginProcessor) must read the lattice downbeat: Result::downbeatSec. The lattice is
+// rebuilt here from firstBeatSec plus whole beats; Result::downbeatSnappedSec (for
+// trackBeats only) must be the one the snap moved.
+static void tfKick (std::vector<float>& x, double sr, double t, float amp)
+{
+    const auto s0 = (std::size_t) std::llround (t * sr);
+    const auto len = (std::size_t) (0.12 * sr);
+    for (std::size_t i = 0; i < len && s0 + i < x.size(); ++i)
+    {
+        const double u = (double) i / sr;
+        const double env = std::exp (-u * 30.0);
+        double v = std::sin (2.0 * juce::MathConstants<double>::pi * (55.0 * u + 60.0 * (1.0 - std::exp (-u * 40.0)) / 40.0)) * env;
+        if (i < 64)
+            v += 0.5 * (1.0 - (double) i / 64.0) * ((i & 1) ? 1.0 : -1.0);
+        x[s0 + i] += (float) (amp * v);
+    }
+}
+
+static void testTempoFix()
+{
+    const double sr = 48000.0;
+    const auto n = (std::size_t) (8.0 * sr);
+    const double pi = juce::MathConstants<double>::pi;
+    std::printf ("tempofix: H1 frame-0 rise of a sustained take, M1 snapped downbeat on fixed-grid callers%c", 10);
+    {
+        std::vector<float> x (n, 0.0f);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const double t = (double) i / sr;
+            x[i] = (float) (0.25 * (std::sin (2.0 * pi * 220.0 * t) + std::sin (2.0 * pi * 277.18 * t) + std::sin (2.0 * pi * 329.63 * t)));
+        }
+        const double period = 0.5, firstKick = 0.1 * period;
+        for (double t = firstKick; t < 8.0; t += period)
+            tfKick (x, sr, t, 0.8f);
+        const auto on = TempoMeasure::onsets (x.data(), n, sr);
+        double nearZero = -1.0, nearZeroW = 0.0, strongest = 0.0;
+        for (const auto& o : on)
+        {
+            strongest = std::max (strongest, o.strength);
+            if (o.sec < 0.020 && (nearZero < 0.0 || o.sec < nearZero))
+            {
+                nearZero = o.sec;
+                nearZeroW = o.strength;
+            }
+        }
+        const auto r = TempoMeasure::analyse (x.data(), n, sr);
+        std::printf ("  A onsets=%d first onset under 20 ms at %.4f s (-1 = none, want -1) strength %.3f (strongest %.3f); bpm %.3f level %s downbeat %.4f s, first kick %.4f s, off by %.1f ms (want <= 10)%c",
+                     (int) on.size(), nearZero, nearZeroW, strongest, r.bpm, TempoMeasure::levelName (r.level), r.downbeatSec, firstKick,
+                     1000.0 * (r.downbeatSec - firstKick), 10);
+        check (nearZero < 0.0, "tempofix A: a take that starts mid-note has no onset within 20 ms of 0");
+        check (r.level != TempoMeasure::Level::none && std::abs (r.downbeatSec - firstKick) <= 0.010,
+               "tempofix A: the downbeat is within 10 ms of the first kick, not on the frame-0 rise");
+    }
+    {
+        // Kicks that speed up across 8 s (spread 4, 6, 8 ... 16 bpm around 120): one fixed
+        // lattice cannot sit on them. The first spread where the snap moves the downbeat by
+        // more than 10 ms is the case under test.
+        TempoMeasure::Result r;
+        double lattice = 0.0, moved = 0.0, snap = 0.0, spread = 0.0;
+        for (spread = 4.0; spread <= 16.0; spread += 2.0)
+        {
+            std::vector<float> x (n, 0.0f);
+            double t = 0.0;
+            while (t < 7.9)
+            {
+                tfKick (x, sr, t, 0.8f);
+                t += 60.0 / (120.0 - 0.5 * spread + spread * t / 8.0);
+            }
+            r = TempoMeasure::analyse (x.data(), n, sr);
+            const double period = r.bpm > 0.0 ? 60.0 / r.bpm : 0.5;
+            lattice = r.firstBeatSec + std::round ((r.downbeatSec - r.firstBeatSec) / period) * period;
+            moved = r.downbeatSec - lattice;
+            snap = r.downbeatSnappedSec - lattice;
+            std::printf ("  B spread %.0f bpm: bpm %.3f level %s drift %.1f ms; firstBeat %.4f s, lattice downbeat %.4f s, downbeatSec (fixed-grid callers read it) %.4f s off the lattice by %.1f ms, downbeatSnappedSec %.4f s, snap moved it %.1f ms%c",
+                         spread, r.bpm, TempoMeasure::levelName (r.level), r.driftMs, r.firstBeatSec, lattice, r.downbeatSec, 1000.0 * moved, r.downbeatSnappedSec, 1000.0 * snap, 10);
+            if (r.level != TempoMeasure::Level::none && std::abs (snap) > 0.010)
+                break;
+        }
+        check (r.level != TempoMeasure::Level::none && spread <= 16.0, "tempofix B setup: a drifting take where the snap moves the downbeat by more than 10 ms exists");
+        check (std::abs (moved) <= 0.001, "tempofix B: downbeatSec (what fixed-grid callers read) is the lattice downbeat within 1 ms");
+    }
+    {
+        // C (M2): kick on every beat at 120 bpm, plus a louder bright hi-hat 0.08 beat
+        // before each beat (so it sits before whichever beat the bar class picks). The snap ranks by the low-band curve
+        // within +-2 frames (falling back to o.w when the take has no low band), so the hat (inside
+        // the 0.15-beat window) must not win over the kick.
+        std::vector<float> x (n, 0.0f);
+        const double period = 0.5, off = 0.25 * period;
+        std::uint32_t rng = 0x1234567u;
+        for (int b = 0; off + period * b < 7.8; ++b)
+        {
+            const double t = off + period * b;
+            tfKick (x, sr, t, 0.8f);
+            {
+                const auto s0 = (std::size_t) std::llround ((t - 0.08 * period) * sr);
+                for (std::size_t i = 0; i < (std::size_t) (0.03 * sr) && s0 + i < n; ++i)
+                {
+                    rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                    const double v = ((double) rng / 4294967295.0) * 2.0 - 1.0;
+                    x[s0 + i] += (float) (1.5 * v * std::exp (-(double) i / sr * 80.0) * ((i & 1) ? 1.0 : -1.0));
+                }
+            }
+        }
+        const auto r = TempoMeasure::analyse (x.data(), n, sr);
+        double nearestKick = off, dMin = 1.0e9;
+        for (int b = 0; off + period * b < 7.8; ++b)
+            if (std::abs (r.downbeatSnappedSec - (off + period * b)) < dMin)
+            {
+                dMin = std::abs (r.downbeatSnappedSec - (off + period * b));
+                nearestKick = off + period * b;
+            }
+        std::printf ("  C bpm %.3f level %s lattice downbeat %.4f s, downbeatSnappedSec %.4f s, nearest kick %.4f s, off by %.1f ms (want <= 10)%c",
+                     r.bpm, TempoMeasure::levelName (r.level), r.downbeatSec, r.downbeatSnappedSec, nearestKick, 1000.0 * (r.downbeatSnappedSec - nearestKick), 10);
+        check (r.level != TempoMeasure::Level::none && dMin <= 0.010, "tempofix C (M2): the snapped downbeat sits on the kick, not on a louder hi-hat 0.08 beat early");
+    }
+    {
+        // D (M3): trackBeats takes the first onset within 0.25 period of the lattice, so a
+        // weak ghost just under a 16th early (0.23 beat) beats the strong real beat.
+        const double period = 0.5, realBeat = 1.0;
+        std::vector<double> on;
+        on.push_back (realBeat - 0.23 * period);
+        for (int b = 0; b < 12; ++b)
+            on.push_back (realBeat + period * b);
+        const auto beats = WarpMarkers::trackBeats (on, 120.0, realBeat, 8.0);
+        const double first = beats.empty() ? -1.0 : beats.front();
+        std::printf ("  D ghost %.4f s, real beat %.4f s, first tracked beat %.4f s, off by %.1f ms (want <= 10)%c",
+                     on.front(), realBeat, first, 1000.0 * (first - realBeat), 10);
+        check (! beats.empty() && std::abs (first - realBeat) <= 0.010, "tempofix D (M3): the first tracked beat is the real beat, not a ghost a 16th early");
+    }
+    {
+        // E (H1 gap): a sustained hit exactly at sample 0 (short chord, 2 ms attack, slow
+        // decay, under 3 dB down by 60-80 ms). The 0-20 ms vs 60-80 ms opening test calls
+        // this warm, so the frame-0 rise is lost. Want an onset within 5 ms of 0 and a
+        // downbeat on a bar line. 120 bpm; the chord is re-struck on beat 1 of every bar
+        // (comping on the 1) with a kick under it from bar 2, and lighter kicks on beats
+        // 2 to 4, so the bar start is the strongest low-band hit in every bar. With equal
+        // kicks on every beat nothing marks the bar and the beat-class pick is a coin toss.
+        std::vector<float> x (n, 0.0f);
+        const double attack = 0.002, tau = 1.5;
+        const double period = 0.5, bar = 4.0 * period;
+        for (double t0 = 0.0; t0 < 7.9; t0 += bar)
+        {
+            for (std::size_t i = (std::size_t) std::llround (t0 * sr); i < n; ++i)
+            {
+                const double t = (double) i / sr - t0;
+                const double g = (t < attack ? t / attack : 1.0) * std::exp (-t / tau);
+                x[i] += (float) (0.25 * g * (std::sin (2.0 * pi * 110.0 * t) + std::sin (2.0 * pi * 220.0 * t) + std::sin (2.0 * pi * 277.18 * t) + std::sin (2.0 * pi * 329.63 * t)));
+            }
+        }
+        for (double t = period; t < 7.9; t += period)
+        {
+            const bool onOne = std::abs (t - bar * std::round (t / bar)) < 1.0e-6;
+            tfKick (x, sr, t, onOne ? 0.8f : 0.4f);
+        }
+        const auto w = (std::size_t) (0.020 * sr);
+        double eA = 0.0, eB = 0.0;
+        for (std::size_t i = 0; i < w; ++i)
+        {
+            eA += (double) x[i] * x[i];
+            eB += (double) x[3 * w + i] * x[3 * w + i];
+        }
+        const auto on = TempoMeasure::onsets (x.data(), n, sr);
+        double first = -1.0;
+        for (const auto& o : on)
+            if (first < 0.0 || o.sec < first)
+                first = o.sec;
+        const auto r = TempoMeasure::analyse (x.data(), n, sr);
+        const double offBar = r.downbeatSnappedSec - bar * std::round (r.downbeatSnappedSec / bar);
+        std::printf ("  E eA %.4f eB %.4f ratio %.3f (warm if < 2); onsets=%d first onset %.4f s (want <= 0.005); bpm %.3f level %s downbeatSnapped %.4f s, off bar line by %.1f ms (want <= 10)%c",
+                     eA, eB, eB > 0.0 ? eA / eB : 0.0, (int) on.size(), first, r.bpm, TempoMeasure::levelName (r.level), r.downbeatSnappedSec, 1000.0 * offBar, 10);
+        check (first >= 0.0 && first <= 0.005, "tempofix E: a sustained hit at sample 0 still gives an onset within 5 ms of 0");
+        check (r.level != TempoMeasure::Level::none && std::abs (offBar) <= 0.010, "tempofix E: downbeatSnappedSec is within 10 ms of 0 or a bar line");
+    }
+    {
+        // G (Job 11, gap 4): a weak ghost (0.2) 0.10 beat before a strong real beat (1.0)
+        // on several beats at 120 bpm. The strength overload must pick the strong hit
+        // for the first beat and every beat with a ghost.
+        const double period = 0.5, realBeat = 1.0;
+        std::vector<double> on, st;
+        std::vector<int> ghostBeats { 0, 2, 3, 5, 8 };
+        for (int b = 0; b < 12; ++b)
+        {
+            if (std::find (ghostBeats.begin(), ghostBeats.end(), b) != ghostBeats.end())
+            {
+                on.push_back (realBeat + period * b - 0.10 * period);
+                st.push_back (0.2);
+            }
+            on.push_back (realBeat + period * b);
+            st.push_back (1.0);
+        }
+        const auto beats = WarpMarkers::trackBeats (on, st, 120.0, realBeat, 6.9);
+        double worst = 0.0;
+        bool ok = ! beats.empty();
+        for (int b : ghostBeats)
+        {
+            const double want = realBeat + period * b;
+            const double got = b < (int) beats.size() ? beats[(std::size_t) b] : std::nan ("");
+            const double offMs = 1000.0 * (got - want);
+            std::printf ("  G beat %d strong %.4f s tracked %.4f s off %.1f ms (want <= 10)%c", b, want, got, offMs, 10);
+            if (std::isnan (got) || std::abs (offMs) > 10.0)
+                ok = false;
+            if (! std::isnan (got))
+                worst = std::max (worst, std::abs (offMs));
+        }
+        std::printf ("  G beats tracked %d, worst ghost-beat error %.1f ms%c", (int) beats.size(), worst, 10);
+        check (ok, "tempofix G (gap 4): with strengths, the first tracked beat and every ghosted beat are within 10 ms of the strong hit");
+    }
+    {
+        // H (Job 12, gap 3, guard): a pickup of hats and a snare (no low band) before the
+        // first kick, then a groove with kicks on 1 and 3, snare on 2 and 4, hats on 8ths.
+        // The snapped downbeat must land on the first kick's bar line.
+        std::vector<float> x (n, 0.0f);
+        const double period = 0.5, firstKick = 1.0;
+        std::uint32_t rng = 0x2468aceu;
+        auto noiseHit = [&] (double t, double amp, double decay, bool alt)
+        {
+            if (t < 0.0) return;
+            const auto s0 = (std::size_t) std::llround (t * sr);
+            for (std::size_t i = 0; i < (std::size_t) (0.08 * sr) && s0 + i < n; ++i)
+            {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                double v = ((double) rng / 4294967295.0) * 2.0 - 1.0;
+                if (alt) v *= ((i & 1) ? 1.0 : -1.0);
+                x[s0 + i] += (float) (amp * v * std::exp (-(double) i / sr * decay));
+            }
+        };
+        // pickup: hats on 8ths from 0.25 s, snare at 0.5 s (beat before the bar)
+        for (double t = 0.25; t < firstKick - 1.0e-6; t += 0.5 * period)
+            noiseHit (t, 0.5, 80.0, true);
+        noiseHit (firstKick - period, 0.8, 25.0, false);
+        for (double t = firstKick; t < 7.9; t += 0.5 * period)
+        {
+            noiseHit (t, 0.4, 80.0, true);
+            const double beat = std::round ((t - firstKick) / period * 2.0) / 2.0;
+            if (std::abs (beat - std::round (beat)) < 1.0e-6)
+            {
+                const int k = ((int) std::round (beat)) % 4;
+                if (k == 0 || k == 2)
+                    tfKick (x, sr, t, 0.8f);
+                else
+                    noiseHit (t, 0.8, 25.0, false);
+            }
+        }
+        const auto r = TempoMeasure::analyse (x.data(), n, sr);
+        const double bar = 4.0 * period;
+        const double offBar = r.downbeatSnappedSec - firstKick - bar * std::round ((r.downbeatSnappedSec - firstKick) / bar);
+        std::printf ("  H bpm %.3f level %s downbeat %.4f s downbeatSnapped %.4f s, first kick %.4f s, off its bar line by %.1f ms (want <= 10)%c",
+                     r.bpm, TempoMeasure::levelName (r.level), r.downbeatSec, r.downbeatSnappedSec, firstKick, 1000.0 * offBar, 10);
+        if (std::abs (offBar) > 0.010)
+            for (const auto& o : TempoMeasure::onsets (x.data(), n, sr))
+                if (std::abs (o.sec - r.downbeatSec) <= 0.15 * period)
+                    std::printf ("    H onset in snap window %.4f s strength %.3f%c", o.sec, o.strength, 10);
+        check (r.level != TempoMeasure::Level::none && std::abs (offBar) <= 0.010, "tempofix H (gap 3, guard): downbeatSnappedSec is within 10 ms of the first kick's bar line");
+    }
+    {
+        // I (Job 17): the link_take_sample miss pattern. 120 bpm strong beats (~11), weak
+        // onsets (~2) 70 ms early on a few beats (one with its strong hit missing, the
+        // next with both), and strong off-beat (half-beat) onsets. A nearest-to-prediction
+        // walk takes the weak pick, the period drops and later beats slip. Markers seeded
+        // with autoPlaceFromBeats at the same bpm: |src - dst| is the error per beat.
+        const double period = 0.5, realBeat = 1.0, sr = 48000.0;
+        const int nBeats = 40;
+        std::vector<int> weakBeats { 6, 7, 20, 21, 30 }, missingStrong { 6, 20 }, offBeats { 25, 26, 33 };
+        auto has = [] (const std::vector<int>& v, int b) { return std::find (v.begin(), v.end(), b) != v.end(); };
+        std::vector<double> on, st;
+        int strongCount = 0;
+        for (int b = 0; b < nBeats; ++b)
+        {
+            const double t = realBeat + period * b;
+            if (has (weakBeats, b))
+            {
+                on.push_back (t - 0.070);
+                st.push_back (2.2);
+            }
+            if (! has (missingStrong, b))
+            {
+                on.push_back (t + 0.004 * ((b % 3) - 1));
+                st.push_back (11.0 + (b % 4) * 0.3);
+                ++strongCount;
+            }
+            if (has (offBeats, b))
+            {
+                on.push_back (t + 0.5 * period);
+                st.push_back (10.5);
+            }
+        }
+        const auto beats = WarpMarkers::trackBeats (on, st, 120.0, realBeat, realBeat + period * nBeats - 0.1);
+        const auto length = (std::int64_t) ((realBeat + period * nBeats + 1.0) * sr);
+        const auto mk = WarpMarkers::autoPlaceFromBeats (length, sr, beats, 120.0, 1.0, 0.5);
+        std::vector<double> errMs;
+        for (std::size_t i = 1; i + 1 < mk.size(); ++i)
+            errMs.push_back (1000.0 * std::abs ((double) (mk[i].srcFrame - mk[i].dstFrame)) / sr);
+        double worst = 0.0, median = 1.0e9;
+        if (! errMs.empty())
+        {
+            for (double e : errMs)
+                worst = std::max (worst, e);
+            auto s = errMs;
+            std::sort (s.begin(), s.end());
+            median = s[s.size() / 2];
+        }
+        int tracked = 0;
+        for (double b : beats)
+            if (! std::isnan (b))
+                ++tracked;
+        std::printf ("  I beats %d tracked %d (want %d strong), markers %d, median %.2f ms worst %.2f ms (want < 10 / < 30)%c",
+                     (int) beats.size(), tracked, strongCount, (int) errMs.size(), median, worst, 10);
+        check ((int) beats.size() == nBeats && (int) errMs.size() == strongCount && median < 10.0 && worst < 30.0,
+               "tempofix I (Job 17): weak early onsets and strong off-beats do not pull the beat walk; median < 10 ms, worst < 30 ms, no beat slip");
+    }
+    {
+        // J (Job 18): sa3_take0 k=10 pattern. One beat window holds a stronger onset
+        // (1.75) 35 ms early and a weaker one (1.03) 1 ms off the beat; the stronger is
+        // under 2x the weaker, so the nearer one must win. Case 2: when the stronger is
+        // at least 2x the weaker (2.5 vs 1.0) the stronger still wins (test G's rule).
+        const double period = 0.5, realBeat = 1.0, sr = 48000.0;
+        const int nBeats = 20, kTwin = 10;
+        auto run = [&] (double sEarly, double sNear, double& beatErrMs, double& worstMs, double& pickSec)
+        {
+            std::vector<double> on, st;
+            for (int b = 0; b < nBeats; ++b)
+            {
+                const double t = realBeat + period * b;
+                if (b == kTwin)
+                {
+                    on.push_back (t - 0.035); st.push_back (sEarly);
+                    on.push_back (t + 0.001); st.push_back (sNear);
+                }
+                else
+                {
+                    on.push_back (t); st.push_back (1.66);
+                }
+            }
+            const auto beats = WarpMarkers::trackBeats (on, st, 120.0, realBeat, realBeat + period * nBeats - 0.1);
+            pickSec = kTwin < (int) beats.size() ? beats[(std::size_t) kTwin] : std::nan ("");
+            const auto length = (std::int64_t) ((realBeat + period * nBeats + 1.0) * sr);
+            const auto mk = WarpMarkers::autoPlaceFromBeats (length, sr, beats, 120.0, 1.0, 0.5);
+            worstMs = 0.0;
+            beatErrMs = 1.0e9;
+            const auto twinFrame = (std::int64_t) std::llround (realBeat * sr + kTwin * period * sr);
+            for (std::size_t i = 1; i + 1 < mk.size(); ++i)
+            {
+                const double e = 1000.0 * std::abs ((double) (mk[i].srcFrame - mk[i].dstFrame)) / sr;
+                worstMs = std::max (worstMs, e);
+                if (mk[i].dstFrame == twinFrame)
+                    beatErrMs = e;
+            }
+        };
+        double e1, w1, p1, e2, w2, p2;
+        run (1.75, 1.03, e1, w1, p1);
+        run (2.5, 1.0, e2, w2, p2);
+        const double twin = realBeat + period * kTwin;
+        std::printf ("  J case 1 (1.75 vs 1.03): beat %d picked %.4f s (beat %.4f), marker err %.2f ms (want <= 5), worst %.2f ms (want < 10)%c",
+                     kTwin, p1, twin, e1, w1, 10);
+        std::printf ("  J case 2 (2.5 vs 1.0): beat %d picked %.4f s, off the strong onset by %.2f ms (want <= 1)%c",
+                     kTwin, p2, 1000.0 * (p2 - (twin - 0.035)), 10);
+        check (e1 <= 5.0 && w1 < 10.0, "tempofix J (Job 18): a stronger onset under 2x the weaker loses to the weaker one on the beat; marker <= 5 ms, worst < 10 ms");
+        check (! std::isnan (p2) && std::abs (p2 - (twin - 0.035)) <= 0.001, "tempofix J (Job 18): a stronger onset at 2x or more still wins the window");
+    }
+    {
+        // tempofix K (quiet passage): a click track with a 16 beat section at -20 dB
+        // (strength x0.1). The windows there have onsets but none clears the global
+        // strength floor; the walk must drop the floor and take the nearest onset.
+        // tempofix L (relock): +20% tempo step mid take; after 4 misses the window
+        // widens until a hit lands. Measured on the trackBeats output directly.
+        auto score = [] (const std::vector<double>& truth, const std::vector<double>& beats, double fromSec,
+                         int& lost, double& worstMs)
+        {
+            lost = 0;
+            worstMs = 0.0;
+            for (double t : truth)
+            {
+                double dm = 1.0e9;
+                for (double b : beats)
+                    if (! std::isnan (b))
+                        dm = std::min (dm, std::abs (b - t));
+                if (dm > 0.015)
+                    ++lost;
+            }
+            for (double b : beats)
+            {
+                if (std::isnan (b) || b < fromSec)
+                    continue;
+                double dm = 1.0e9;
+                for (double t : truth)
+                    dm = std::min (dm, std::abs (b - t));
+                worstMs = std::max (worstMs, 1000.0 * dm);
+            }
+        };
+        {
+            std::vector<double> on, st;
+            for (int b = 0; b < 48; ++b)
+            {
+                on.push_back (1.0 + 0.5 * b);
+                st.push_back (b >= 16 && b < 32 ? 0.1 : 1.0);
+            }
+            const auto beats = WarpMarkers::trackBeats (on, st, 120.0, 1.0, 1.0 + 0.5 * 47 + 0.1);
+            int lost = 0;
+            double worst = 0.0;
+            score (on, beats, 0.0, lost, worst);
+            std::printf ("  K quiet 16 beats at -20 dB: beats lost %d (want 0), worst %.2f ms (want < 10)%c", lost, worst, 10);
+            check (lost == 0 && worst < 10.0, "tempofix K: a 16 beat -20 dB passage is tracked beat for beat, worst < 10 ms");
+        }
+        {
+            std::vector<double> on, st;
+            double t = 1.0;
+            for (int b = 0; b < 32; ++b, t += 0.5)
+            {
+                on.push_back (t); st.push_back (1.0);
+            }
+            const double step = t;
+            for (int b = 0; b < 40; ++b, t += 0.5 / 1.2)
+            {
+                on.push_back (t); st.push_back (1.0);
+            }
+            const auto beats = WarpMarkers::trackBeats (on, st, 120.0, 1.0, t - 0.1);
+            std::vector<double> post (on.begin() + 32, on.end());
+            int lost = 0;
+            double worst = 0.0;
+            score (post, beats, step, lost, worst);
+            std::printf ("  L tempo step +20%%: beats lost after step %d (want <= 4), worst after relock %.2f ms (want < 15)%c", lost, worst, 10);
+            check (lost <= 4 && worst < 15.0, "tempofix L: a +20% tempo step loses at most 4 beats, worst < 15 ms after relock");
+        }
+        {
+            // tempofix M (fallback veto, link_take_sample k=5): a strong onset 0.26 beat early
+            // (outside the window) and a weak one 0.05 beat early (below the floor). The quiet
+            // fallback must not take the weak one; the beat stays empty.
+            const double period = 0.5, start = 1.0;
+            std::vector<double> on, st;
+            for (int b = 0; b < 12; ++b)
+            {
+                const double p = start + period * b;
+                if (b == 5)
+                {
+                    on.push_back (p - 0.26 * period); st.push_back (10.4);
+                    on.push_back (p - 0.05 * period); st.push_back (1.89);
+                }
+                else
+                {
+                    on.push_back (p); st.push_back (10.0);
+                }
+            }
+            const auto beats = WarpMarkers::trackBeats (on, st, 120.0, start, start + period * 11 + 0.1);
+            const double b5 = beats.size() > 5 ? beats[5] : 0.0;
+            const double offMs = std::isnan (b5) ? 0.0 : (b5 - (start + 5 * period)) * 1000.0;
+            std::printf ("  M fallback veto: beat 5 %s (picked %.4f s, %.2f ms off), want empty%c",
+                         std::isnan (b5) ? "empty" : "filled", b5, offMs, 10);
+            check (beats.size() > 5 && std::isnan (b5), "tempofix M: a weak onset near the beat is not taken when a strong one sits within 0.35 beat");
+        }
+    }
+}
+
 // Tempo restore: a take measured at 120.01 that was asked for at 88 comes back from the
 // plugin state at 120.01, never at the asked 88. Teeth: HSLINK_TEETH_TEMPORESTORE=1 drops
 // the measured tempo at save.
@@ -13876,6 +15576,31 @@ static void testTempo (const juce::File& tmp)
                  (double) (juce::Time::getMillisecondCounter() - t0) / 1000.0, 10);
 }
 
+// Take editor hit-area rules after the v5b layout (docs/design/TAKE_EDITOR_V5B_INVENTORY.md).
+// Overlap: readoutLabel and resultLabel share one footer line on purpose (the result replaces
+// the readout while it shows), so that one pair is allowed to overlap. Small: the R15 desktop
+// tiers, every button 24 px tall, icon squares 24 wide, short-label buttons 36, others 48; a
+// button is under tier when it is under 24 tall, under 24 wide, or under 36 wide and not square.
+// Labels and rows parked at 0 x 0 on purpose (3aab088): not counted as empty areas.
+static bool takeAreaParkedByDesign (const juce::String& name)
+{
+    static const juce::StringArray parkedByDesign { "Snap note", "Tempo unit", "Repeats label", "Grid resolution label", "Quantize to label", "Quantize strength label",
+                                                    "Fade in label", "Fade out label", "Loop xfade label", "Gain label", "Grid label", "Warp marker line", "Scroll bar", "Zoom row (empty)" }; // 3aab088
+    return parkedByDesign.contains (name);
+}
+
+static bool takeAreasShareByDesign (const juce::String& a, const juce::String& b)
+{
+    return (a == "Readout" && b == "Result line") || (a == "Result line" && b == "Readout");
+}
+
+static bool takeButtonUnderTier (juce::Rectangle<int> r)
+{
+    if (r.getHeight() < 24 || r.getWidth() < 24)
+        return true;
+    return r.getWidth() < 36 && r.getWidth() != r.getHeight();
+}
+
 // The info line label of the take editor panel (found by the bounds areasForTest gives
 // for "Info line"; the panel has no reader for its text), and the width its text needs.
 static juce::Label* takeEditorInfoLabel (TakeEditorPanel& panel)
@@ -14309,12 +16034,26 @@ static void testTempoFallback (const juce::File& tmp)
             std::printf ("  C7 editor: cell found=%d tag='%s' colour=%d (want 1 '120.00 bpm (file)' 3); panel opened=%d grid bpm=%.4f downbeat=%.4f measured=%d fallback=%d usable=%d (want 1 120.0000 0.0000 0 1 1); snap on: active=%d amber note=%d beat lines=%d (want 1 0, over 10); start handle dragged to 100000 -> %lld (want 96000, beat 4 at 120 bpm from the file start)%c",
                          (int) (cell != nullptr), cellTag.text.toRawUTF8(), cellTag.colour, (int) opened, grid.bpm, grid.downbeatSec, (int) grid.measured, (int) grid.fallback, (int) usable,
                          (int) active, (int) amber, lines, snapped, 10);
-            std::printf ("  C7 editor info line: '%s' (want it to start with '120.00 bpm (file)')%c", infoText.toRawUTF8(), 10);
+            // Rebased 2026-11-14: since r5 (0b4a3b4, 7ea78a9) the header meta drops whole trailing
+            // parts to fit its width, so at a narrow header the bpm part is dropped, not cut. Wanted:
+            // the line is empty or starts with the tempo part, and it is shown whenever it fits.
+            const int metaW = info != nullptr ? info->getWidth() : 0;
+            int tempoNeed = 0;
+            if (info != nullptr)
+            {
+                juce::GlyphArrangement mg;
+                mg.addLineOfText (info->getFont(), "120.00 bpm (file)", 0.0f, 0.0f);
+                tempoNeed = (int) std::ceil (mg.getBoundingBox (0, -1, true).getWidth()) + 6;
+            }
+            const bool tempoFits = tempoNeed <= metaW;
+            std::printf ("  C7 editor info line: '%s' meta width %d, tempo part needs %d, fits=%d (want the line to start with '120.00 bpm (file)' when it fits, else empty)%c",
+                         infoText.toRawUTF8(), metaW, tempoNeed, (int) tempoFits, 10);
             ck (cell != nullptr && cellTag.text == "120.00 bpm (file)" && cellTag.colour == TakeGrid::TempoTag::amber, "C7: the take cell's tag reads '120.00 bpm (file)', amber");
             ck (opened && grid.bpm == 120.0 && grid.downbeatSec == 0.0 && grid.fallback && ! grid.measured && usable,
                 "C7: the take editor's grid is the file name tempo, 120 from the file start, marked fallback, usable");
             ck (active && ! amber && lines > 10 && snapped == 96000, "C7: Snap to grid is active on it, the ruler has beat lines and a dragged handle lands on beat 4 (frame 96000)");
-            ck (infoText.startsWith ("120.00 bpm (file)"), "C7: the take editor's info line starts with '120.00 bpm (file)'");
+            ck (info != nullptr && (tempoFits ? infoText.startsWith ("120.00 bpm (file)") : infoText.isEmpty()),
+                "C7: the take editor's info line starts with '120.00 bpm (file)' when it fits, else drops it whole (r5)");
             ed.reset();
         }
         p.reset();
@@ -14530,6 +16269,9 @@ static void testDerivedTempo (const juce::File& tmp)
 {
     using namespace TempoTest;
     std::printf ("Derived tempo: crop and stretch fall back to an estimate when the remeasure fails%c", 10);
+    // F4b: a crop of a measured parent now carries its tempo with no remeasure; this group
+    // tests the remeasure-failed fallback, so it runs with the carry off.
+    HotStepLinkProcessor::testNoCarryTempo.store (true);
     const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_DERIVED_EST";
     HotStepLinkProcessor::testNoDerivedEstimate.store (teeth);
     HotStepLinkProcessor::testStretchEst.store (juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "STRETCH_EST");
@@ -14647,7 +16389,351 @@ static void testDerivedTempo (const juce::File& tmp)
     }
     HotStepLinkProcessor::testNoDerivedEstimate.store (false);
     HotStepLinkProcessor::testStretchEst.store (false);
+    HotStepLinkProcessor::testNoCarryTempo.store (false);
     dir.deleteRecursively();
+}
+
+// F1 AUTO-WARP, F2 Cut / Splice, F3 pinned markers, F4a tempo carry (2026-11-14).
+// Pure parts (renderEditFile, keepPinned) and one processor + panel part on a synthetic
+// kick/hat take at 120. Teeth: HSLINK_TEETH=NOCARRY (derived takes remeasure); the other
+// teeth are one-line source breaks shown once and reverted.
+static void testWarpCutPin (const juce::File& tmp)
+{
+    using namespace TempoTest;
+    std::printf ("Warp cut pin: AUTO-WARP, Cut / Splice length and join, pinned markers, tempo carry%c", 10);
+    const int failuresBefore = failures;
+    const bool noCarry = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NOCARRY";
+    HotStepLinkProcessor::testNoCarryTempo.store (noCarry);
+    std::printf ("  teeth NOCARRY=%d%c", noCarry ? 1 : 0, 10);
+    const auto dir = tmp.getChildFile ("warp_cut_pin_test");
+    dir.createDirectory();
+
+    // F2 (a) length and (b) loud join, through renderEditFile.
+    {
+        const double sr = 48000.0, w = 2.0 * juce::MathConstants<double>::pi * 440.0 / sr;
+        const int len = 4 * 48000;
+        const juce::int64 ls = 48027, le = 96000; // left side near a peak, right side phase pi
+        juce::AudioBuffer<float> b (1, len);
+        for (int i = 0; i < len; ++i)
+            b.setSample (0, i, (float) (0.8 * (i < le ? std::sin (w * i) : std::sin (w * i + juce::MathConstants<double>::pi))));
+        const auto src = writeWav (dir.getChildFile ("cut_src.wav"), b, sr);
+        TakeEdit::EditRequest rq;
+        rq.source = src;
+        rq.dest = dir.getChildFile ("cut_out.wav");
+        rq.edit.loopStart = ls;
+        rq.edit.loopEnd = le;
+        rq.edit.loopXfadeMs = 10.0;
+        rq.options.fadeMs = 10.0;
+        rq.options.cutSplice = true;
+        const auto r = TakeEdit::renderEditFile (rq);
+        const juce::int64 wantX = 480, region = le - ls;
+        std::printf ("  F2a: ok=%d before=%d region=%lld xfade=%lld (want %lld) after=%lld, before - region - xfade=%lld%c", (int) r.ok, len,
+                     (long long) region, (long long) r.seamFadeSamples, (long long) wantX, (long long) r.outSamples, (long long) (len - region - wantX), 10);
+        check (r.ok && r.seamFadeSamples == wantX && r.outSamples == len - region - wantX,
+               "F2a: Cut / Splice output length = before - region - crossfade, exact frames (crossfade 480 at 10 ms)");
+        juce::AudioBuffer<float> o;
+        if (auto rd = std::unique_ptr<juce::AudioFormatReader> (juce::WavAudioFormat().createReaderFor (new juce::FileInputStream (rq.dest), true)))
+        {
+            o.setSize (1, (int) rd->lengthInSamples);
+            rd->read (&o, 0, o.getNumSamples(), 0, true, false);
+        }
+        auto maxStep = [] (const juce::AudioBuffer<float>& xb, juce::int64 a, juce::int64 e)
+        {
+            float m = 0.0f;
+            for (juce::int64 i = juce::jmax ((juce::int64) 1, a); i < juce::jmin ((juce::int64) xb.getNumSamples(), e); ++i)
+                m = juce::jmax (m, std::abs (xb.getSample (0, (int) i) - xb.getSample (0, (int) i - 1)));
+            return m;
+        };
+        const float natural = maxStep (b, 1000, 20000); // the signal's own step, far from the join
+        const float join = o.getNumSamples() > 0 ? maxStep (o, ls - wantX - 4, ls + 4) : 1.0e9f;
+        juce::AudioBuffer<float> butt (1, (int) (len - region)); // hard butt splice, no crossfade
+        for (int i = 0; i < butt.getNumSamples(); ++i)
+            butt.setSample (0, i, b.getSample (0, i < ls ? i : (int) (i + region)));
+        const float buttJoin = maxStep (butt, ls - 4, ls + 4);
+        std::printf ("  F2b: natural max step=%.5f limit (2x)=%.5f; spliced join max step=%.5f; hard butt splice join step=%.5f%c", natural, 2.0f * natural, join, buttJoin, 10);
+        check (natural > 0.03f && join < 2.0f * natural, "F2b: the crossfaded join of a loud 0.8 sine (phase flipped) steps under 2x the signal's own max step");
+        check (buttJoin > 2.0f * natural, "F2b (contrast): a hard butt splice of the same signal fails that limit");
+    }
+
+    // F2c: equal-power level across the seam, on uncorrelated noise (a linear crossfade dips
+    // about 2.7 dB in the middle half of the fade; equal power holds 0 dB).
+    {
+        const double sr = 48000.0;
+        const int len = 4 * 48000;
+        const juce::int64 ls = 60000, le = 120000;
+        juce::Random rng (9702);
+        juce::AudioBuffer<float> b (1, len);
+        for (int i = 0; i < len; ++i)
+            b.setSample (0, i, 0.5f * (2.0f * rng.nextFloat() - 1.0f));
+        const auto src = writeWav (dir.getChildFile ("cutn_src.wav"), b, sr);
+        TakeEdit::EditRequest rq;
+        rq.source = src;
+        rq.dest = dir.getChildFile ("cutn_out.wav");
+        rq.edit.loopStart = ls;
+        rq.edit.loopEnd = le;
+        rq.edit.loopXfadeMs = 100.0;
+        rq.options.fadeMs = 10.0;
+        rq.options.cutSplice = true;
+        const auto r = TakeEdit::renderEditFile (rq);
+        juce::AudioBuffer<float> o;
+        if (auto rd = std::unique_ptr<juce::AudioFormatReader> (juce::WavAudioFormat().createReaderFor (new juce::FileInputStream (rq.dest), true)))
+        {
+            o.setSize (1, (int) rd->lengthInSamples);
+            rd->read (&o, 0, o.getNumSamples(), 0, true, false);
+        }
+        const juce::int64 x = r.seamFadeSamples, w = x / 2, mid0 = ls - x + x / 4;
+        auto rms = [&o] (juce::int64 a, juce::int64 n)
+        {
+            if (a < 0 || a + n > o.getNumSamples() || n <= 0)
+                return 0.0;
+            double e = 0.0;
+            for (juce::int64 i = a; i < a + n; ++i)
+                e += (double) o.getSample (0, (int) i) * o.getSample (0, (int) i);
+            return std::sqrt (e / (double) n);
+        };
+        const double seam = rms (mid0, w), left = rms (ls - x - 4 * w, 2 * w), right = rms (ls + 2 * w, 2 * w);
+        const double ref = 0.5 * (left + right), db = (seam > 0.0 && ref > 0.0) ? 20.0 * std::log10 (seam / ref) : -100.0;
+        std::printf ("  F2c: ok=%d xfade=%lld; RMS seam middle half=%.4f, left=%.4f, right=%.4f, seam vs neighbours=%.2f dB (limit +-1 dB; linear would be about -2.7)%c",
+                     (int) r.ok, (long long) x, seam, left, right, db, 10);
+        check (r.ok && x == 4800 && std::abs (db) < 1.0, "F2c: equal-power seam keeps level within 1 dB of the neighbouring windows on uncorrelated noise");
+    }
+
+    // F3 pure: keepPinned on a re-placement.
+    {
+        const double sr = 48000.0;
+        const std::int64_t len = 16 * 48000;
+        const auto fresh = WarpMarkers::autoPlace (len, sr, 120.0, 0.0, 4);
+        auto old = fresh;
+        const bool okSize = old.size() > 6;
+        if (okSize)
+        {
+            WarpMarkers::moveTo (old, 3, old[3].dstFrame + 3000, len);
+            old[3].pinned = true;
+            WarpMarkers::moveTo (old, 5, old[5].dstFrame + 2000, len);
+        }
+        const auto out = WarpMarkers::keepPinned (old, fresh);
+        long long pinDelta = -1, unpinDelta = 0;
+        for (const auto& m : out)
+        {
+            if (okSize && m.srcFrame == old[3].srcFrame)
+                pinDelta = (long long) (m.dstFrame - old[3].dstFrame) + (m.pinned ? 0 : 1000000);
+            if (okSize && m.srcFrame == old[5].srcFrame)
+                unpinDelta = (long long) (m.dstFrame - old[5].dstFrame);
+        }
+        std::printf ("  F3 pure: %d markers (fresh %d); pinned marker dst change=%lld (want 0); unpinned dragged marker dst change=%lld (want -2000)%c",
+                     (int) out.size(), (int) fresh.size(), pinDelta, unpinDelta, 10);
+        check (okSize && pinDelta == 0 && std::llabs (unpinDelta) >= 1000, "F3: a re-placement keeps the pinned marker in place and moves the unpinned one by a real amount");
+    }
+
+    // Processor + panel on a measured 120 bpm kick/hat take.
+    const double sr = 44100.0, seconds = 16.0;
+    const auto x = render (drums (steadyBeats (120.0, 0.0, seconds)), sr, seconds);
+    const auto f = dir.getChildFile ("dl").getChildFile ("take_kick_hat_120.wav");
+    {
+        f.getParentDirectory().createDirectory();
+        std::unique_ptr<juce::AudioFormatWriter> wr (juce::WavAudioFormat().createWriterFor (new juce::FileOutputStream (f), sr, 1, 16, {}, 0));
+        const float* chans[1] = { x.data() };
+        if (wr != nullptr)
+            wr->writeFromFloatArrays (chans, 1, (int) x.size());
+    }
+    juce::MemoryBlock state;
+    juce::String parentName;
+    std::vector<WarpMarkers::Marker> savedMarkers;
+    {
+        auto p = std::make_unique<HotStepLinkProcessor>();
+        p->setStableRoot (dir.getChildFile ("stable"));
+        p->setCollectionRoot (dir.getChildFile ("coll"));
+        DawJob j;
+        j.localId = 1;
+        j.request.caption = "warp cut pin";
+        j.request.expectedBackend = "sa3";
+        j.request.bpm = 120.0;
+        j.request.seed = 9701;
+        j.request.durationS = seconds;
+        j.takeFiles.add (f);
+        j.takeSeeds.add (9701);
+        p->registerTakeAndWait (j, 0);
+        p->waitTakeMeasureIdle();
+        auto entryOf = [&] (const juce::String& n)
+        {
+            for (const auto& t : p->getTakes())
+                if (t.name == n)
+                    return t;
+            return HslinkTakeEntry();
+        };
+        const auto parent = entryOf ("take_kick_hat_120.wav");
+        parentName = parent.name;
+        std::printf ("  parent: state=%d valid=%d bpm=%.4f level=%d%c", parent.tempoState, (int) parent.tempo.valid, parent.tempo.bpm, (int) parent.tempo.level, 10);
+        check (parent.tempoState == HslinkTakeEntry::tempoMeasured && parent.tempo.valid && std::abs (parent.tempo.bpm - 120.0) < 0.1, "setup: the kick/hat take measures near 120");
+
+        // F4a: a cut take carries the source tempo.
+        {
+            TakeEdit::EditData e;
+            e.loopStart = (juce::int64) (2.3 * sr);
+            e.loopEnd = (juce::int64) (4.1 * sr);
+            TakeEdit::EditOptions o;
+            o.cutSplice = true;
+            const auto cutName = HotStepLinkProcessor::editedTakeName (parent.name, e, o);
+            p->requestTakeEdit (parent.temp, e, o);
+            p->waitTakeEditIdle();
+            p->waitTakeMeasureIdle();
+            const auto c = entryOf (cutName);
+            std::printf ("  F4a: cut take '%s' listed=%d state=%d bpm=%.4f, source bpm=%.4f, diff=%.4f (want under 0.01)%c", cutName.toRawUTF8(),
+                         (int) c.temp.existsAsFile(), c.tempoState, c.tempo.bpm, parent.tempo.bpm, c.tempo.bpm - parent.tempo.bpm, 10);
+            check (c.temp.existsAsFile() && c.tempoState == HslinkTakeEntry::tempoMeasured && std::abs (c.tempo.bpm - parent.tempo.bpm) < 0.01,
+                   "F4a: the Cut / Splice take's bpm equals the source bpm within 0.01 (carried, not remeasured)");
+        }
+
+        // F1 + F3 in the panel.
+        {
+            TakeEditorPanel panel;
+            juce::uint32 clock = 1000;
+            panel.setSize (490, 566);
+            panel.clockForTest = [&clock] { return clock; };
+            panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+            TakeEditorPanel::Take take;
+            take.temp = parent.temp;
+            take.name = parent.name;
+            take.tempo = parent.tempo;
+            take.grid.bpm = parent.tempo.bpm;
+            take.grid.downbeatSec = parent.tempo.downbeatSec;
+            take.grid.measured = true;
+            take.takeBpm = parent.tempo.bpm;
+            panel.open (take);
+            for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+            {
+                juce::Thread::sleep (10);
+                panel.tick();
+            }
+            {
+                int calls = 0;
+                TakeEdit::EditOptions got;
+                TakeEdit::EditData gotEdit;
+                panel.onApply = [&] (const juce::File&, const TakeEdit::EditData& e, const TakeEdit::EditOptions& o, juce::String&) -> juce::uint64
+                {
+                    ++calls;
+                    got = o;
+                    gotEdit = e;
+                    return 0;
+                };
+                panel.clearLoopForTest();
+                panel.clickCutSpliceForTest();
+                const int noLoopCalls = calls;
+                panel.createLoopForTest ((juce::int64) (4.0 * sr));
+                const bool loop = panel.hasLoopForTest();
+                panel.clickCutSpliceForTest();
+                std::printf ("  F2d: Cut / Splice with no loop -> jobs=%d (want 0); loop=%d [%lld, %lld) -> jobs=%d (want 1) cutSplice=%d loop sent [%lld, %lld)%c", noLoopCalls,
+                             (int) loop, (long long) panel.getLoopStartForTest(), (long long) panel.getLoopEndForTest(), calls - noLoopCalls, (int) got.cutSplice,
+                             (long long) gotEdit.loopStart, (long long) gotEdit.loopEnd, 10);
+                check (noLoopCalls == 0, "F2d: Cut / Splice with no loop starts no job");
+                check (loop && calls - noLoopCalls == 1 && got.cutSplice && gotEdit.loopEnd > gotEdit.loopStart, "F2d: Cut / Splice with a loop starts one job with options.cutSplice true");
+                panel.clearLoopForTest();
+                panel.onApply = nullptr;
+            }
+            const int before = (int) panel.warpMarkersForTest().size();
+            const int placed = panel.autoWarpForTest();
+            const auto a = panel.lastAutoWarpForTest();
+            const int after = (int) panel.warpMarkersForTest().size();
+            const bool u = panel.undoForTest();
+            const int afterUndo = (int) panel.warpMarkersForTest().size();
+            std::printf ("  F1: AUTO-WARP bpm=%.4f (want 120 +- 0.05) beats=%d markers placed=%d list %d -> %d, undo=%d -> %d (want %d)%c",
+                         a.bpm, a.beats, placed, before, after, (int) u, afterUndo, before, 10);
+            check (std::abs (a.bpm - 120.0) <= 0.05 && after >= 16 && placed >= 16, "F1: AUTO-WARP on the 120 kick/hat take: bpm within 0.05 of 120 and at least 16 markers");
+            check (u && afterUndo == before && after != before, "F1: one undo returns the prior marker count");
+
+            panel.redoForTest();
+            if (panel.warpMarkersForTest().size() > 8)
+            {
+                panel.selectWarpMarkerForTest (3, false);
+                panel.dragWarpForTest (3, panel.warpMarkersForTest()[3].dstFrame + 3000);
+                panel.clickPinForTest (true);
+                const auto keep = panel.warpMarkersForTest()[3];
+                panel.autoWarpForTest();
+                int at = -1;
+                for (std::size_t k = 0; k < panel.warpMarkersForTest().size(); ++k)
+                    if (panel.warpMarkersForTest()[k].pinned)
+                        at = (int) k;
+                const auto pa = at >= 0 ? panel.warpMarkersForTest()[(std::size_t) at] : WarpMarkers::Marker {};
+                const int un = at >= 0 ? at + 2 : 5;
+                const auto unBefore = panel.warpMarkersForTest()[(std::size_t) un].dstFrame;
+                panel.dragWarpForTest (un, unBefore + 3000);
+                panel.selectWarpMarkerForTest (at, false);
+                panel.selectWarpMarkerForTest (un, true);
+                const int q = panel.clickQuantizeForTest();
+                const auto pq = at >= 0 ? panel.warpMarkersForTest()[(std::size_t) at] : WarpMarkers::Marker {};
+                const auto unAfter = panel.warpMarkersForTest()[(std::size_t) un].dstFrame;
+                std::printf ("  F3 panel: pin at %d: after AUTO-WARP dst change=%lld, after Quantize dst change=%lld (want 0 0, pinned=%d); unpinned marker %d dragged +3000, Quantize moved it %lld frames (want about -3000), quantize count=%d%c",
+                             at, (long long) (pa.dstFrame - keep.dstFrame), (long long) (pq.dstFrame - keep.dstFrame), (int) pq.pinned, un, (long long) (unAfter - (unBefore + 3000)), q, 10);
+                check (at >= 0 && pa.srcFrame == keep.srcFrame && pa.dstFrame == keep.dstFrame && pq.dstFrame == keep.dstFrame && pq.pinned,
+                       "F3: a pinned marker keeps its position through AUTO-WARP and Quantize");
+                check (std::llabs ((long long) (unAfter - (unBefore + 3000))) >= 2000, "F3: an unpinned marker in the same Quantize moves by a real amount (over 2000 frames)");
+            }
+            else
+                check (false, "F3 panel: AUTO-WARP gave too few markers to test pins");
+        }
+
+        // F3 wpin state: markers 2 and 4 pinned on the take.
+        savedMarkers = WarpMarkers::autoPlace ((std::int64_t) x.size(), sr, 120.0, 0.0, 4);
+        if (savedMarkers.size() > 5)
+        {
+            savedMarkers[2].pinned = savedMarkers[4].pinned = true;
+            savedMarkers[2].dstFrame += 500;
+        }
+        p->setTakeWarp (parent.temp, savedMarkers, true, 120.0);
+        p->waitTakeEditIdle();
+        p->waitSaverIdle();
+        p->getStateInformation (state);
+    }
+    auto reload = [&] (const juce::MemoryBlock& s)
+    {
+        auto q = std::make_unique<HotStepLinkProcessor>();
+        q->setStableRoot (dir.getChildFile ("stable"));
+        q->setCollectionRoot (dir.getChildFile ("coll"));
+        q->setStateInformation (s.getData(), (int) s.getSize());
+        q->waitTakeMeasureIdle();
+        std::vector<WarpMarkers::Marker> m;
+        for (const auto& t : q->getTakes())
+            if (t.name == parentName)
+                m = t.warpMarkers;
+        q->waitSaverIdle();
+        return m;
+    };
+    {
+        const auto m = reload (state);
+        bool same = m.size() == savedMarkers.size();
+        for (std::size_t k = 0; same && k < m.size(); ++k)
+            same = m[k].srcFrame == savedMarkers[k].srcFrame && m[k].dstFrame == savedMarkers[k].dstFrame && m[k].pinned == savedMarkers[k].pinned;
+        std::printf ("  F3 wpin: saved %d markers (%d pinned), reloaded %d markers (%d pinned), all equal=%d%c", (int) savedMarkers.size(),
+                     WarpMarkers::pinnedCount (savedMarkers), (int) m.size(), WarpMarkers::pinnedCount (m), (int) same, 10);
+        check (same && WarpMarkers::pinnedCount (m) == 2, "F3: pinned markers round-trip through get/setStateInformation (wpin)");
+    }
+    {
+        // Old state: the same, with every wpin attribute taken out.
+        juce::MemoryBlock old;
+        int removed = 0;
+        if (auto xml = juce::AudioProcessor::getXmlFromBinary (state.getData(), (int) state.getSize()))
+        {
+            std::function<void (juce::XmlElement&)> strip = [&] (juce::XmlElement& e)
+            {
+                if (e.hasAttribute ("wpin"))
+                {
+                    e.removeAttribute ("wpin");
+                    ++removed;
+                }
+                for (auto* c : e.getChildIterator())
+                    strip (*c);
+            };
+            strip (*xml);
+            juce::AudioProcessor::copyXmlToBinary (*xml, old);
+        }
+        const auto m = reload (old);
+        std::printf ("  F3 old state: wpin attributes removed=%d (want 1), reloaded %d markers (want %d), pinned=%d (want 0)%c", removed, (int) m.size(),
+                     (int) savedMarkers.size(), WarpMarkers::pinnedCount (m), 10);
+        check (removed == 1 && m.size() == savedMarkers.size() && WarpMarkers::pinnedCount (m) == 0, "F3: an old state without wpin loads every marker unpinned");
+    }
+    HotStepLinkProcessor::testNoCarryTempo.store (false);
+    dir.deleteRecursively();
+    std::printf ("  warp cut pin: %d failed%c", failures - failuresBefore, 10);
 }
 
 // TakeStretch::stretchTakeFile and requestTakeStretch: real files, only inside
@@ -15015,6 +17101,59 @@ static void testStretch (const juce::File& tmp)
 
 // TakeEdit::renderEditFile, its pure helpers and requestTakeEdit: real files, only inside
 // <test temp>/edit_test, which this function creates and removes. Nothing is played.
+// Apply warp keeps only the S/E section (c97e894): an 8.000 s clip with S/E 0.000 to 4.500 s
+// must give a 4.500 s take from Apply crop and from Apply warp with identity markers, and the
+// marker-mapped length from a non-identity warp. Drives the real TakeEdit::renderEditFile.
+static void testWarpCropLength (const juce::File& tmp)
+{
+    std::printf ("Warp crop length: Apply crop and Apply warp keep only S/E%c", 10);
+    const double sr = 48000.0;
+    const std::int64_t len = (std::int64_t) std::llround (8.0 * sr), cs = 0, ce = (std::int64_t) std::llround (4.5 * sr);
+    const auto tol = (std::int64_t) std::llround (0.001 * sr);
+    const auto dir = tmp.getChildFile ("warp_crop_len");
+    dir.createDirectory();
+    const auto src = dir.getChildFile ("src.wav");
+    {
+        juce::AudioBuffer<float> in (1, (int) len);
+        for (int i = 0; i < in.getNumSamples(); ++i)
+            in.setSample (0, i, (float) (0.5 * std::sin (6.283185307179586 * 220.0 * (double) i / sr)));
+        juce::WavAudioFormat wav;
+        auto os = src.createOutputStream();
+        juce::OutputStream* raw = os.release();
+        std::unique_ptr<juce::AudioFormatWriter> w (wav.createWriterFor (raw, sr, 1, 24, {}, 0));
+        if (w == nullptr)
+            delete raw;
+        else
+            w->writeFromAudioSampleBuffer (in, 0, in.getNumSamples());
+    }
+    auto run = [&] (const char* label, const char* destName, const std::vector<WarpMarkers::Marker>& warp, std::int64_t want)
+    {
+        TakeEdit::EditRequest rq;
+        rq.source = src;
+        rq.dest = dir.getChildFile (destName);
+        rq.edit.cropStart = cs;
+        rq.edit.cropEnd = ce;
+        rq.edit.loopStart = -1;
+        rq.edit.loopEnd = -1;
+        rq.options.warp = warp;
+        const auto r = TakeEdit::renderEditFile (rq);
+        std::int64_t fileLen = -1;
+        if (auto rd = std::unique_ptr<juce::AudioFormatReader> (juce::WavAudioFormat().createReaderFor (new juce::FileInputStream (rq.dest), true)))
+            fileLen = (std::int64_t) rd->lengthInSamples;
+        std::printf ("  %s: ok %d, outSamples %lld, file %lld frames = %.4f s, want %lld frames = %.4f s%c", label, (int) r.ok,
+                     (long long) r.outSamples, (long long) fileLen, (double) fileLen / sr, (long long) want, (double) want / sr, 10);
+        return r.ok && std::llabs ((long long) (fileLen - want)) <= (long long) tol && std::llabs ((long long) (r.outSamples - want)) <= (long long) tol;
+    };
+    const std::int64_t s4 = (std::int64_t) std::llround (4.0 * sr), s2 = (std::int64_t) std::llround (2.0 * sr), s6 = (std::int64_t) std::llround (6.0 * sr);
+    check (run ("crop", "crop.wav", {}, ce - cs), "warp crop: Apply crop of S/E 0..4.5 s on an 8 s clip gives 4.500 s");
+    const std::vector<WarpMarkers::Marker> identity { { 0, 0 }, { s4, s4 }, { len, len } };
+    check (run ("warp identity", "warp_id.wav", identity, ce - cs), "warp crop: Apply warp with identity markers gives the 4.500 s S/E section, not the whole take");
+    // 0->0, 4 s->2 s, 8 s->6 s: 4.5 s maps to 2 s + 0.5 s * (4/4) = 2.5 s, so S/E warps to 2.500 s.
+    const std::vector<WarpMarkers::Marker> squeeze { { 0, 0 }, { s4, s2 }, { len, s6 } };
+    const auto wantSq = s2 + (ce - s4) * (s6 - s2) / (len - s4);
+    check (run ("warp squeeze", "warp_sq.wav", squeeze, wantSq), "warp crop: Apply warp with 4 s->2 s, 8 s->6 s markers gives the mapped 2.500 s section");
+}
+
 static void testEdit (const juce::File& tmp)
 {
     using namespace TempoTest;
@@ -16777,6 +18916,62 @@ static void testHeaderCounters (const juce::File& tmp)
     check (q1 == 0 && q2 == 0, "header counters: the QUEUE count is 0 when every job is finished (4 done jobs)");
     check (q3 == 1, "header counters: the QUEUE count is repainted for queued plus running jobs");
     check (t1 == 3 && t2 == 4, "header counters: the TAKES count is repainted for the number of takes, also on a new take's auto-select");
+    // Delete one take (the cell "x"), then star one and Clear unstarred: the shown count
+    // must follow the real number of take cards each time.
+    int t3 = -1, c3 = -1, t4 = -1, c4 = -1, n4 = -1;
+    {
+        auto en = p->getTakes();
+        if (en.size() >= 2)
+        {
+            ed->deleteTakeForTest (en[0].temp.getFullPathName());
+            ed->runRefreshForTest();
+            t3 = ed->takeCountShownForTest();
+            c3 = ed->takeCellCountForTest();
+            p->commitTakeDelete();
+            en = p->getTakes();
+            if (! en.empty())
+                p->setStarred (en[0].stable != juce::File() ? en[0].stable : en[0].temp, true);
+            p->clearUnstarredTakes();
+            ed->runRefreshForTest();
+            t4 = ed->takeCountShownForTest();
+            c4 = ed->takeCellCountForTest();
+            n4 = (int) p->getTakes().size();
+        }
+    }
+    std::printf ("  after delete: TAKES shown %d, cards %d (want 3); after star 1 + clear unstarred: TAKES shown %d, cards %d, getTakes %d (want 1)%c",
+                 t3, c3, t4, c4, n4, 10);
+    check (t3 == c3 && c3 == 3, "header counters: the TAKES count follows a deleted take");
+    check (t4 == c4 && c4 == 1 && n4 == 1, "header counters: the TAKES count follows Clear unstarred");
+    // Bounds at the default size: each count sits right of its title, inside the plate,
+    // clear of Edit take (TAKES) and of the job card / Cancel (QUEUE). Same arithmetic as paintSection.
+    {
+        const auto plate = ed->takesPlateForTest();
+        juce::GlyphArrangement ga;
+        const juce::Font f (juce::FontOptions (11.0f, juce::Font::bold));
+        auto countRect = [&] (juce::Rectangle<int> r, const juce::String& t, juce::Rectangle<int>& title)
+        {
+            juce::GlyphArrangement g2;
+            g2.addLineOfText (f, t, 0.0f, 0.0f);
+            const int tw = (int) std::ceil (g2.getBoundingBox (0, -1, true).getWidth());
+            title = r.removeFromLeft (tw + 2);
+            return r.removeFromLeft (30).withTrimmedLeft (6);
+        };
+        juce::Rectangle<int> tT, qT;
+        const auto tRow = plate.reduced (12, 0).withY (ed->takeListBoundsForTest().getY() - 22).withHeight (20).withTrimmedRight (100);
+        const auto qRow = plate.reduced (12, 0).withY (ed->jobCardForTest().getY() - 22).withHeight (20);
+        const auto tC = countRect (tRow, "TAKES", tT), qC = countRect (qRow, "QUEUE", qT);
+        const auto eb = ed->editTakeBoundsForTest(), cb = ed->cancelBoundsForTest(), jc = ed->jobCardForTest();
+        std::printf ("  editor %dx%d plate x%d..%d; TAKES title %d..%d count (%d,%d %dx%d), Edit take (%d,%d %dx%d); QUEUE title %d..%d count (%d,%d %dx%d), job card y%d, Cancel (%d,%d %dx%d)%c",
+                     ed->getWidth(), ed->getHeight(), plate.getX(), plate.getRight(), tT.getX(), tT.getRight(),
+                     tC.getX(), tC.getY(), tC.getWidth(), tC.getHeight(), eb.getX(), eb.getY(), eb.getWidth(), eb.getHeight(),
+                     qT.getX(), qT.getRight(), qC.getX(), qC.getY(), qC.getWidth(), qC.getHeight(), jc.getY(),
+                     cb.getX(), cb.getY(), cb.getWidth(), cb.getHeight(), 10);
+        check (plate.contains (tC) && plate.contains (qC), "header counters: both counts lie inside the right plate");
+        check (tC.getX() >= tT.getRight() && qC.getX() >= qT.getRight(), "header counters: counts do not overlap their titles");
+        check (! tC.intersects (eb) && tC.getRight() <= eb.getX(), "header counters: the TAKES count is clear of Edit take");
+        check (! qC.intersects (cb) && ! qC.intersects (jc), "header counters: the QUEUE count is clear of the job card and Cancel");
+        (void) ga;
+    }
     ed.reset();
     p.reset();
     dir.deleteRecursively();
@@ -18318,7 +20513,7 @@ static int runLoopCheck (int argc, char** argv)
     return res.outSamples == expected ? 0 : 1;
 }
 
-// editor-shot [--closed] [--settings] [--select N] [--loop] [--seam] [--playhead] [--warp] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]: the whole editor with the take editor
+// editor-shot [--closed] [--settings] [--midipicker] [--select N] [--loop] [--seam] [--playhead] [--warp] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]: the whole editor with the take editor
 // open on one take, painted off screen into <out.png>, and the panel alone into
 // <out>_panel.png. The take is a generated kick and hat pattern (real level) or a copy
 // of in.wav. No window, no audio device; an existing output is refused. It also prints
@@ -18332,16 +20527,24 @@ static int runLoopCheck (int argc, char** argv)
 // --fit: Fit to bars on, and the result of an Apply crop with a bar count on the result
 // line (the display path only, no job), so that Stretch to fit is on.
 // --takename <name.wav>: the take is registered under that file name (default
-// take_kick_hat_120.wav) and, when no in.wav is given, is steady noise, so its
+// "Kick hat 120.wav") and, when no in.wav is given, is steady noise, so its
 // measurement is uncertain and a tempo in the name shows as the fallback label
 // ("loop_120bpm_x.wav" gives "120.00 bpm (file)"). Test code only.
+static bool rhCapture (HotStepLinkProcessor& proc, FakePlayHead& ph, HotStepLinkEditor* ed);
+
 static int runEditorShot (int argc, char** argv, const juce::File& tmp)
 {
     juce::StringArray rest;
-    bool closedList = false, withSettings = false, withLoop = false, withSeam = false, withSnap = false, withZero = false, noTempo = false, withFit = false, withPlayhead = false, withWarp = false, addMarker = false, removeMarker = false, badName = false, withQuant = false, withCue = false;
+    bool refHintSeenShot = false, noSourceShot = false, firstRunShot = false, captureShot = false;
+    int cardW = 0, cardH = 0;
+    bool closedList = false, withSettings = false, withLoop = false, withSeam = false, withSnap = false, withZero = false, noTempo = false, withFit = false, withPlayhead = false, withWarp = false, addMarker = false, removeMarker = false, badName = false, withQuant = false, withCue = false, withAutoWarp = false, withCut = false, withPin = false, withMidiPicker = false, keyRevealShot = false;
     double zoomShot = 1.0;
     int selectShot = 0;
-    juce::String takeName ("take_kick_hat_120.wav");
+    juce::String takeName ("Kick hat 120.wav");
+    juce::String shotBackend ("-"); // --backend <id|auto>: "-" = leave the default
+    juce::String shotBackends; // --backends <id,id>: a listener in this process lists these, so the rest is marked
+    int shotMenuHighlight = 0; // --menuhighlight <item id>: the highlighted row of that menu (default: the selection)
+    bool withBackendMenu = false; // --backendmenu: with --settings, the Backend menu open (a child of the editor, not a desktop window)
     for (int i = 2; i < argc; ++i)
     {
         const auto arg = juce::String::fromUTF8 (argv[i]);
@@ -18368,6 +20571,14 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             withPlayhead = true;
         else if (arg == "--warp")
             withWarp = true;
+        else if (arg == "--autowarp")
+            withAutoWarp = true;
+        else if (arg == "--pin")
+            withPin = true;
+        else if (arg == "--cutsplice")
+            withLoop = withCut = true;
+        else if (arg == "--nocarry")
+            HotStepLinkProcessor::testNoCarryTempo.store (true);
         else if (arg == "--addmarker")
             withWarp = addMarker = true;
         else if (arg == "--removemarker")
@@ -18382,8 +20593,34 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             selectShot = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]).getIntValue() : 0;
         else if (arg == "--closed")
             closedList = true;
+        else if (arg == "--backend")
+            shotBackend = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]) : juce::String ("-");
+        else if (arg == "--backendmenu")
+            withBackendMenu = true;
+        else if (arg == "--menuhighlight")
+            shotMenuHighlight = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]).getIntValue() : 0;
+        else if (arg == "--backends")
+            shotBackends = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]) : juce::String();
+        else if (arg == "--midipicker")
+            closedList = withMidiPicker = true; // MIDI export picker open over the closed list
         else if (arg == "--settings")
             closedList = withSettings = true; // settings panel open over the closed list
+        else if (arg == "--keyreveal")
+            closedList = withSettings = keyRevealShot = true; // settings panel open, DAW key shown as plain text
+        else if (arg == "--nosource")
+            noSourceShot = true; // clear the SOURCE waveform before the picture
+        else if (arg == "--firstrun")
+            firstRunShot = true; // no source is ever given to the processor (true first run)
+        else if (arg == "--capture")
+            firstRunShot = captureShot = true; // first run, then one real ARM capture through processBlock
+        else if (arg == "--wavecard")
+        {
+            // also write <out>_card.png: the SOURCE waveform view alone at this size, hint on, no source
+            cardW = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]).getIntValue() : 0;
+            cardH = i + 1 < argc ? juce::String::fromUTF8 (argv[++i]).getIntValue() : 0;
+        }
+        else if (arg == "--refhintseen")
+            refHintSeenShot = true; // dismiss the first-run reference hint (writes the scratch settings file only)
         else
             rest.add (arg);
     }
@@ -18399,7 +20636,7 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
     if (badName || ! juce::File::isAbsolutePath (outPath) || (inPath.isNotEmpty() && ! juce::File::isAbsolutePath (inPath))
         || (rest.size() != 0 && rest.size() != 2) || (rest.size() == 2 && (w < 200 || h < 200 || w > 4000 || h > 4000)))
     {
-        std::printf ("usage: HSLINK_Tests editor-shot [--settings] [--loop] [--seam] [--playhead] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]  (full paths)%c", 10);
+        std::printf ("usage: HSLINK_Tests editor-shot [--settings] [--backend <id|auto>] [--backends <id,id>] [--backendmenu] [--menuhighlight <id>] [--midipicker] [--loop] [--seam] [--playhead] [--snap] [--zero] [--notempo] [--fit] [--takename <name.wav>] <out.png> [in.wav] [width height]  (full paths)%c", 10);
         return 2;
     }
     const juce::File out (outPath);
@@ -18437,10 +20674,53 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
         writeWav (take, b, sr);
     }
     int rc = 0;
+    // --backends: the listener outlives the processor and is stopped on every way out.
+    struct ShotStub
+    {
+        BsHttpStub http;
+        bool started = false;
+        ~ShotStub() { if (started) http.stop(); }
+    } shotStub;
     {
         auto p = std::make_unique<HotStepLinkProcessor>();
         p->setStableRoot (tmp.getChildFile ("shot_stable"));
         p->setCollectionRoot (tmp.getChildFile ("shot_coll"));
+        p->apvts.state.setProperty ("serverUrl", "http://localhost:8080", nullptr); // shot only: neutral URL in the picture
+        if (shotBackends.isNotEmpty())
+        {
+            juce::String list;
+            for (const auto& id : juce::StringArray::fromTokens (shotBackends, ",", {}))
+                list << (list.isEmpty() ? "" : ",") << "{\"id\":" << juce::JSON::toString (juce::var (id.trim())) << "}";
+            shotStub.http.statusBody = "{\"api\":1,\"loaded_model\":null,\"base_available\":true,\"non_turbo_available\":false}";
+            shotStub.http.backendsBody = "{\"activeId\":\"\",\"backends\":[" + list + "]}";
+            shotStub.started = shotStub.http.start ("");
+            p->daw.listBackends = true;
+            const bool urlOk = shotStub.started && shotStub.http.port != 3001 && shotStub.http.port != 8085 && p->setServerUrl (shotStub.http.url());
+            bool known = false;
+            for (int k = 0; urlOk && k < 600 && ! known; ++k)
+            {
+                const auto s = p->daw.getSnapshot();
+                known = s.online && s.backendsKnown;
+                if (! known)
+                    juce::Thread::sleep (20);
+            }
+            std::printf ("editor-shot: backends '%s' from a listener on 127.0.0.1:%d, list read=%d ids '%s'%c", shotBackends.toRawUTF8(),
+                         shotStub.http.port, known ? 1 : 0, p->daw.getSnapshot().backendIds.joinIntoString (",").toRawUTF8(), 10);
+            if (! known)
+                return 1;
+        }
+        if (shotBackend != "-")
+        {
+            const juce::String want = shotBackend == "auto" ? juce::String() : shotBackend;
+            if (auto* bp = p->apvts.getParameter ("backend"))
+                for (int bi = 0; bi < 16; ++bi)
+                    if (HotStepLinkProcessor::backendIdForIndex (bi) == want)
+                    {
+                        bp->setValueNotifyingHost (bp->convertTo0to1 ((float) bi));
+                        break;
+                    }
+            std::printf ("editor-shot: backend '%s'%c", p->getSelectedBackendId().toRawUTF8(), 10);
+        }
         DawJob j;
         j.localId = 1;
         j.request.caption = "editor shot";
@@ -18460,13 +20740,14 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
         }
         if (closedList)
         {
-            // --closed: take editor closed; three more takes (8 s and 7 s at 120 bpm,
-            // 6 s at 100 bpm) and host 120 bpm 4/4, so the take list shows fit tags.
+            // --closed: take editor closed; three more takes (8 s, 7 s and 6 s at
+            // 120 bpm) and host 120 bpm 4/4, so the take list shows fit tags.
             const double lens[] = { 8.0, 7.0, 6.0 };
-            const double bpms[] = { 120.0, 120.0, 100.0 };
+            const double bpms[] = { 120.0, 120.0, 120.0 }; // all at the host tempo: every take shows a green fit
+            const char* shotNames[] = { "Dusty keys loop", "Sub bass 120", "Vox chop" }; // public-screenshot names
             for (int k = 0; k < 3; ++k)
             {
-                const auto f = take.getSiblingFile ("take_shot_" + juce::String (k + 2) + ".wav");
+                const auto f = take.getSiblingFile (juce::String (shotNames[k]) + ".wav");
                 auto x = TempoTest::render (TempoTest::drums (TempoTest::steadyBeats (bpms[k], 0.0, lens[k])), 48000.0, lens[k]);
                 juce::AudioBuffer<float> b (2, (int) x.size());
                 b.copyFrom (0, 0, x.data(), (int) x.size());
@@ -18487,14 +20768,37 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             p->hostSync.bpm.store (120.0);
             p->hostSync.timeSigNum.store (4);
             p->hostSync.bpmKnown.store (true);
+            p->hostSync.hostSyncActive.store (true); // a real host session: the sync cells read 120.00 and 4/4, not "--"
             // SOURCE panel: the 8 s take as the source clip, so the waveform is drawn.
-            p->setSourceFile (take.getSiblingFile ("take_shot_2.wav"));
+            if (! firstRunShot)
+                p->setSourceFile (take.getSiblingFile ("Dusty keys loop.wav"));
+            FakePlayHead shotHead; // --capture only
             auto ed = std::make_unique<HotStepLinkEditor> (*p);
             if (w > 0)
                 ed->setSize (w, h);
             ed->runRefreshForTest();
             juce::Thread::sleep (300);
             ed->runRefreshForTest();
+            if (captureShot)
+            {
+                const bool hintBefore = ed->sourceWaveForTest().refHintShowing();
+                shotHead.info.setBpm (120.0);
+                shotHead.info.setTimeSignature (juce::AudioPlayHead::TimeSignature { 4, 4 });
+                shotHead.info.setIsLooping (true);
+                shotHead.info.setLoopPoints (juce::AudioPlayHead::LoopPoints { 0.0, 4.0 });
+                p->setPlayHead (&shotHead);
+                p->prepareToPlay (44100.0, 512);
+                const bool got = rhCapture (*p, shotHead, ed.get());
+                p->setPlayHead (nullptr);
+                for (int k = 0; k < 100 && ! ed->sourceWaveForTest().hasPeaksForTest(); ++k)
+                {
+                    juce::Thread::sleep (20);
+                    ed->runRefreshForTest();
+                }
+                std::printf ("editor-shot: capture done=%d hint before=%d after=%d seen=%d peaks=%d%c", got ? 1 : 0, hintBefore ? 1 : 0,
+                             ed->sourceWaveForTest().refHintShowing() ? 1 : 0, ed->refHintSeenForTest() ? 1 : 0,
+                             ed->sourceWaveForTest().hasPeaksForTest() ? 1 : 0, 10);
+            }
             if (selectShot > 0 && selectShot <= (int) p->getTakes().size())
             {
                 // --select N: take N selected and one MIDI export done, so Export MIDI and the chip are live.
@@ -18508,11 +20812,99 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             for (auto* c : ed->getChildren())
                 if (auto* o = dynamic_cast<OfflineOverlay*> (c))
                     o->setVisible (false);
+            int midiFindings = 0;
+            if (withMidiPicker)
+            {
+                ed->setMidiPickerOpenForTest (true);
+                std::printf ("editor-shot: MIDI picker open=%d%c", ed->midiPickerForTest().isVisible() ? 1 : 0, 10);
+                // Same layout audit as the other shot modes: overlaps, outside the card, R15 tier, text fit.
+                auto& mp = ed->midiPickerForTest();
+                if (juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "MP_OVERLAP")
+                    mp.perBeatButton.setBounds (mp.oneFileButton.getBounds().translated (20, 0));
+                int mOver = 0, mOut = 0, mSmall = 0, mClip = 0;
+                const auto kids = mp.getChildren();
+                for (int a = 0; a < kids.size(); ++a)
+                {
+                    const auto r = kids[a]->getBounds();
+                    juce::String txt;
+                    float tw = 0.0f;
+                    bool on = false;
+                    if (auto* tb = dynamic_cast<juce::TextButton*> (kids[a]))
+                    {
+                        txt = tb->getButtonText();
+                        on = tb->getToggleState();
+                        tw = juce::GlyphArrangement::getStringWidth (mp.getLookAndFeel().getTextButtonFont (*tb, r.getHeight()), txt);
+                        mClip += tw + 8.0f > (float) r.getWidth() ? 1 : 0;
+                        mSmall += takeButtonUnderTier (r) ? 1 : 0;
+                    }
+                    mOut += mp.getLocalBounds().contains (r) ? 0 : 1;
+                    std::printf ("  picker %-16s %4d %4d %4d %4d on=%d text %.1f px%c", txt.toRawUTF8(), r.getX(), r.getY(), r.getWidth(), r.getHeight(), on ? 1 : 0, (double) tw, 10);
+                    for (int b = a + 1; b < kids.size(); ++b)
+                        if (r.intersects (kids[b]->getBounds()))
+                        {
+                            ++mOver;
+                            std::printf ("  OVERLAP: picker child %d and %d%c", a, b, 10);
+                        }
+                }
+                const bool wordsOff = mp.oneFileButton.getButtonText() == "Separate files" && mp.perBeatButton.getButtonText() == "Per bar";
+                std::printf ("editor-shot: MIDI picker audit overlaps=%d outside=%d under-tier=%d clipped text=%d (want 0) off-state words=%d (want 1)%c",
+                             mOver, mOut, mSmall, mClip, (int) wordsOff, 10);
+                midiFindings = mOver + mOut + mSmall + mClip + (wordsOff ? 0 : 1);
+            }
             if (withSettings)
             {
                 // --settings: default settings in memory; the key store is the temp file set in main.
                 ed->setSettingsOpenForTest (true); // no refresh after: it would bring the offline overlay back
                 std::printf ("editor-shot: settings panel open=%d%c", ed->settingsOpenForTest() ? 1 : 0, 10);
+                if (keyRevealShot && ed->keyRevealButtonForTest().onClick != nullptr)
+                    ed->keyRevealButtonForTest().onClick(); // --keyreveal: the Show click, after the panel opened masked
+                {
+                    // Geometry of the key row for the arithmetic overlap check (never the key text).
+                    const auto kb = ed->keyEditorForTest().getBounds();
+                    const auto bb = ed->keyRevealButtonForTest().getBounds();
+                    std::printf ("editor-shot: key reveal=%d mask=%d field x=%d w=%d y=%d h=%d button '%s' x=%d w=%d y=%d h=%d gap=%d panel w=%d%c",
+                                 ed->keyRevealedForTest() ? 1 : 0, (int) ed->keyEditorForTest().getPasswordCharacter(),
+                                 kb.getX(), kb.getWidth(), kb.getY(), kb.getHeight(),
+                                 ed->keyRevealButtonForTest().getButtonText().toRawUTF8(), bb.getX(), bb.getWidth(), bb.getY(), bb.getHeight(),
+                                 bb.getX() - kb.getRight(), ed->keyEditorForTest().getParentWidth(), 10);
+                }
+                ed->applyBackendRefLockForTest();
+                std::printf ("editor-shot: ref lock repaint=%d lego=%d strength=%d note=%d%c", ed->modeItemEnabledForTest (2) ? 1 : 0,
+                             ed->modeItemEnabledForTest (3) ? 1 : 0, ed->strengthEditorForTest().isEnabled() ? 1 : 0,
+                             ed->refLockNoteForTest().isVisible() ? 1 : 0, 10);
+#if defined (HSLINK_TEST_HOOKS)
+                if (withBackendMenu)
+                {
+                    // The menu ComboBox::showPopup builds (root menu copy, tick on the selection,
+                    // the combo's look-and-feel and options), with one difference: the editor is
+                    // its parent component, so the menu window is a child and never on the desktop.
+                    auto& box = ed->backendBoxForTest();
+                    const int kidsBefore = ed->getNumChildComponents();
+                    const int hi = shotMenuHighlight > 0 ? shotMenuHighlight : box.getSelectedId();
+                    if (auto* root = box.getRootMenu())
+                    {
+                        juce::PopupMenu menu (*root);
+                        for (juce::PopupMenu::MenuItemIterator it (menu, true); it.next();)
+                            it.getItem().isTicked = it.getItem().itemID == box.getSelectedId();
+                        menu.setLookAndFeel (&box.getLookAndFeel());
+                        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&box).withParentComponent (ed.get())
+                                                .withItemThatMustBeVisible (box.getSelectedId()).withInitiallySelectedItem (hi)
+                                                .withMinimumWidth (box.getWidth()).withMaximumNumColumns (1)
+                                                .withStandardItemHeight (box.getHeight()));
+                    }
+                    auto* mw = ed->getNumChildComponents() > kidsBefore ? ed->getChildComponent (ed->getNumChildComponents() - 1) : nullptr;
+                    juce::String mk, en;
+                    for (int i = 0; i < HotStepLinkProcessor::kBackendChoices; ++i)
+                    {
+                        mk << (ed->backendItemMarkedForTest (i) ? "1" : "0");
+                        en << (box.isItemEnabled (i + 1) ? "1" : "0");
+                    }
+                    std::printf ("editor-shot: backend menu child added=%d visible=%d bounds %s on desktop=%d (editor on desktop=%d); items enabled=%s marked=%s highlighted id %d%c",
+                                 mw != nullptr ? 1 : 0, mw != nullptr && mw->isVisible() ? 1 : 0,
+                                 mw != nullptr ? mw->getBounds().toString().toRawUTF8() : "-", mw != nullptr && mw->isOnDesktop() ? 1 : 0,
+                                 ed->isOnDesktop() ? 1 : 0, en.toRawUTF8(), mk.toRawUTF8(), hi, 10);
+                }
+#endif
             }
             for (const auto& t : p->getTakes())
             {
@@ -18520,11 +20912,62 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
                 std::printf ("editor-shot: closed list take '%s' fit score %d tag '%s'%c", t.name.toRawUTF8(), cell != nullptr ? cell->fitScore : -2,
                              cell != nullptr ? TakeGrid::fitTagOf (cell->fitScore).text.toRawUTF8() : "-", 10);
             }
+            {
+                // First-run reference hint: state, area and fit numbers beside the picture.
+                auto& sw = ed->sourceWaveForTest();
+                const bool seenAtOpen = ed->refHintSeenForTest();
+                if (noSourceShot)
+                    sw.setSource (juce::File(), 0.0, 0.0); // the waveform card as with no capture (the shot seeds a source otherwise)
+                if (refHintSeenShot)
+                    ed->dismissRefHintForTest();
+                const auto wa = sw.waveArea();
+                const auto lines = SourceWaveView::refHintFor (false, wa);
+                {
+                    // Rectangles in editor coordinates, for the pixel measurements beside the picture.
+                    const auto sp = ed->sourcePanelForTest();
+                    const auto wr = wa + sw.getPosition();
+                    const auto nr = ed->refLockNoteForTest().getBounds() + ed->settingsPopoverBoundsForTest().getPosition();
+                    const auto pr = ed->settingsPopoverBoundsForTest();
+                    std::printf ("editor-shot: rects source card %d %d %d %d | wave view %d %d %d %d | wave area %d %d %d %d | settings card %d %d %d %d | note label %d %d %d %d (visible=%d) | source text '%s' | source loaded=%d peaks=%d%c",
+                                 sp.getX(), sp.getY(), sp.getWidth(), sp.getHeight(), sw.getX(), sw.getY(), sw.getWidth(), sw.getHeight(),
+                                 wr.getX(), wr.getY(), wr.getWidth(), wr.getHeight(), pr.getX(), pr.getY(), pr.getWidth(), pr.getHeight(),
+                                 nr.getX(), nr.getY(), nr.getWidth(), nr.getHeight(), ed->refLockNoteForTest().isVisible() ? 1 : 0,
+                                 ed->sourceTextForTest().toRawUTF8(), p->sourceLoaded() ? 1 : 0, sw.hasPeaksForTest() ? 1 : 0, 10);
+                }
+                if (cardW >= 40 && cardH >= 40 && cardW <= 2000 && cardH <= 400)
+                {
+                    SourceWaveView card;
+                    card.setBounds (0, 0, cardW, cardH);
+                    card.setRefHint (true, false);
+                    const auto ca = card.waveArea();
+                    const auto cl = SourceWaveView::refHintFor (false, ca);
+                    juce::Image ci (juce::Image::ARGB, cardW + 12, cardH + 12, true);
+                    {
+                        juce::Graphics cg (ci);
+                        cg.fillAll (juce::Colour (0xff111521)); // the card plate colour
+                        cg.setColour (juce::Colour (0x38a0aac8));
+                        cg.drawRect (0, 0, cardW + 12, cardH + 12);
+                        cg.setOpacity (1.0f);
+                        cg.drawImageAt (card.createComponentSnapshot (card.getLocalBounds(), true, 1.0f), 6, 6);
+                    }
+                    const auto cf = out.getSiblingFile (out.getFileNameWithoutExtension() + "_card.png");
+                    juce::FileOutputStream cs (cf);
+                    const bool cok = ! cf.existsAsFile() || cs.getPosition() == 0;
+                    const bool wrote = cok && cs.openedOk() && juce::PNGImageFormat().writeImageToStream (ci, cs);
+                    std::printf ("editor-shot: wave card %dx%d wave area %dx%d lines=%d showing=%d first '%s' wrote %s (%d)%c", cardW, cardH, ca.getWidth(), ca.getHeight(),
+                                 cl.size(), card.refHintShowing() ? 1 : 0, cl.isEmpty() ? "" : cl[0].toRawUTF8(), cf.getFullPathName().toRawUTF8(), wrote ? 1 : 0, 10);
+                }
+                std::printf ("editor-shot: ref hint seen at open=%d now=%d stored=%d showing=%d wave area %dx%d lines=%d need h=%d settings file '%s'%c",
+                             seenAtOpen ? 1 : 0, ed->refHintSeenForTest() ? 1 : 0, HotStepLinkProcessor::loadRefHintSeen() ? 1 : 0,
+                             sw.refHintShowing() ? 1 : 0, wa.getWidth(), wa.getHeight(), lines.size(),
+                             lines.size() * SourceWaveView::kRefHintLineH, HotStepLinkProcessor::keyStoreFile().getFullPathName().toRawUTF8(), 10);
+            }
             juce::FileOutputStream os (out);
             const auto img = ed->createComponentSnapshot (ed->getLocalBounds(), true, 1.0f);
             const bool ok = img.isValid() && os.openedOk() && juce::PNGImageFormat().writeImageToStream (img, os);
             std::printf ("editor-shot: closed list wrote %s (%d), %d takes%c", out.getFullPathName().toRawUTF8(), (int) ok, (int) p->getTakes().size(), 10);
-            return ok ? 0 : 1;
+            juce::PopupMenu::dismissAllActiveMenus();
+            return ok && midiFindings == 0 ? 0 : 1; // rc=1 on picker audit findings
         }
         auto ed = std::make_unique<HotStepLinkEditor> (*p);
         if (w > 0)
@@ -18562,7 +21005,7 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             r.ticket = 1;
             r.ok = r.result.ok = true;
             r.sourceName = takes[0].name;
-            r.newName = "take_kick_hat_120_a1b2c3d4e5f6_lp8_0123456789abcdef.wav";
+            r.newName = "Kick hat 120_a1b2c3d4e5f6_lp8_0123456789abcdef.wav";
             r.result.sampleRate = 48000.0;
             r.result.outSamples = 8 * 122880;
             r.result.seamFadeSamples = 240;
@@ -18580,7 +21023,7 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             r.ticket = 1;
             r.ok = r.result.ok = true;
             r.sourceName = takes[0].name;
-            r.newName = "take_kick_hat_120_edc1a2b.wav";
+            r.newName = "Kick hat 120_edc1a2b.wav";
             r.result.sampleRate = panel.sampleRateForTest();
             r.result.outSamples = region;
             r.result.bars = fit.bars;
@@ -18619,6 +21062,125 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
                 bars += b.label > 0 ? 1 : 0;
             }
             std::printf ("editor-shot: ruler bar labels=%d beat labels=%d%c", bars, tags, 10);
+        }
+        if (withCut)
+        {
+            // F2: Cut / Splice of the loop region, the job waited for, then the join measured.
+            const juce::int64 before = panel.getLengthForTest(), cs0 = panel.getLoopStartForTest(), ce0 = panel.getLoopEndForTest();
+            const bool en = panel.cutSpliceEnabledForTest();
+            panel.clickCutSpliceForTest();
+            const auto ticket = panel.waitTicketForTest();
+            const bool disabledWhileWaiting = ! panel.cutSpliceEnabledForTest();
+            for (int i = 0; i < 1000 && panel.waitingForTest(); ++i)
+            {
+                juce::Thread::sleep (10);
+                ed->runRefreshForTest();
+            }
+            HotStepLinkProcessor::TakeEditReport r;
+            const bool got = p->getTakeEditReport (ticket, r);
+            const auto& res = r.result;
+            const juce::int64 region = ce0 - cs0, x = res.seamFadeSamples;
+            std::printf ("editor-shot: cutsplice enabled=%d disabledWhileWaiting=%d ticket=%llu got=%d ok=%d new='%s' region S=%lld E=%lld%c", en ? 1 : 0,
+                         disabledWhileWaiting ? 1 : 0, (unsigned long long) ticket, got ? 1 : 0, r.ok ? 1 : 0, r.newName.toRawUTF8(), (long long) cs0, (long long) ce0, 10);
+            std::printf ("editor-shot: cutsplice length before=%lld after=%lld removed=%lld xfade=%lld; before - region - xfade = %lld - %lld - %lld = %lld (match=%d)%c",
+                         (long long) before, (long long) res.outSamples, (long long) res.cutRemoved, (long long) x, (long long) before, (long long) region, (long long) x,
+                         (long long) (before - region - x), (int) (res.outSamples == before - region - x), 10);
+            juce::File made;
+            for (const auto& t : p->getTakes())
+                if (t.name == r.newName)
+                    made = t.temp;
+            for (const auto& t : p->getTakes()) // F4b: the take fields, source and derived
+            {
+                const auto tag = TakeGrid::tempoTagOf (t.tempoState, t.tempo);
+                std::printf ("editor-shot: F4b take name='%s' state=%d bpm=%.3f drift=%.1f downbeat=%.4f entryBpm=%.3f pill='%s' carryOff=%d%c", t.name.toRawUTF8(), (int) t.tempoState,
+                             t.tempo.bpm, t.tempo.driftMs, t.tempo.downbeatSec, t.bpm, tag.text.toRawUTF8(), (int) HotStepLinkProcessor::testNoCarryTempo.load(), 10);
+            }
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::AudioFormatReader> rd (made.existsAsFile() ? wav.createReaderFor (new juce::FileInputStream (made), true) : nullptr);
+            if (rd != nullptr && rd->lengthInSamples > 0)
+            {
+                juce::AudioBuffer<float> b ((int) rd->numChannels, (int) rd->lengthInSamples);
+                rd->read (&b, 0, b.getNumSamples(), 0, true, true);
+                const int j0 = (int) juce::jmax ((juce::int64) 1, cs0 - x), j1 = (int) juce::jmin ((juce::int64) b.getNumSamples() - 1, cs0 + 1);
+                float maxStep = 0.0f;
+                for (int c = 0; c < b.getNumChannels(); ++c)
+                    for (int i = j0; i <= j1; ++i)
+                        maxStep = juce::jmax (maxStep, std::abs (b.getSample (c, i) - b.getSample (c, i - 1)));
+                std::printf ("editor-shot: cutsplice file frames=%lld; join ch0 around fade start %d: %.5f %.5f %.5f | around fade end %d: %.5f %.5f %.5f; max abs step in [%d, %d] = %.5f (under 0.05=%d)%c",
+                             (long long) rd->lengthInSamples, j0, b.getSample (0, j0 - 1), b.getSample (0, j0), b.getSample (0, j0 + 1), j1,
+                             b.getSample (0, j1 - 1), b.getSample (0, j1), b.getSample (0, juce::jmin (j1 + 1, b.getNumSamples() - 1)), j0, j1, maxStep, (int) (maxStep < 0.05f), 10);
+            }
+            else
+                std::printf ("editor-shot: cutsplice result file not readable%c", 10);
+        }
+        if (withAutoWarp)
+        {
+            // F1: AUTO-WARP on the take, then undo and redo (the shot shows the markers placed).
+            const int before = (int) panel.warpMarkersForTest().size();
+            const bool en = panel.autoWarpEnabledForTest();
+            const int placed = panel.autoWarpForTest();
+            const auto& a = panel.lastAutoWarpForTest();
+            const int after = (int) panel.warpMarkersForTest().size();
+            std::printf ("editor-shot: autowarp enabled=%d bpm=%.3f offset=%.4f s host=%.3f level=%d confidence=%.3f beats=%d markers=%d%c",
+                         en ? 1 : 0, a.bpm, a.downbeatSec, a.hostBpm, a.level, a.confidence, a.beats, placed, 10);
+            const bool u = panel.undoForTest();
+            const int afterUndo = (int) panel.warpMarkersForTest().size();
+            const double undoBpm = panel.detectedGridForTest().bpm;
+            const bool rd = panel.redoForTest();
+            std::printf ("editor-shot: autowarp undo markers before=%d after=%d afterUndo=%d (undo=%d redo=%d, detected bpm %.3f) afterRedo=%d%c",
+                         before, after, afterUndo, u ? 1 : 0, rd ? 1 : 0, undoBpm, (int) panel.warpMarkersForTest().size(), 10);
+        }
+        if (withPin)
+        {
+            // F3: AUTO-WARP, select marker 3, drag it off its beat, pin it, then AUTO-WARP
+            // and Quantize again: the pinned marker must stay; undo restores the unpinned state.
+            auto dump = [&] (const char* tag)
+            {
+                const auto& w = panel.warpMarkersForTest();
+                std::printf ("editor-shot: pin %s n=%d add=%d remove=%d:", tag, (int) w.size(), panel.pinAddEnabledForTest() ? 1 : 0, panel.pinRemoveEnabledForTest() ? 1 : 0);
+                for (std::size_t k = 1; k < w.size() && k <= 5; ++k)
+                    std::printf (" [%d src=%lld dst=%lld pin=%d]", (int) k, (long long) w[k].srcFrame, (long long) w[k].dstFrame, w[k].pinned ? 1 : 0);
+                std::printf ("%c", 10);
+                // Print-only: each region's src span, dst span and speed (WarpMarkers::speedPercent).
+                for (std::size_t k = 0; k + 1 < w.size(); ++k)
+                {
+                    const auto sl = (double) (w[k + 1].srcFrame - w[k].srcFrame), dl = (double) (w[k + 1].dstFrame - w[k].dstFrame);
+                    std::printf ("editor-shot: pin %s seg %d-%d src=%.0f dst=%.0f pct=%.3f (src/dst x100 %.3f)%c", tag, (int) k, (int) k + 1, sl, dl,
+                                 WarpMarkers::regionPercent (w, k), dl > 0.0 ? sl / dl * 100.0 : 0.0, 10);
+                }
+            };
+            panel.autoWarpForTest();
+            panel.selectWarpMarkerForTest (3, false);
+            const auto d3 = panel.warpMarkersForTest().size() > 4 ? panel.warpMarkersForTest()[3].dstFrame : 0;
+            panel.dragWarpForTest (3, d3 + 3000);
+            dump ("beforePin");
+            const int pinned = panel.clickPinForTest (true);
+            dump ("afterPin");
+            const auto keep = panel.warpMarkersForTest()[3];
+            panel.autoWarpForTest();
+            int at = -1;
+            for (std::size_t k = 0; k < panel.warpMarkersForTest().size(); ++k)
+                if (panel.warpMarkersForTest()[k].pinned)
+                    at = (int) k;
+            dump ("afterAutoWarp2");
+            const auto pinAfter = at >= 0 ? panel.warpMarkersForTest()[(std::size_t) at] : WarpMarkers::Marker {};
+            panel.selectWarpMarkerForTest (at, false);
+            const int q = panel.clickQuantizeForTest();
+            dump ("afterQuantize");
+            const auto pinAfterQ = at >= 0 ? panel.warpMarkersForTest()[(std::size_t) at] : WarpMarkers::Marker {};
+            std::printf ("editor-shot: pin pinned=%d at=%d stayed=%d quantMoved=%d stayedQ=%d%c", pinned, at,
+                         (pinAfter.srcFrame == keep.srcFrame && pinAfter.dstFrame == keep.dstFrame && pinAfter.pinned) ? 1 : 0, q,
+                         (pinAfterQ.srcFrame == keep.srcFrame && pinAfterQ.dstFrame == keep.dstFrame) ? 1 : 0, 10);
+            if (q > 0)
+                panel.undoForTest(); // quantize made a step only if something moved
+            panel.undoForTest();
+            dump ("afterUndo1");
+            panel.undoForTest();
+            dump ("afterUndo2");
+            panel.redoForTest();
+            panel.redoForTest();
+            panel.selectWarpMarkerForTest (at, false);
+            dump ("final");
         }
         if (withWarp)
         {
@@ -18769,8 +21331,95 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
         };
         const bool ok1 = save (ed->createComponentSnapshot (ed->getLocalBounds(), true, 1.0f), out);
         const bool ok2 = save (panel.createComponentSnapshot (panel.getLocalBounds(), true, 1.0f), panelOut);
+        std::printf ("editor-shot: D2 wave height=%d gain=%.3f peak fill=%.1f %% of lane half-height%c", panel.waveAreaForTest().getHeight(), (double) panel.waveGainForTest(), 100.0 * (double) panel.wavePeakFillForTest(), 10);
         std::printf ("editor-shot: wrote %s (%d) and %s (%d)%c", out.getFullPathName().toRawUTF8(), (int) ok1, panelOut.getFullPathName().toRawUTF8(), (int) ok2, 10);
         rc = opened && panel.peaksReadyForTest() && ok1 && ok2 ? 0 : 1;
+        if (withPin)
+        {
+            // F4c: every drawn speed label fits its column whole and is never a cut form.
+            // F4d: when the percent form does not fit, the bare number is drawn if it fits; every
+            // warped region's hover tooltip is its full percent. Teeth: HSLINK_TEETH=NO_WARP_FALLBACK / NO_WARP_TIP.
+            const auto teethW = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+            if (teethW == "NO_WARP_FALLBACK")
+                TakeEditorMath::testMutant.store (TakeEditorMath::mutWarpNoFallback);
+            else if (teethW == "NO_WARP_TIP")
+                TakeEditorMath::testMutant.store (TakeEditorMath::mutWarpNoTip);
+            else if (teethW == "NO_NEAR100_SKIP")
+                TakeEditorMath::testMutant.store (TakeEditorMath::mutWarpNoNear100Skip);
+            else if (teethW == "NO_FLAG_CLEAR")
+                TakeEditorMath::testMutant.store (TakeEditorMath::mutWarpNoFlagClear);
+            else if (teethW == "LABELS_UNDER_DIM")
+                TakeEditorMath::testMutant.store (TakeEditorMath::mutWarpLabelsUnderDim);
+            int drawn = 0, bad = 0, near100Drawn = 0, flagHits = 0;
+            for (const auto& f : panel.cropFlagRects())
+                std::printf ("editor-shot: F4e flag rect %d %d %d %d%c", f.getX(), f.getY(), f.getWidth(), f.getHeight(), 10);
+            for (const auto& l : panel.warpLabelsForTest())
+            {
+                const auto full = juce::String (juce::roundToInt (l.pct)) + "%";
+                const auto bare = juce::String (juce::roundToInt (l.pct));
+                const float wFull = TakeEditorPanel::warpTextWidthForTest (full), wBare = TakeEditorPanel::warpTextWidthForTest (bare);
+                // F4e: near-100 and flag-cleared labels are checked by the F4e counts below, not the fallback rule.
+                const bool near100 = std::abs (l.pct - 100.0) < 0.5;
+                const juce::Rectangle<int> barePlate (l.x - 2, panel.waveAreaForTest().getY() + 2, juce::jmin (l.room + 2, (int) std::ceil (wBare) + 4), 14);
+                bool bareUnderFlag = false;
+                for (const auto& f : panel.cropFlagRects())
+                    bareUnderFlag = bareUnderFlag || barePlate.intersects (f);
+                const bool wantBare = ! near100 && ! bareUnderFlag && wFull > (float) l.room && wBare <= (float) l.room;
+                near100Drawn += near100 && l.text.isNotEmpty() ? 1 : 0;
+                flagHits += l.flagHit ? 1 : 0;
+                std::printf ("editor-shot: F4e seg %d pct=%.3f column x=%d text='%s' rect=%d %d %d %d near100=%d flag overlap=%d%s%c", l.seg, l.pct, l.x, l.text.toRawUTF8(),
+                             l.rect.getX(), l.rect.getY(), l.rect.getWidth(), l.rect.getHeight(), near100 ? 1 : 0, l.flagHit ? 1 : 0,
+                             (near100 && l.text.isNotEmpty()) || l.flagHit ? "  FAIL" : "", 10);
+                const bool fallbackOk = ! wantBare || l.text == bare;
+                const bool tipOk = l.tip == full;
+                bad += fallbackOk && tipOk ? 0 : 1;
+                std::printf ("editor-shot: F4d seg %d column=%d full='%s' %.2f px bare=%.2f px chosen='%s' tooltip='%s' fallback ok=%d tip ok=%d%s%c", l.seg, l.room, full.toRawUTF8(),
+                             (double) wFull, (double) wBare, l.text.toRawUTF8(), l.tip.toRawUTF8(), fallbackOk ? 1 : 0, tipOk ? 1 : 0, fallbackOk && tipOk ? "" : "  FAIL", 10);
+                const auto last = l.text.isEmpty() ? (juce::juce_wchar) 0 : l.text.getLastCharacter();
+                const auto num = last == '%' ? l.text.dropLastCharacters (1) : l.text;
+                const bool whole = l.text.isEmpty() || (num.containsOnly ("0123456789.") && ! num.endsWithChar ('.') && num.isNotEmpty());
+                const bool fits = l.text.isEmpty() || l.width <= (float) l.room;
+                drawn += l.text.isNotEmpty() ? 1 : 0;
+                bad += whole && fits ? 0 : 1;
+                std::printf ("editor-shot: F4c label seg %d pct=%.3f text='%s' width=%.2f column=%d x=%d drawn=%d fits=%d whole=%d%s%c", l.seg, l.pct, l.text.toRawUTF8(),
+                             (double) l.width, l.room, l.x, l.text.isNotEmpty() ? 1 : 0, fits ? 1 : 0, whole ? 1 : 0, whole && fits ? "" : "  FAIL", 10);
+            }
+            // F4f: render the panel and sample each drawn label: brightest glyph pixel against its plate,
+            // WCAG contrast 12:1 or better, inside and outside the crop. Teeth: HSLINK_TEETH=LABELS_UNDER_DIM.
+            int lowContrast = 0, sampled = 0;
+            {
+                const auto img = panel.createComponentSnapshot (panel.getLocalBounds(), true, 1.0f);
+                const juce::Image::BitmapData bd (img, juce::Image::BitmapData::readOnly);
+                auto lin = [] (int c) { const double v = c / 255.0; return v <= 0.03928 ? v / 12.92 : std::pow ((v + 0.055) / 1.055, 2.4); };
+                auto lum = [&lin] (juce::Colour c) { return 0.2126 * lin (c.getRed()) + 0.7152 * lin (c.getGreen()) + 0.0722 * lin (c.getBlue()); };
+                const auto wa = panel.waveAreaForTest();
+                for (const auto& l : panel.warpLabelsForTest())
+                {
+                    if (l.text.isEmpty())
+                        continue;
+                    const auto pr = l.rect.reduced (0, 1).getIntersection (wa).getIntersection (img.getBounds());
+                    if (pr.isEmpty())
+                        continue;
+                    const auto plateC = bd.getPixelColour (pr.getX(), pr.getCentreY());
+                    juce::Colour glyph = plateC;
+                    for (int y = pr.getY(); y < pr.getBottom(); ++y)
+                        for (int x = pr.getX(); x < pr.getRight(); ++x)
+                            if (lum (bd.getPixelColour (x, y)) > lum (glyph))
+                                glyph = bd.getPixelColour (x, y);
+                    const double ratio = (lum (glyph) + 0.05) / (lum (plateC) + 0.05);
+                    ++sampled;
+                    lowContrast += ratio >= 12.0 ? 0 : 1;
+                    std::printf ("editor-shot: F4f label seg %d '%s' x=%d glyph max=%d,%d,%d plate=%d,%d,%d contrast=%.1f:1 (want >= 12)%s%c", l.seg, l.text.toRawUTF8(), pr.getX(),
+                                 glyph.getRed(), glyph.getGreen(), glyph.getBlue(), plateC.getRed(), plateC.getGreen(), plateC.getBlue(), ratio, ratio >= 12.0 ? "" : "  FAIL", 10);
+                }
+            }
+            std::printf ("editor-shot: F4f labels sampled=%d under 12:1=%d (want 0)%c", sampled, lowContrast, 10);
+            std::printf ("editor-shot: F4c labels drawn=%d bad=%d (want 0) panel %dx%d%c", drawn, bad, panel.getWidth(), panel.getHeight(), 10);
+            std::printf ("editor-shot: F4e near-100 labels drawn=%d (want 0) labels over S/E flags=%d (want 0)%c", near100Drawn, flagHits, 10);
+            TakeEditorMath::testMutant.store (TakeEditorMath::mutNone);
+            if (bad > 0 || drawn == 0 || near100Drawn > 0 || flagHits > 0 || lowContrast > 0 || sampled == 0)
+                rc = 1;
+        }
 
         // Bounds of every control and reserved row, panel coordinates (x y w h).
         const auto areas = panel.areasForTest();
@@ -18783,16 +21432,18 @@ static int runEditorShot (int argc, char** argv, const juce::File& tmp)
             const auto& r = areas[a].bounds;
             std::printf ("  %-26s %4d %4d %4d %4d  %s%c", areas[a].name.toRawUTF8(), r.getX(), r.getY(), r.getWidth(), r.getHeight(), areas[a].hit ? "hit" : "-", 10);
             outside += panel.getLocalBounds().contains (r) ? 0 : 1;
-            small += areas[a].button && (r.getWidth() < 48 || r.getHeight() < 24) ? 1 : 0;
+            small += areas[a].button && takeButtonUnderTier (r) ? 1 : 0; // R15 tiers (V5B_RULES:47)
             for (size_t b = a + 1; b < areas.size(); ++b)
-                if (r.intersects (areas[b].bounds))
+                if (r.intersects (areas[b].bounds) && ! takeAreasShareByDesign (areas[a].name, areas[b].name)) // Readout/Result line share by design
                 {
                     ++overlaps;
                     std::printf ("  OVERLAP: %s and %s%c", areas[a].name.toRawUTF8(), areas[b].name.toRawUTF8(), 10);
                 }
         }
-        std::printf ("editor-shot: %d areas, overlapping pairs=%d (want 0), outside the panel=%d (want 0), buttons and boxes under 48 x 24=%d (want 0)%c", (int) areas.size(),
+        std::printf ("editor-shot: %d areas, overlapping pairs=%d (want 0), outside the panel=%d (want 0), buttons under R15 tier=%d (want 0)%c", (int) areas.size(),
                      overlaps, outside, small, 10);
+        if (overlaps > 0 || small > 0)
+            rc = 1; // the audit fails the run: an overlap or an under-tier target is a layout bug
         ed.reset();
     }
     return rc;
@@ -20243,8 +22894,16 @@ static void testMidiDrag (const juce::File& tmp)
     in.hasTempo = true;
     const auto dest = base.getChildFile ("out");
     const auto files = buildMidiFilesForDrag (in, dest);
-    std::printf ("  build returned %d files (want 2)%c", files.size(), 10);
-    check (files.size() == 2, "mididrag: hits and tempo files returned");
+    std::printf ("  build returned %d files (want 3: hits, melody, tempo)%c", files.size(), 10);
+    // The fixture is a steady sine, so it is tonal: the drag returns every written file (hits,
+    // melody, tempo), as the editor's Saved-to list does (MidiBuildResult::files()).
+    {
+        juce::StringArray tails;
+        for (const auto& path : files)
+            tails.add (juce::File (path).getFileName());
+        check (files.size() == 3 && tails[0] == "take_hits.mid" && tails[1] == "take_melody.mid" && tails[2] == "take_tempo.mid",
+               "mididrag: hits, melody and tempo files returned");
+    }
     for (const auto& path : files)
     {
         const juce::File f (path);
@@ -20253,11 +22912,11 @@ static void testMidiDrag (const juce::File& tmp)
         const auto* b = static_cast<const unsigned char*> (mb.getData());
         const bool magic = read && b[0] == 'M' && b[1] == 'T' && b[2] == 'h' && b[3] == 'd';
         const int tracks = read ? ((int) b[10] << 8) | (int) b[11] : -1;
-        const int want = f.getFileName().endsWith ("_hits.mid") ? 2 : 1;
+        const int want = f.getFileName().endsWith ("_tempo.mid") ? 1 : 2;
         std::printf ("  %s: exists %d, %d bytes, MThd %d, tracks %d (want %d)%c", f.getFileName().toRawUTF8(),
                      (int) f.existsAsFile(), (int) mb.getSize(), (int) magic, tracks, want, 10);
         check (f.existsAsFile() && magic, "mididrag: returned file exists and starts with MThd");
-        check (tracks == want, "mididrag: header track count (hits 2, tempo 1)");
+        check (tracks == want, "mididrag: header track count (hits 2, melody 2, tempo 1)");
     }
     // b) cleanup: fake root with children, a foreign file beside it
     const auto parent = base.getChildFile ("fakeTemp");
@@ -20447,7 +23106,7 @@ static void testMidiExport (const juce::File& tmp)
                 {
                     r.noteTicks.push_back (msg.getTimeStamp());
                     r.vel.push_back ((int) msg.getVelocity());
-                    if (msg.getNoteNumber() != 36 || msg.getChannel() != 10)
+                    if (msg.getNoteNumber() < 35 || msg.getNoteNumber() > 81 || msg.getChannel() != 10) // per-hit GM drum note (91d3b15)
                         ++r.badNotes;
                 }
             }
@@ -20556,10 +23215,16 @@ static void testMidiExport (const juce::File& tmp)
             // Bar markers: every bar inside the clicks starts on a true click, one bar apart.
             const double tpsT = pt.bpm / 60.0 * pt.ppq;
             const double barTicks = 4.0 * pt.ppq;
+            // Export origin: the downbeat (first click at `offset`) is tick 0, so file seconds
+            // + offset = source seconds. HSLINK_MIDIEXPORT_MUTANT=1 drops the origin add (teeth).
+            const char* moEnv = std::getenv ("HSLINK_MIDIEXPORT_MUTANT");
+            const int mo = moEnv != nullptr ? std::atoi (moEnv) : 0;
+            const double originSec = mo == 1 ? 0.0 : offset;
+            std::printf ("  clicks: origin %.4f s = %.1f ticks (downbeat on the first click)%c", originSec, originSec * tpsT, 10);
             double worstBar = 0.0, worstStep = 0.0;
             for (size_t i = 0; i < pt.barTicks.size(); ++i)
             {
-                const double s = pt.barTicks[i] / tpsT;
+                const double s = pt.barTicks[i] / tpsT + originSec;
                 double best = 1e9;
                 for (double t : truth)
                     best = std::min (best, std::abs (t - s));
@@ -20584,7 +23249,7 @@ static void testMidiExport (const juce::File& tmp)
             std::vector<float> noteGain;
             for (size_t i = 0; i < ph.noteTicks.size(); ++i)
             {
-                const double s = ph.noteTicks[i] / tpsH;
+                const double s = ph.noteTicks[i] / tpsH + originSec;
                 if (i < ons.size())
                     worstOn = std::max (worstOn, std::abs (s - ons[i].sec));
                 double best = 1e9;
@@ -20603,7 +23268,7 @@ static void testMidiExport (const juce::File& tmp)
             check (ph.noteTicks.size() == 16 && ons.size() == 16, "midiexport: 16 hits for 16 clicks");
             check (worstOn <= 0.001, "midiexport: hit notes within 1 ms of the detected onsets");
             check (worstTrue <= 0.002, "midiexport: hit notes within 2 ms of the true clicks");
-            check (ph.badNotes == 0 && ! ph.noteTicks.empty(), "midiexport: note 36 on channel 10");
+            check (ph.badNotes == 0 && ! ph.noteTicks.empty(), "midiexport: GM drum notes 35-81 on channel 10");
             int inversions = 0, pairs = 0;
             for (size_t i = 0; i < noteGain.size(); ++i)
                 for (size_t j = 0; j < noteGain.size(); ++j)
@@ -20616,7 +23281,12 @@ static void testMidiExport (const juce::File& tmp)
             for (size_t i = 0; i < ph.vel.size() && i < 4; ++i)
                 vs << "g" << juce::String (noteGain[i], 2) << "=v" << ph.vel[i] << " ";
             std::printf ("  clicks: velocity %s; louder-quieter pairs=%d not strictly ordered=%d%c", vs.toRawUTF8(), pairs, inversions, 10);
+            int maxVel = 0;
+            for (int v : ph.vel)
+                maxVel = std::max (maxVel, mo == 2 ? v / 2 : v);
+            std::printf ("  clicks: loudest velocity %d (want >= 120: relative to the loudest hit)%c", maxVel, 10);
             check (pairs > 0 && inversions == 0, "midiexport: velocity follows the peak level");
+            check (maxVel >= 120, "midiexport: the loudest hit is at or near velocity 127");
             ed.reset();
         }
         p.reset();
@@ -20737,6 +23407,7 @@ static void testTakeExport (const juce::File& tmp)
         p->hostSync.bpm.store (100.0);
         p->hostSync.timeSigNum.store (4);
         p->hostSync.bpmKnown.store (true);
+        p->hostSync.hostSyncActive.store (true); // a real host session: Warp to host takes the host tempo only (B4, 133d6a4)
         const auto takes = p->getTakes();
         if (takes.empty())
         {
@@ -20862,7 +23533,8 @@ static void testTakeExport (const juce::File& tmp)
 // double-click reset of a marker, Reset markers after an add, the edited list reaching the
 // audition and Apply warp, and the ruler label spacing at 1x, 4x and 8x. Real
 // juce::MouseEvent objects. Teeth (HSLINK_TEETH): TM_NO_GAP, TM_ANCHOR, TM_NO_MAP
-// (WarpMarkers mutants 5, 6, 7), TM_RESET, TM_TAG_TIGHT (TakeEditorMath).
+// (WarpMarkers mutants 5, 6, 7), TM_RESET, TM_TAG_TIGHT, TM_DBL_RESET (check 5),
+// TM_BAR20 (check 8, bar labels at 20 px) (TakeEditorMath).
 static void testTakeMarkers (const juce::File& tmp)
 {
     std::printf ("Take markers: add, gap, remove, anchors, reset, audition and apply lists, ruler labels%c", 10);
@@ -20873,7 +23545,7 @@ static void testTakeMarkers (const juce::File& tmp)
     const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
     WarpMarkers::testMutant = teethVar == "TM_NO_GAP" ? WarpMarkers::mutNoInsertGap : teethVar == "TM_ANCHOR" ? WarpMarkers::mutRemoveAnchor
                             : teethVar == "TM_NO_MAP" ? WarpMarkers::mutInsertNoMap : WarpMarkers::mutNone;
-    TakeEditorMath::testMutant = teethVar == "TM_RESET" ? TakeEditorMath::mutResetMovedOnly : teethVar == "TM_TAG_TIGHT" ? TakeEditorMath::mutTagTight : teethVar == "TM_RULER_CLIP" ? TakeEditorMath::mutRulerAlwaysClip : TakeEditorMath::mutNone;
+    TakeEditorMath::testMutant = teethVar == "TM_RESET" ? TakeEditorMath::mutResetMovedOnly : teethVar == "TM_TAG_TIGHT" ? TakeEditorMath::mutTagTight : teethVar == "TM_RULER_CLIP" ? TakeEditorMath::mutRulerAlwaysClip : teethVar == "TM_RULER_SHIFT" ? TakeEditorMath::mutRulerShift8 : teethVar == "TM_DBL_RESET" ? TakeEditorMath::mutDblClickResets : teethVar == "TM_BAR20" ? TakeEditorMath::mutBarLabel20 : TakeEditorMath::mutNone;
     std::printf ("  mutants: warp=%d editor=%d (0 = none)%c", WarpMarkers::testMutant.load(), TakeEditorMath::testMutant.load(), 10);
     const bool savedMeasure = P::tempoMeasureEnabled.load();
     P::tempoMeasureEnabled = false;
@@ -20911,6 +23583,21 @@ static void testTakeMarkers (const juce::File& tmp)
     const auto lane = panel.warpLaneForTest();
     const int n0 = (int) panel.warpMarkersForTest().size();
     std::printf ("  length=%lld width=%d auto markers=%d (want 9)%c", (long long) len, wa.getWidth(), n0, 10);
+    {
+        // Ruler vs seconds axis at 120 bpm 4/4: bar n+1 starts at 2n s, so bar 2/3/4 sit on 2/4/6 s.
+        const auto bars = panel.rulerBarTicksForTest();
+        const auto secs = panel.axisTicksForTest();
+        auto barX = [&bars] (int n) { for (const auto& b : bars) if (b.first == n) return b.second; return -9999; };
+        auto secX = [&secs] (double t) { for (const auto& a : secs) if (std::abs (a.first - t) < 1.0e-9) return a.second; return 9999; };
+        int worst = 0;
+        for (int n = 2; n <= 4; ++n)
+        {
+            const int bx = barX (n), sx = secX (2.0 * (n - 1));
+            worst = juce::jmax (worst, std::abs (bx - sx));
+            std::printf ("  ruler: bar %d tick x=%d, %d s tick x=%d, off by %d px%c", n, bx, 2 * (n - 1), sx, bx - sx, 10);
+        }
+        ck (worst <= 1, "ruler: bar 2/3/4 ticks sit on the 2/4/6 s axis ticks within 1 px at 120 bpm");
+    }
     ck (len == kFrames && n0 == 9, "0: the take opens with 9 auto-placed markers (bars and both anchors)");
 
     auto mev = [&panel] (juce::Point<int> pos, juce::ModifierKeys mods, int clicks)
@@ -21000,7 +23687,9 @@ static void testTakeMarkers (const juce::File& tmp)
     {
         for (int i = 0; i < 30; ++i)
             panel.zoomByForTest (2.0, 0.0);
-        panel.setViewStartForTest (288000 - 100 * 64 + 32); // pixels fall half a step off the marker
+        // The deepest zoom is 2 fpp since de7403c: place the marker 100 px in, pixels half a step off it.
+        const double fpp0 = panel.viewForTest().framesPerPixel;
+        panel.setViewStartForTest (288000 - (juce::int64) std::llround (100.0 * fpp0 + 0.5 * fpp0));
         const auto v = panel.viewForTest();
         int x = -1;
         juce::int64 f = 0;
@@ -21044,15 +23733,16 @@ static void testTakeMarkers (const juce::File& tmp)
         ck (pick0 == 0 && pickL == (int) lastI && m.size() == n1 && m.front().srcFrame == 0 && m.back().srcFrame == len, "4: the first and last anchors cannot be removed");
     }
 
-    // 5. Double-click on a moved marker (src 96000, at 100800) resets it.
+    // 5. Double-click on a moved marker (src 96000, at 100800) removes it (4eed68e: only the end anchors reset).
     {
         const int k = findSrc (96000.0, 0.0);
         const auto n = panel.warpMarkersForTest().size();
         if (k >= 0)
             dbl ({ laneX ((size_t) k), lane.getCentreY() });
         const auto& m = panel.warpMarkersForTest();
-        std::printf ("  5: double-click marker %d: dst %lld (want 96000) count %d -> %d%c", k, k >= 0 ? (long long) m[(size_t) k].dstFrame : -1LL, (int) n, (int) m.size(), 10);
-        ck (k >= 0 && m[(size_t) k].dstFrame == 96000 && m.size() == n, "5: a double-click on a marker resets it, no marker added");
+        const int still = findSrc (96000.0, 0.0);
+        std::printf ("  5: double-click marker %d: count %d -> %d (want -1), src 96000 still there=%d (want 0)%c", k, (int) n, (int) m.size(), still >= 0 ? 1 : 0, 10);
+        ck (k >= 0 && m.size() == n - 1 && still < 0, "5: a double-click on a moved marker removes it, no marker added");
     }
 
     // 6. Reset markers: after an add with no move it is enabled, and it restores the auto count.
@@ -21103,13 +23793,37 @@ static void testTakeMarkers (const juce::File& tmp)
             for (const auto& l : panel.beatLinesForTest())
                 if (l.label > 0 || l.tagBar > 0)
                 {
+                    // Bar numbers thin at kMinBarLabelPx (34, 30 px text box), bar.beat tags at kMinTagPx (44).
+                    const double need = l.tagBar > 0 ? TakeEditorMath::kMinTagPx : TakeEditorMath::kMinBarLabelPx;
+                    if (count > 0)
+                        gap = juce::jmin (gap, (l.x - prev) - need + 44.0); // normalised: >= 44 means the rule holds
+                    prev = l.x;
+                    ++count;
+                }
+            std::printf ("  8: %s zoom=%.2f labels=%d min gap margin=%.1f (want >= 2 labels, margin >= 44 = gap >= 34 px bars / 44 px tags)%c", names[z], panel.getZoomForTest(), count, gap, 10);
+            ck (count >= 2 && gap >= 44.0, "8: ruler bar labels at least 34 px apart (tags 44), two or more visible");
+        }
+        // 8b. Narrow panel at 1x (about 27 px per bar, between 20 and 34): bar labels must
+        // thin to every other bar. Teeth: HSLINK_TEETH=TM_BAR20 (thin at 20 px) keeps every bar.
+        {
+            const double zBefore = panel.getZoomForTest();
+            panel.setSize (360, 566);
+            panel.zoomByForTest (0.0001, 0.0);
+            double prev = -1.0e9, gap = 1.0e9;
+            int count = 0;
+            for (const auto& l : panel.beatLinesForTest())
+                if (l.label > 0 && l.tagBar <= 0)
+                {
                     if (count > 0)
                         gap = juce::jmin (gap, l.x - prev);
                     prev = l.x;
                     ++count;
                 }
-            std::printf ("  8: %s zoom=%.2f labels=%d min gap=%.1f px (want >= 2, >= 44)%c", names[z], panel.getZoomForTest(), count, gap, 10);
-            ck (count >= 2 && gap >= 44.0, "8: ruler labels at least 44 px apart, two or more visible");
+            std::printf ("  8b: narrow 360 px zoom=%.2f bar labels=%d min gap=%.1f px (want >= 2 labels, gap >= 34)%c", panel.getZoomForTest(), count, gap, 10);
+            ck (count >= 2 && gap >= TakeEditorMath::kMinBarLabelPx, "8b: on a narrow panel bar labels thin to at least 34 px apart");
+            panel.setSize (490, 566);
+            panel.zoomByForTest (0.0001, 0.0);
+            panel.zoomByForTest (zBefore, 0.0);
         }
     }
 
@@ -21197,20 +23911,20 @@ static juce::Point<int> takePanelSizeAtMinWindow()
 // readouts1: the Export loop button names its repeat count and keeps the full text at the
 // minimum panel size; a take cell shows the take length ('4.0 s', or m:ss over 60 s) in the
 // waveform's lower right corner, clear of the tempo plate and never cut.
-// Teeth: HSLINK_TEETH=RD_EXPORT_STATIC, RD_EXPORT_NARROW, RD_LEN_NO_MSS, RD_LEN_OVER_TEMPO.
+// Teeth: HSLINK_TEETH=RD_EXPORT_STATIC, RD_EXPORT_NARROW, RD_BPM_NARROW, RD_LEN_NO_MSS, RD_LEN_OVER_TEMPO.
 static void testReadouts1()
 {
     std::printf ("Readouts 1: Export loop xN text and fit, take cell length text and plate%c", 10);
     const int failuresBefore = failures;
     using namespace TakeEditorMath;
     const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
-    testMutant = teethVar == "RD_EXPORT_STATIC" ? mutExportTextStatic : teethVar == "RD_EXPORT_NARROW" ? mutExportTextNarrow : mutNone;
-    TakeGrid::testLengthMutant = teethVar == "RD_LEN_NO_MSS" ? 1 : teethVar == "RD_LEN_OVER_TEMPO" ? 2 : 0;
+    testMutant = teethVar == "RD_EXPORT_STATIC" ? mutExportTextStatic : teethVar == "RD_EXPORT_NARROW" ? mutExportTextNarrow : teethVar == "RD_BPM_NARROW" ? mutBpmFieldNarrow : mutNone;
+    TakeGrid::testLengthMutant = teethVar == "RD_LEN_NO_MSS" ? 1 : teethVar == "RD_LEN_OVER_TEMPO" ? 2 : teethVar == "RD_CHIP_OVER_WAVE" ? 3 : 0;
     const auto minPanel = takePanelSizeAtMinWindow();
     {
         TakeEditorPanel panel;
         panel.setSize (minPanel.x, minPanel.y);
-        for (const int n : { 4, 2, 64 })
+        for (const int n : { 4, 2, 16, 64 })
         {
             panel.setRepeatsForTest (n);
             float tw = 0.0f;
@@ -21220,8 +23934,10 @@ static void testReadouts1()
             std::printf ("  1 panel %d x %d, Repeats %d: button text '%s' (want '%s'), text %.1f px in %d px of room, fits=%d (want 1)%c",
                          panel.getWidth(), panel.getHeight(), n, panel.exportTextForTest().toRawUTF8(), want.toRawUTF8(), (double) tw, room, (int) fits, 10);
             check (panel.exportTextForTest() == want && fits && tw > 40.0f,
-                   ("1: Export loop text is '" + want + "' and fits at the minimum panel size").toRawUTF8());
+                   ("1: Export text is '" + want + "' and fits at the minimum panel size").toRawUTF8());
         }
+        panel.setRepeatsForTest (16);
+        check (panel.f4WidthsForTest(), "1b: F4 width table: Export loop x16/x64, grid bpm field value fits");
     }
     {
         const auto t4 = TakeGrid::lengthTextOf (4.0), t75 = TakeGrid::lengthTextOf (75.0), t0 = TakeGrid::lengthTextOf (0.0), t3600 = TakeGrid::lengthTextOf (600.4);
@@ -21249,7 +23965,10 @@ static void testReadouts1()
             std::printf ("  3 cell %d x %d, length '%s': plate %d,%d %dx%d, tempo plate %d,%d %dx%d, fits=%d clear of the tempo=%d (want 1 each)%c",
                          cell.getWidth(), cell.getHeight(), cell.getLengthText().toRawUTF8(), lp.getX(), lp.getY(), lp.getWidth(), lp.getHeight(),
                          tp.getX(), tp.getY(), tp.getWidth(), tp.getHeight(), (int) fits, (int) clear, 10);
-            check (fits && clear, "3: the cell length plate fits inside the waveform and clear of the tempo plate");
+            check (fits && clear, "3: the cell length plate fits in the chip row and clear of the tempo plate");
+            const int cg = cell.chipGapForTest();
+            std::printf ("  3b chip gap: waveform bottom %d, nearest chip top gap %d px (want >= 3)%c", cell.waveAreaForTest().getBottom(), cg, 10);
+            check (cg >= 3 && cg < 1000, "3b: the bpm and length chips sit in their own row, at least 3 px below the waveform");
         }
         // A tempo tag too long to share the row: the tag is shortened, the length always shows.
         for (const char* tt : { "199.99 est", "~199.99 BPM est from the host grid", "199.99 bpm  x2  100 ms" })
@@ -21324,9 +24043,9 @@ static void testReadouts2 (const juce::File& tmp)
         panel.gridNudgeForTest (kGridNudgeSec);
         const auto o2 = panel.gridOffsetTextForTest();
         const bool fit2 = panel.readouts2FitForTest();
-        std::printf ("  1 panel %d x %d: offset at open '%s' (want 'offset 0 ms'), after two 1 ms nudges right '%s' (want '+2 ms'), downbeat %.4f s, fits=%d%c",
+        std::printf ("  1 panel %d x %d: offset at open '%s' (want '0 ms', v5b: no inline offset word), after two 1 ms nudges right '%s' (want '+2 ms'), downbeat %.4f s, fits=%d%c",
                      panel.getWidth(), panel.getHeight(), o0.toRawUTF8(), o2.toRawUTF8(), panel.gridForTest().downbeatSec, (int) fit2, 10);
-        check (o0 == "offset 0 ms" && o2 == "+2 ms" && fit2, "1: two nudges right read '+2 ms' and the readout fits");
+        check (o0 == "0 ms" && o2 == "+2 ms" && fit2, "1: two nudges right read '+2 ms' and the readout fits");
         panel.gridNudgeForTest (-12 * kGridNudgeSec);
         const auto om = panel.gridOffsetTextForTest();
         panel.gridSetDownbeatForTest (48000);
@@ -21334,9 +24053,9 @@ static void testReadouts2 (const juce::File& tmp)
         panel.gridNudgeForTest (kGridNudgeSec);
         panel.gridResetForTest();
         const auto oReset = panel.gridOffsetTextForTest();
-        std::printf ("  2 after 12 ms left '%s' (want '-10 ms'), after Set 1 '%s' (want 'offset 0 ms'), after a nudge and Reset grid '%s' (want 'offset 0 ms')%c",
+        std::printf ("  2 after 12 ms left '%s' (want '-10 ms'), after Set 1 '%s' (want '0 ms'), after a nudge and Reset grid '%s' (want '0 ms')%c",
                      om.toRawUTF8(), oSet.toRawUTF8(), oReset.toRawUTF8(), 10);
-        check (om == "-10 ms" && oSet == "offset 0 ms" && oReset == "offset 0 ms", "2: Set 1 and Reset grid zero the offset readout");
+        check (om == "-10 ms" && oSet == "0 ms" && oReset == "0 ms", "2: Set 1 and Reset grid zero the offset readout");
 
         const auto& wm = panel.warpMarkersForTest();
         const auto hint = panel.warpInfoTextForTest();
@@ -21389,7 +24108,8 @@ static void testTakeLoop (const juce::File& tmp)
                : teethVar == "TL_EXPORT_LOOSE" ? mutExportLoose : teethVar == "TL_SEAM_LOOSE" ? mutSeamLoose
                : teethVar == "TL_BUTTONS_OVERLAP" ? mutButtonsOverlap : teethVar == "TL_NO_BUTTON_CHECK" ? mutNoButtonCheck
                : teethVar == "TL_OLD_ANCHOR" ? mutOldAnchor : teethVar == "TL_STRICT_RIGHT" ? mutStrictRight
-               : teethVar == "TL_CLEAR_MID_DRAG" ? mutClearMidDrag : teethVar == "TL_OPEN_NO_END_DRAG" ? mutOpenNoEndDrag : mutNone;
+               : teethVar == "TL_CLEAR_MID_DRAG" ? mutClearMidDrag : teethVar == "TL_OPEN_NO_END_DRAG" ? mutOpenNoEndDrag
+               : teethVar == "TL_SEAM_LONG_WORDS" ? mutSeamLongWords : mutNone;
     std::printf ("  mutant=%d (0 = none)%c", testMutant.load(), 10);
     const bool savedMeasure = P::tempoMeasureEnabled.load();
     P::tempoMeasureEnabled = false; // nothing here needs a tempo
@@ -21800,9 +24520,9 @@ static void testTakeLoop (const juce::File& tmp)
         const int writesMade = (int) st.writes.size();
         const auto storedMade = st.stored;
         const bool exportMade = panel.exportLoopEnabledForTest();
-        std::printf ("  3 no loop: Export loop enabled=%d hasLoop=%d (want 0, 0), a flag drag writes %d times (want 0); a click at 30000: writes=%d (want 1), stored loop %lld..%lld crop %lld..%lld (want 30000..42000, 9600..76800), Export loop enabled=%d (want 1)%c",
+        std::printf ("  3 no loop: Export loop enabled=%d hasLoop=%d (want 1 (S/E framed), 0), a flag drag writes %d times (want 0); a click at 30000: writes=%d (want 1), stored loop %lld..%lld crop %lld..%lld (want 30000..42000, 9600..76800), Export loop enabled=%d (want 1)%c",
                      (int) exportOff, (int) ! flagNone, writesNoLoop, writesMade, ll (storedMade.loopStart), ll (storedMade.loopEnd), ll (storedMade.cropStart), ll (storedMade.cropEnd), (int) exportMade, 10);
-        ck (! exportOff && flagNone && writesNoLoop == 0 && writesMade == 1 && storedMade == pts (9600, 76800, 30000, 42000) && exportMade, "3: a click in the empty lane makes the loop and writes it once on the mouse up");
+        ck (exportOff && flagNone && writesNoLoop == 0 && writesMade == 1 && storedMade == pts (9600, 76800, 30000, 42000) && exportMade, "3: a click in the empty lane makes the loop and writes it once on the mouse up");
 
         // clearLoop clears only the loop.
         panel.clearLoopForTest();
@@ -21810,11 +24530,11 @@ static void testTakeLoop (const juce::File& tmp)
         const auto storedCleared = st.stored;
         const bool resetStill = panel.resetEnabledForTest(), exportCleared = panel.exportLoopEnabledForTest();
         panel.clearLoopForTest(); // nothing to clear
-        std::printf ("  3 clear: writes=%d (want 2), stored loop %lld, %lld crop %lld..%lld (want -1, -1, 9600..76800), panel crop %lld..%lld (want 9600..76800), Reset enabled=%d (want 1, the crop is still there), Export loop enabled=%d (want 0); a second clear: writes=%d (want 2)%c",
+        std::printf ("  3 clear: writes=%d (want 2), stored loop %lld, %lld crop %lld..%lld (want -1, -1, 9600..76800), panel crop %lld..%lld (want 9600..76800), Reset enabled=%d (want 1, the crop is still there), Export loop enabled=%d (want 1, S/E framed); a second clear: writes=%d (want 2)%c",
                      writesCleared, ll (storedCleared.loopStart), ll (storedCleared.loopEnd), ll (storedCleared.cropStart), ll (storedCleared.cropEnd), ll (panel.getCropStartForTest()),
                      ll (panel.getCropEndForTest()), (int) resetStill, (int) exportCleared, (int) st.writes.size(), 10);
         ck (writesCleared == 2 && storedCleared == pts (9600, 76800, -1, -1) && panel.getCropStartForTest() == 9600 && panel.getCropEndForTest() == 76800 && ! panel.hasLoopForTest() && resetStill
-                && ! exportCleared && st.writes.size() == 2,
+                && exportCleared && st.writes.size() == 2, // the S/E crop still frames a section
             "3: clearing the loop leaves the crop as it is");
         panel.close (false);
     }
@@ -21826,11 +24546,13 @@ static void testTakeLoop (const juce::File& tmp)
         TakeEditorPanel panel;
         wire (panel, st, clock, 490, 566);
         const int defaultRepeats = panel.getRepeatsForTest();
-        openBare (panel, st, pts (9600, 76800, -1, -1));
+        openBare (panel, st, pts (-1, -1, -1, -1)); // whole take, no loop: no section framed
         const bool enabledNoLoop = panel.exportLoopEnabledForTest();
         panel.clickExportLoopForTest();
         const int callsNoLoop = (int) st.applies.size();
         const bool waitingNoLoop = panel.waitingForTest();
+        panel.close (false);
+        openBare (panel, st, pts (9600, 76800, -1, -1));
         std::printf ("  4 no loop: Export loop enabled=%d (want 0), a click calls onApply %d times (want 0), waiting=%d (want 0)%c", (int) enabledNoLoop, callsNoLoop, (int) waitingNoLoop, 10);
         ck (! enabledNoLoop && callsNoLoop == 0 && ! waitingNoLoop, "4: Export loop is off and does nothing while no loop is set");
         if (waitingNoLoop) // only on a mutant: end that wait so the next steps start clean
@@ -21962,7 +24684,7 @@ static void testTakeLoop (const juce::File& tmp)
         Store st;
         juce::uint32 clock = 100000;
         TakeEditorPanel panel;
-        wire (panel, st, clock, 490, 566);
+        wire (panel, st, clock, takePanelSizeAtMinWindow().x, 566); // q3c: seam lines are measured at the minimum width (was 490 px)
         openBare (panel, st, pOpen);
         TakeEdit::EditOptions cropAsk, loopAsk;
         cropAsk.loopRepeats = 0;
@@ -21989,13 +24711,13 @@ static void testTakeLoop (const juce::File& tmp)
         const auto line1 = panel.resultTextForTest();
         const int shown1 = shown();
         std::printf ("  5 loop at -0.60: tone=%d (want 4), line '%s', level/warning/error=%03d (want 110), fits=%d%c", resultToneFor (r1, loopAsk), line1.toRawUTF8(), shown1, (int) panel.resultFitsForTest(), 10);
-        ck (resultToneFor (r1, loopAsk) == 4 && line1 == "Loop made: n.wav. Ends do not join cleanly (-0.60); try moving a flag." && shown1 == 110 && panel.resultFitsForTest(),
+        ck (resultToneFor (r1, loopAsk) == 4 && line1 == "Loop made: n.wav. Seam not clean (-0.60), move a flag" && shown1 == 110 && panel.resultFitsForTest(),
             "5: level 1 says the ends do not join cleanly, in amber");
         panel.showReportForTest (r2, loopAsk);
         const auto line2 = panel.resultTextForTest();
         const int shown2 = shown();
         std::printf ("  5 loop at -0.75: tone=%d (want 5), line '%s', level/warning/error=%03d (want 201), fits=%d%c", resultToneFor (r2, loopAsk), line2.toRawUTF8(), shown2, (int) panel.resultFitsForTest(), 10);
-        ck (resultToneFor (r2, loopAsk) == 5 && line2 == "Loop made: n.wav. Ends join badly, the level dips (-0.75); try moving a flag." && shown2 == 201 && panel.resultFitsForTest(),
+        ck (resultToneFor (r2, loopAsk) == 5 && line2 == "Loop made: n.wav. Bad seam, level dips (-0.75), move a flag" && shown2 == 201 && panel.resultFitsForTest(),
             "5: level 2 says the ends join badly, in the error colour");
 
         // A long take name at the 490 px panel width: the name gives way, the words stay.
@@ -22003,13 +24725,13 @@ static void testTakeLoop (const juce::File& tmp)
         int fitFaults = 0, shortened = 0;
         juce::String lines[3];
         const double corrs[] = { 0.90, -0.52, -0.75 };
-        const char* tails[] = { ", 3 x 0.500 s", ". Ends do not join cleanly (-0.52); try moving a flag.", ". Ends join badly, the level dips (-0.75); try moving a flag." };
+        const char* tails[] = { ", 3 x 0.500 s", ". Seam not clean (-0.52), move a flag", ". Bad seam, level dips (-0.75), move a flag" };
         for (int i = 0; i < 3; ++i)
         {
             const auto r = rep (longName.toRawUTF8(), corrs[i], 240);
             panel.showReportForTest (r, loopAsk);
             lines[i] = panel.resultTextForTest();
-            const bool isShort = lines[i] == "Loop made: " + shortName (longName) + tails[i], isFull = lines[i] == "Loop made: " + longName + tails[i];
+            const bool isShort = lines[i].startsWith ("Loop made: ") && lines[i].contains ("...") && lines[i].endsWith (tails[i]), isFull = lines[i] == "Loop made: " + longName + tails[i];
             shortened += isShort ? 1 : 0;
             fitFaults += panel.resultFitsForTest() && (isShort || isFull) && panel.seamLevelShownForTest() == i ? 0 : 1;
             std::printf ("  5 name of %d characters, level %d: line '%s' (%d characters, the full line has %d), fits=%d%c", longName.length(), i, lines[i].toRawUTF8(), lines[i].length(),
@@ -22018,24 +24740,52 @@ static void testTakeLoop (const juce::File& tmp)
         std::printf ("  5 short name '%s' (want 23 characters: %d); lines that do not fit or lost their words=%d (want 0), lines with the short name=%d (want at least 2: both warnings)%c",
                      shortName (longName).toRawUTF8(), shortName (longName).length(), fitFaults, shortened, 10);
         ck (shortName (longName) == "a_very_lon...oop_x3.wav" && shortName ("exactly_24_chars_xxx.wav") == "exactly_24_chars_xxx.wav" && shortName ("exactly_25_chars_xxxx.wav") == "exactly_25...s_xxxx.wav" && fitFaults == 0 && shortened >= 2
-                && lines[2] == "Loop made: a_very_lon...oop_x3.wav. Ends join badly, the level dips (-0.75); try moving a flag.",
-            "5: with a long take name the result line still fits its row at 490 px and keeps its words");
+                && lines[2].startsWith ("Loop made: a_very") && lines[2].endsWith ("x3.wav. Bad seam, level dips (-0.75), move a flag"),
+            "5: with a long take name the result line still fits its row at the minimum width and keeps its words");
 
+        // R2a (3aab088) moved the readout into the footer between Reset and Cancel; 490 px is
+        // below the minimum window now, so the row is measured at the minimum-window panel width.
+        const auto atBuild = panel.getBounds();
+        const int minPw = takePanelSizeAtMinWindow().x;
+        panel.setSize (minPw, atBuild.getHeight());
+        // q3c: every seam warning line fits its row whole at the minimum panel width (the
+        // long words live in the tooltip); with a long name only the name may give way.
+        {
+            int seamElided = 0;
+            const char* who[] = { "n.wav", "a_very_long_take_name_that_goes_on_and_on_for_ever_and_ever_loop_x3.wav" };
+            const double sc[] = { -0.45, -1.00 };
+            for (auto* nm : who)
+                for (double c : sc)
+                {
+                    const auto r = rep (nm, c, 240);
+                    panel.showReportForTest (r, loopAsk);
+                    const auto t = panel.resultTextForTest();
+                    const float px = panel.resultTextPxForTest();
+                    const int row = panel.resultRowPxForTest();
+                    const bool ok = px <= (float) row && row > 0 && panel.resultTipForTest().contains ("try moving a flag.");
+                    seamElided += ok ? 0 : 1;
+                    std::printf ("  5 seam line at %d px: '%s' text %.1f px, available %d px, tip '%s' -> %s%c", minPw, t.toRawUTF8(), (double) px, row,
+                                 panel.resultTipForTest().toRawUTF8(), ok ? "whole" : "ELIDED", 10);
+                }
+            ck (seamElided == 0, "5: every seam warning line fits whole at the minimum panel width, long words in the tooltip");
+        }
         const auto readoutLoop = panel.readoutTextForTest();
         const bool readoutFits = panel.readoutFitsForTest();
         panel.clearLoopForTest();
         const auto readoutCrop = panel.readoutTextForTest();
-        std::printf ("  5 readout with a loop: '%s' fits=%d; without: '%s' fits=%d%c", readoutLoop.toRawUTF8(), (int) readoutFits, readoutCrop.toRawUTF8(), (int) panel.readoutFitsForTest(), 10);
+        const bool readoutCropFits = panel.readoutFitsForTest();
+        std::printf ("  5 readout at %d px with a loop: '%s' fits=%d; without: '%s' fits=%d%c", minPw, readoutLoop.toRawUTF8(), (int) readoutFits, readoutCrop.toRawUTF8(), (int) readoutCropFits, 10);
+        panel.setBounds (atBuild);
         ck (readoutLoop == "Crop 0.200 s to 1.600 s (1.400 s)   Loop 0.500 s to 1.000 s (0.500 s)" && readoutFits && readoutCrop == "Crop 0.200 s to 1.600 s, length 1.400 s (67200 frames)"
-                && panel.readoutFitsForTest() && readout (0, len, 24000, 48000, len, 48000.0) == "Crop: whole take   Loop 0.500 s to 1.000 s (0.500 s)",
-            "5: the readout shows crop and loop in the short form and fits its row at 490 px");
+                && readoutCropFits && readout (0, len, 24000, 48000, len, 48000.0) == "Crop: whole take   Loop 0.500 s to 1.000 s (0.500 s)",
+            "5: the readout shows crop and loop in the short form and fits its row at the minimum-window width");
         // The playhead readout (Mock-up B): a right-aligned overlay inside the ruler strip, at
         // 490 and 590 px; it must fail when the box is too small for its text (teeth).
         panel.setPlayheadForTest (172800);
         const auto phText = panel.playheadTextForTest();
         const auto narrow = panel.getBounds();
         bool phAll = phText.isNotEmpty();
-        for (const int pw : { 490, 590 })
+        for (const int pw : { minPw, 590 })
         {
             panel.setSize (pw, narrow.getHeight());
             juce::Rectangle<int> pr;
@@ -22053,7 +24803,7 @@ static void testTakeLoop (const juce::File& tmp)
         panel.setPlayheadOverlayWidthForTest (0);
         panel.setBounds (narrow);
         ck (phAll && ! smallFits,
-            "5: the playhead readout fits inside the ruler strip at 490 and 590 px, right-aligned, and the check fails on a box too small for its text");
+            "5: the playhead readout fits in the title row clear of the ruler and markers at the minimum width and 590 px, and the check fails on a box too small for its text");
         panel.close (false);
     }
 
@@ -22108,7 +24858,8 @@ static void testTakeLoop (const juce::File& tmp)
             struct Out
             {
                 bool started = false, done = false, listed = false, fits = false, warning = false, error = false;
-                int level = -1, ticks = 0, takes = 0;
+                int level = -1, ticks = 0, takes = 0, rowPx = 0;
+                float textPx = 0.0f;
                 juce::int64 loopS = -1, loopE = -1, frames = -1;
                 juce::String line;
                 P::TakeEditReport r;
@@ -22151,15 +24902,27 @@ static void testTakeLoop (const juce::File& tmp)
                 o.warning = panel.resultIsWarningForTest();
                 o.error = panel.resultIsErrorForTest();
                 o.fits = panel.resultFitsForTest();
+                o.textPx = panel.resultTextPxForTest();
+                o.rowPx = panel.resultRowPxForTest();
                 return o;
             };
-            auto named = [] (const Out& o) { return o.r.newName.isNotEmpty() && (o.line.contains (o.r.newName) || o.line.contains (shortName (o.r.newName))); };
+            auto named = [] (const Out& o)
+            {
+                if (o.r.newName.isEmpty())
+                    return false;
+                if (o.line.contains (o.r.newName) || o.line.contains (shortName (o.r.newName)))
+                    return true;
+                // q3d: at the minimum width the name gives way to head...tail, the warning stays whole.
+                const auto shown = o.line.fromFirstOccurrenceOf ("Loop made: ", false, false).upToFirstOccurrenceOf (".wav", true, false);
+                const auto head = shown.upToFirstOccurrenceOf ("...", false, false), tail = shown.fromFirstOccurrenceOf ("...", false, false);
+                return shown.contains ("...") && head.length() >= 2 && tail.length() >= 2 && o.r.newName.startsWith (head) && o.r.newName.endsWith (tail);
+            };
             auto show = [&] (const char* what, const Out& o, juce::int64 wantFrames)
             {
                 std::printf ("  6 %s: loop %lld..%lld (%lld frames) x3: started=%d done=%d after %d ticks, ok=%d new take '%s' listed=%d (takes now %d), file %lld frames, report %lld (want %lld = 3 x loop), seam fade %lld frames, seam correlation %+.4f, panel level=%d warning=%d error=%d fits=%d%c",
                              what, ll (o.loopS), ll (o.loopE), ll (o.loopE - o.loopS), (int) o.started, (int) o.done, o.ticks, (int) o.r.ok, o.r.newName.toRawUTF8(), (int) o.listed, o.takes, ll (o.frames),
                              ll (o.r.result.outSamples), ll (wantFrames), ll (o.r.result.seamFadeSamples), o.r.result.seamCorrelation, o.level, (int) o.warning, (int) o.error, (int) o.fits, 10);
-                std::printf ("  6 %s: line '%s'%c", what, o.line.toRawUTF8(), 10);
+                std::printf ("  6 %s: line '%s' (text %.1f px, row %d px)%c", what, o.line.toRawUTF8(), o.textPx, o.rowPx, 10);
             };
             // 24000 frames = 50 whole periods of the 100 Hz tone: the loop end runs into its start.
             const auto clean = run (24000, 48000, 3);
@@ -22172,14 +24935,14 @@ static void testTakeLoop (const juce::File& tmp)
             const auto bad = run (24000, 48240, 3);
             show ("half a period off", bad, 72720);
             ck (bad.done && bad.r.ok && bad.loopE == 48240 && bad.listed && bad.takes == 3 && bad.frames == 72720 && bad.r.result.outSamples == 72720 && bad.r.result.seamFadeSamples == 240
-                    && bad.r.result.seamCorrelation < -0.99 && bad.level == 2 && bad.error && ! bad.warning && named (bad) && bad.line.contains (". Ends join badly, the level dips (-1.00); try moving a flag.")
+                    && bad.r.result.seamCorrelation < -0.99 && bad.level == 2 && bad.error && ! bad.warning && named (bad) && bad.line.contains (". Bad seam, level dips (-1.00), move a flag")
                     && bad.fits,
                 "6: a loop cut half a period off renders with a seam correlation under -0.60 and the panel shows level 2");
             // 24156 frames = 50 periods and 117 degrees: cos = -0.454.
             const auto mid = run (24000, 48156, 3);
             show ("117 degrees off", mid, 72468);
             ck (mid.done && mid.r.ok && mid.loopE == 48156 && mid.listed && mid.takes == 4 && mid.frames == 72468 && mid.r.result.seamCorrelation < -0.40 && mid.r.result.seamCorrelation > -0.50
-                    && mid.level == 1 && mid.warning && ! mid.error && named (mid) && mid.line.contains (". Ends do not join cleanly (-0.45); try moving a flag.") && mid.fits
+                    && mid.level == 1 && mid.warning && ! mid.error && named (mid) && mid.line.contains (". Seam not clean (-0.45), move a flag") && mid.fits
                     && clean.r.newName != bad.r.newName && bad.r.newName != mid.r.newName && framesOf (a.temp) == 96000,
                 "6: a loop cut 117 degrees off renders with a seam correlation between -0.60 and -0.30 and the panel shows level 1");
             if (panel.isOpen())
@@ -22205,12 +24968,17 @@ static void testTakeLoop (const juce::File& tmp)
         {
             const auto& r = areas[i].bounds;
             outside += panel.getLocalBounds().contains (r) ? 0 : 1;
-            empty += r.isEmpty() ? 1 : 0;
+            // R2a (3aab088) parks these labels and rows at an empty rect by design; the scroll
+            // strip became the seconds axis (940194c). Any other empty area still fails.
+            static const juce::StringArray parkedByDesign { "Snap note", "Tempo unit", "Repeats label", "Grid resolution label", "Quantize to label", "Quantize strength label",
+                                                            "Fade in label", "Fade out label", "Loop xfade label", "Gain label", "Grid label", "Warp marker line", "Scroll bar", "Zoom row (empty)" };
+            empty += r.isEmpty() && ! parkedByDesign.contains (areas[i].name) ? 1 : 0;
             hit += areas[i].hit ? 1 : 0;
             buttons += areas[i].button ? 1 : 0;
-            small += areas[i].button && (r.getWidth() < 48 || r.getHeight() < 24) ? 1 : 0;
+            small += areas[i].button && takeButtonUnderTier (r) ? 1 : 0;
+            if (r.isEmpty() || (areas[i].button && takeButtonUnderTier (r))) std::printf ("    area '%s' %d x %d%s%c", areas[i].name.toRawUTF8(), r.getWidth(), r.getHeight(), r.isEmpty() ? " (empty)" : " (under tier)", 10);
             for (size_t k = i + 1; k < areas.size(); ++k)
-                if (r.intersects (areas[k].bounds))
+                if (r.intersects (areas[k].bounds) && ! takeAreasShareByDesign (areas[i].name, areas[k].name))
                 {
                     const auto both = r.getIntersection (areas[k].bounds);
                     worstOverlap = juce::jmax (worstOverlap, both.getWidth() * both.getHeight());
@@ -22218,9 +24986,9 @@ static void testTakeLoop (const juce::File& tmp)
                         firstPair = areas[i].name + " / " + areas[k].name;
                 }
         }
-        std::printf ("  7 panel %d x %d, loop set=%d: %d areas (%d take the mouse, %d buttons or boxes), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty=%d (want 0), buttons under 48 x 24=%d (want 0)%c",
+        std::printf ("  7 panel %d x %d, loop set=%d: %d areas (%d take the mouse, %d buttons or boxes), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty outside the parked set=%d (want 0), buttons under 48 x 24=%d (want 0)%c",
                      size.x, size.y, (int) panel.hasLoopForTest(), (int) areas.size(), hit, buttons, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small, 10);
-        ck (panel.hasLoopForTest() && areas.size() == 72 && hit == 51 && buttons == 47 /* metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas (4 labels, 4 boxes, Normalize, peak), 5 of them buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.hasLoopForTest() && areas.size() == 70 && hit == 49 && buttons == 45 /* ec2d116 dropped the grid bpm - and + buttons: -2 areas, both buttons. metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas (4 labels, 4 boxes, Normalize, peak), 5 of them buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686" : "7: no two areas overlap and none leaves the panel at the measured minimum-window size");
         panel.close (false);
     }
@@ -23333,7 +26101,7 @@ static void testTakeSnap (const juce::File& tmp)
             if (a.name == "Snap note")
                 noteW = a.bounds.getWidth();
         std::printf ("  5 panel 490 x 566, note label %d px wide: of 8 states the note shows the text of snapNote in %d, fits its label in %d, has the right tone and colour in %d (want 8 each)\n", noteW, shown, fits, toneOk);
-        ck (shown == 8 && fits == 8 && toneOk == 8 && noteW >= 200, "5: every note fits its label at the 490 px panel and is amber only without a tempo");
+        ck (shown == 8 && toneOk == 8 && noteW == 0 /* 3aab088 parked the note label (0 x 0) until R2b; fits no longer applies */, "5: every note fits its label at the 490 px panel and is amber only without a tempo");
 
         // Ruler: beats with a usable grid, seconds without.
         panel.setSnapGridForTest (false);
@@ -23475,7 +26243,7 @@ static void testTakeSnap (const juce::File& tmp)
         const auto asked = panel.askedOptionsForTest();
         std::printf ("  6 take without a tempo, Snap to grid on: toggle=%d active=%d, note '%s', tone=%d amber=%d fits=%d, ruler beats=%d (want 1 0, the no tempo note, 1 1 1, 0); real drag of the crop start to x 170 (frame %lld): %lld (want within one pixel = %.0f frames; the beat a measured grid would give is %lld, %lld frames away); Apply snapToGrid=%d (want 0)\n",
                      (int) s3, (int) act3, n3.toRawUTF8(), tone3, (int) amber, (int) fits, (int) beats, ll (ptr), ll (plain), v.framesPerPixel, ll (cf (g937, std::round (qOf (g937, ptr)))), ll (off (g937, ptr)), (int) asked.snapToGrid);
-        ck (s3 && ! act3 && n3 == noTempoNote() && tone3 == 1 && amber && fits && ! beats, "6: a take without a tempo opened with the toggle on shows the amber no tempo note and a seconds ruler");
+        ck (s3 && ! act3 && n3 == noTempoNote() && tone3 == 1 && amber && ! beats /* fits dropped: 3aab088 parked the note label */, "6: a take without a tempo opened with the toggle on shows the amber no tempo note and a seconds ruler");
         ck ((double) std::abs (plain - ptr) <= v.framesPerPixel + 1.0 && off (g937, plain) > 3000 && st.stored.cropStart == plain && ! asked.snapToGrid && st.applies.size() == 1,
             "6: a take without a tempo is dragged unsnapped and its request sends snapToGrid false");
         panel.close (false);
@@ -23500,13 +26268,14 @@ static void testTakeSnap (const juce::File& tmp)
         {
             const auto& r = areas[i].bounds;
             outside += panel.getLocalBounds().contains (r) ? 0 : 1;
-            empty += r.isEmpty() ? 1 : 0;
+            empty += r.isEmpty() && ! takeAreaParkedByDesign (areas[i].name) ? 1 : 0;
             hit += areas[i].hit ? 1 : 0;
             buttons += areas[i].button ? 1 : 0;
-            small += areas[i].button && (r.getWidth() < 48 || r.getHeight() < 24) ? 1 : 0;
+            small += areas[i].button && takeButtonUnderTier (r) ? 1 : 0;
+            if (r.isEmpty() || (areas[i].button && takeButtonUnderTier (r))) std::printf ("    area '%s' %d x %d%s%c", areas[i].name.toRawUTF8(), r.getWidth(), r.getHeight(), r.isEmpty() ? " (empty)" : " (under tier)", 10);
             snapAreas += areas[i].name == "Snap to grid" || areas[i].name == "Zero crossing" || areas[i].name == "Snap note" ? 1 : 0;
             for (size_t k = i + 1; k < areas.size(); ++k)
-                if (r.intersects (areas[k].bounds))
+                if (r.intersects (areas[k].bounds) && ! takeAreasShareByDesign (areas[i].name, areas[k].name))
                 {
                     const auto both = r.getIntersection (areas[k].bounds);
                     worstOverlap = juce::jmax (worstOverlap, both.getWidth() * both.getHeight());
@@ -23516,7 +26285,7 @@ static void testTakeSnap (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, snap row filled (note '%s', fits=%d): %d areas (%d take the mouse, %d buttons or boxes, %d of the snap row), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d (want 0), empty=%d (want 0), buttons under 48 x 24=%d (want 0)\n",
                      size.x, size.y, panel.noteTextForTest().toRawUTF8(), (int) panel.noteFitsForTest(), (int) areas.size(), hit, buttons, snapAreas, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small);
-        ck (panel.noteTextForTest().isNotEmpty() && panel.noteFitsForTest() && areas.size() == 72 && hit == 51 && buttons == 47 /* metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas, 5 buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && snapAreas == 3 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.noteTextForTest().isNotEmpty() && areas.size() == 70 && hit == 49 && buttons == 45 /* 3aab088 parked the note label (fits dropped). ec2d116 dropped the grid bpm - and + buttons: -2 areas, both buttons.  metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas, 5 buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && snapAreas == 3 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the snap row filled" : "7: no two areas overlap and none leaves the panel at the measured minimum-window size with the snap row filled");
         panel.close (false);
     }
@@ -23574,7 +26343,7 @@ static void testTakeSnap (const juce::File& tmp)
         const auto s2 = panel.getCropStartForTest();
         panel.clickApplyForTest();
         const auto a2 = panel.askedOptionsForTest();
-        const double wantShift = 0.137 * sr / wholeTake (len, 566).framesPerPixel;
+        const double wantShift = 0.137 * sr / panel.viewForTest().framesPerPixel; // 3aab088 changed the wave width; read the live view
         std::printf ("  8 tempo changed to 120 / 0 s while open: downbeat line at x %.2f, was %.2f (want %.2f px to the left); the point %lld is now off the grid: Apply snapToGrid=%d (want 0); drag to 100000 -> %lld (want 96000); Apply snapToGrid=%d gridBpm=%.3f downbeat=%.4f (want 1 120.000 0.0000)\n",
                      firstBar2, firstBar1, wantShift, ll (afterStep), (int) aOffGrid.snapToGrid, ll (s2), (int) a2.snapToGrid, a2.gridBpm, a2.gridDownbeatSec);
         ck (std::abs ((firstBar1 - firstBar2) - wantShift) < 0.01 && firstBar1 - firstBar2 > 5.0 && ! aOffGrid.snapToGrid && s2 == 96000 && a2.snapToGrid && a2.gridBpm == 120.0 && a2.gridDownbeatSec == 0.0,
@@ -23864,7 +26633,7 @@ static void testTakeGridEdit (const juce::File& tmp)
     const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
     testMutant = teethVar == "TG_EDIT_IGNORED" ? mutGridEditIgnored : teethVar == "TG_NO_WRAP" ? mutGridNoWrap
                : teethVar == "TG_BPM_MOVES_DB" ? mutGridBpmMovesDownbeat : teethVar == "TG_NOT_STORED" ? mutGridNotStored
-               : teethVar == "TG_MARKERS_STALE" ? mutGridMarkersStale : mutNone;
+               : teethVar == "TG_MARKERS_STALE" ? mutGridMarkersStale : teethVar == "NO_BPM_DRAG" ? mutNoBpmDrag : mutNone;
     std::printf ("  mutant=%d (0 = none)\n", testMutant.load());
     const bool savedMeasure = P::tempoMeasureEnabled.load();
     P::tempoMeasureEnabled = false;
@@ -24022,6 +26791,49 @@ static void testTakeGridEdit (const juce::File& tmp)
         const auto b1 = beatFrame (panel.gridForTest(), sr, 1.0);
         std::printf ("  6 beat 1 before %lld (want 36000), after +1 ms %lld (want 36048)\n", (long long) b0, (long long) b1);
         cc (6, b0 == 36000 && b1 == 36048, "6: after a +1 ms nudge beat 1 is at frame 36048");
+        panel.close (false);
+    }
+    // 6b. F4e: drag the grid bpm field. Teeth: HSLINK_TEETH=NO_BPM_DRAG.
+    {
+        auto s = fresh();
+        auto& panel = *s->p;
+        auto& field = panel.gridBpmFieldForTest();
+        auto& fc = static_cast<juce::Component&> (field);
+        auto ev = [&field] (int y, bool shift, bool dragged)
+        {
+            const auto t = juce::Time::getCurrentTime();
+            const auto mods = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier | (shift ? juce::ModifierKeys::shiftModifier : 0));
+            const juce::Point<float> pos (10.0f, (float) (100 + y)), down (10.0f, 100.0f);
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos, mods, juce::MouseInputSource::defaultPressure,
+                                     juce::MouseInputSource::defaultOrientation, juce::MouseInputSource::defaultRotation, juce::MouseInputSource::defaultTiltX,
+                                     juce::MouseInputSource::defaultTiltY, &field, &field, t, down, t, 1, dragged);
+        };
+        auto drag = [&] (int dy, bool shift)
+        {
+            fc.mouseDown (ev (0, shift, false));
+            const int steps = 5;
+            for (int i = 1; i <= steps; ++i)
+                fc.mouseDrag (ev (dy * i / steps, shift, true));
+            fc.mouseUp (ev (dy, shift, std::abs (dy) > 2));
+            if (field.isBeingEdited())
+                field.hideEditor (true);
+            return panel.gridForTest().bpm;
+        };
+        const double b0 = panel.gridForTest().bpm;
+        const double up = drag (-50, false);
+        const bool undone = panel.undoForTest();
+        const double afterUndo = panel.gridForTest().bpm;
+        const double down = drag (50, false);
+        panel.gridResetForTest();
+        const double shiftUp = drag (-50, true);
+        panel.gridResetForTest();
+        const double small = drag (-2, false);
+        const double huge = drag (-5000, false);
+        std::printf ("  6b drag from %.3f: up 50 px -> %.3f (want %.3f), undo=%d -> %.3f (want %.3f), down 50 px -> %.3f (want %.3f), Shift up 50 -> %.3f (want %.3f), 2 px -> %.3f (want %.3f), up 5000 -> %.3f (want %.3f)\n",
+                     b0, up, b0 + 5.0, (int) undone, afterUndo, b0, down, b0 - 5.0, shiftUp, b0 + 0.5, small, b0, huge, TakeEdit::kMaxBpm);
+        auto close01 = [] (double a, double b) { return std::abs (a - b) <= 0.01; };
+        ck (close01 (up, b0 + 5.0) && undone && close01 (afterUndo, b0) && close01 (down, b0 - 5.0) && close01 (shiftUp, b0 + 0.5) && close01 (small, b0) && close01 (huge, TakeEdit::kMaxBpm),
+            "6b: the bpm field drags 0.1 per px (Shift 0.01), 4 px threshold, clamps, one undo per drag");
         panel.close (false);
     }
     // 7. Reset.
@@ -24357,7 +27169,7 @@ static void testTakeLoopBody (const juce::File& tmp)
         auto s = fresh();
         const auto t = s->p->gridRowTextsForTest();
         std::printf ("  6 grid row: '%s'\n", t.joinIntoString ("' '").toRawUTF8());
-        ck (t == juce::StringArray { "< 1ms", "1ms >", "Grid /2", "Grid x2", "BPM" }, "6: grid row labels < 1ms, 1ms >, Grid /2, Grid x2, BPM");
+        ck (t == juce::StringArray { "< 1ms", "1ms >", "/2", "x2", "BPM" }, "6: grid row labels < 1ms, 1ms >, /2, x2, BPM (v5b GRID EDIT pad relabel)");
         s->p->close (false);
     }
 
@@ -25145,7 +27957,8 @@ static void testTakeFit (const juce::File& tmp)
     const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
     testMutant = teethVar == "TF_WARN_WRONG" ? mutFitWarnWrong : teethVar == "TF_READOUT_LOOSE" ? mutFitReadoutLoose : teethVar == "TF_TEMPO_LOOSE" ? mutFitTempoLoose : teethVar == "TF_NO_HOST" ? mutFitNoHost
                : teethVar == "TF_STRETCH_LOOSE" ? mutFitStretchLoose : teethVar == "TF_SEND_ALWAYS" ? mutFitSendAlways
-               : teethVar == "TF_STRETCH_WRONG" ? mutFitStretchWrong : teethVar == "TF_ROW_TIGHT" ? mutFitRowTight : mutNone;
+               : teethVar == "TF_STRETCH_WRONG" ? mutFitStretchWrong : teethVar == "TF_ROW_TIGHT" ? mutFitRowTight
+               : teethVar == "TF_TYPED_FOLLOWS" ? mutFitTypedFollowsHost : teethVar == "TF_FIT_NO_TIP" ? mutFitNoClipTip : mutNone;
     std::printf ("  mutant=%d (0 = none)\n", testMutant.load());
     const bool savedMeasure = P::tempoMeasureEnabled.load();
     P::tempoMeasureEnabled = false; // no tempo is needed for the fit row
@@ -25487,6 +28300,10 @@ static void testTakeFit (const juce::File& tmp)
         juce::uint32 clock = 300000;
         TakeEditorPanel panel;
         wire (panel, st, clock, 490, 566);
+        // jobA rebase: the Host BPM readout (v5b R2b, 5bfdf6b) reads onWarpHostBpm, falling back to onHostBpm
+        // when it is not wired. The plugin wires both (PluginEditor.cpp:385-387), so wire it here too and
+        // onHostBpm counts only the tempo field asking the host.
+        panel.onWarpHostBpm = [&st] { return st.host; };
         // Host tempo until a tempo is typed.
         const double nan = std::numeric_limits<double>::quiet_NaN();
         const double hosts[] = { 97.5, 133.0, 20.0, 400.0, 0.0, nan, 88.25 };
@@ -25863,17 +28680,18 @@ static void testTakeFit (const juce::File& tmp)
             const auto& r = areas[i].bounds;
             const bool ofFit = areas[i].name == "Fit to bars" || areas[i].name == "Tempo field" || areas[i].name == "Bars readout" || areas[i].name == "Stretch to fit";
             outside += panel.getLocalBounds().contains (r) ? 0 : 1;
-            empty += r.isEmpty() ? 1 : 0;
+            empty += r.isEmpty() && ! takeAreaParkedByDesign (areas[i].name) ? 1 : 0;
             hit += areas[i].hit ? 1 : 0;
             buttons += areas[i].button ? 1 : 0;
-            small += areas[i].button && (r.getWidth() < 48 || r.getHeight() < 24) ? 1 : 0;
+            small += areas[i].button && takeButtonUnderTier (r) ? 1 : 0;
+            if (r.isEmpty() || (areas[i].button && takeButtonUnderTier (r))) std::printf ("    area '%s' %d x %d%s%c", areas[i].name.toRawUTF8(), r.getWidth(), r.getHeight(), r.isEmpty() ? " (empty)" : " (under tier)", 10);
             fitAreas += ofFit ? 1 : 0;
             if (areas[i].name == "Bars readout")
                 readoutW = r.getWidth();
             if (ofFit)
                 std::printf ("  7 panel %d x %d: '%s' at x %d..%d, y %d..%d (%d x %d)\n", size.x, size.y, areas[i].name.toRawUTF8(), r.getX(), r.getRight(), r.getY(), r.getBottom(), r.getWidth(), r.getHeight());
             for (size_t k = i + 1; k < areas.size(); ++k)
-                if (r.intersects (areas[k].bounds))
+                if (r.intersects (areas[k].bounds) && ! takeAreasShareByDesign (areas[i].name, areas[k].name))
                 {
                     const auto both = r.getIntersection (areas[k].bounds);
                     worstOverlap = juce::jmax (worstOverlap, both.getWidth() * both.getHeight());
@@ -25883,7 +28701,7 @@ static void testTakeFit (const juce::File& tmp)
         }
         std::printf ("  7 panel %d x %d, fit row filled, Stretch to fit lit=%d: %d areas (%d take the mouse, %d buttons or boxes, %d of the fit row), overlapping pairs=%d (want 0; largest %d square px; first '%s'), outside the panel=%d, empty=%d, buttons under 48 x 24=%d (want 0 each)\n",
                      size.x, size.y, (int) panel.stretchEnabledForTest(), (int) areas.size(), hit, buttons, fitAreas, overlaps, worstOverlap, firstPair.toRawUTF8(), outside, empty, small);
-        ck (panel.stretchEnabledForTest() && areas.size() == 72 && hit == 51 && buttons == 47 /* metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas, 5 buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && fitAreas == 4 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
+        ck (panel.stretchEnabledForTest() && areas.size() == 70 && hit == 49 && buttons == 45 /* ec2d116 -2 areas, both buttons.  metronome: +1 area (Click), a button.  readouts2: +2 label areas (grid offset, warp marker line), not buttons. Reverse: +1 area, a button.  F1 level row: +10 areas, 5 buttons or boxes. gap round 1: +2 label areas (Res, tempo BPM), not buttons. R4 undo/redo: +2 areas, both buttons. R4 quantize labels: +2 areas (To, Strength), not buttons. R3 quantize row: +4 areas, all buttons or boxes. R1b grid row: +10 areas (label, Set, earlier, later, bpm -, bpm field, bpm +, half, double, reset), 9 of them buttons or boxes */ && fitAreas == 4 && overlaps == 0 && outside == 0 && empty == 0 && small == 0,
             size.x == 590 ? "7: no two areas overlap and none leaves the panel at 590 x 686 with the fit row filled" : "7: no two areas overlap and none leaves the panel at the measured minimum-window size with the fit row filled");
         if (size.x == 490)
         {
@@ -25939,11 +28757,13 @@ static void testTakeFit (const juce::File& tmp)
         const bool farAmber = panel.fitIsAmberForTest(), farFits = panel.fitTextFitsForTest();
         int farW = 0, farLines = 0, labelW = 0, nearW = 0, nearLines = 0, farPercent = 0, nearPercent = 0;
         const bool farInside = panel.fitInsideForTest (farW, farLines, labelW);
+        const auto farTip = panel.fitTipForTest();
         const auto wantFar = fitOf (239976, sr, 120.0).text + warnOf (239976, sr, 120.0, &farPercent);
         setCrop (panel, clock, 0, 96500); // 10.4 ms over one bar
         const auto nearText = panel.fitTextForTest();
         const bool nearAmber = panel.fitIsAmberForTest(), nearFits = panel.fitTextFitsForTest();
         const bool nearInside = panel.fitInsideForTest (nearW, nearLines, labelW);
+        const auto nearTip = panel.fitTipForTest();
         const auto wantNear = fitOf (96500, sr, 120.0).text + warnOf (96500, sr, 120.0, &nearPercent);
         std::printf ("  8 panel 490 x 566, Fit to bars on, 120 bpm: crop 0..239976 (4.9995 s) readout '%s' amber=%d (want '%s', 1; stretch %d %%, want 25); crop 0..96500 readout '%s' amber=%d (want '%s', 0; stretch %d %%)\n",
                      show (farText).toRawUTF8(), (int) farAmber, show (wantFar).toRawUTF8(), farPercent, show (nearText).toRawUTF8(), (int) nearAmber, show (wantNear).toRawUTF8(), nearPercent);
@@ -25963,9 +28783,16 @@ static void testTakeFit (const juce::File& tmp)
                      show (offFar).toRawUTF8(), (int) offFarAmber, show (onFar).toRawUTF8(), (int) onFarAmber);
         ck (offNear.isEmpty() && ! offNearAmber && offFar.isEmpty() && ! offFarAmber && onFar == wantFar && onFarAmber, "8: no warning and no amber while Fit to bars is off, both back when it is on");
 
-        std::printf ("  8 fit at 490 x 566, readout label %d px between its borders: warned readout widest line %d px in %d lines, inside=%d, not wider than the label=%d; near readout %d px in %d line, inside=%d, not wider=%d (want 2 lines and 1 line, 1 1 1 1)\n",
-                     labelW, farW, farLines, (int) farInside, (int) farFits, nearW, nearLines, (int) nearInside, (int) nearFits);
-        ck (farInside && farFits && farLines == 2 && farW <= labelW && farW >= 60 && nearInside && nearFits && nearLines == 1 && labelW >= 100, "8: the warned readout fits its label in two lines at the 490 px panel");
+        // jobA rebase: F4b (f3045fb) made the fit readout one 12 px line, 40 px wide, drawn elided with the
+        // full text as its tooltip (layout locked). Check that contract: a clipped readout carries its whole
+        // text (line break as two spaces) in the tooltip, a readout that fits carries none.
+        const auto wantFarTip = farFits ? juce::String() : farText.replace (juce::String::charToString (10), "  ");
+        const auto wantNearTip = nearFits ? juce::String() : nearText.replace (juce::String::charToString (10), "  ");
+        const int labelH = panel.fitLabelHeightForTest();
+        std::printf ("  8 fit at 490 x 566, readout label %d px wide, %d px high: warned readout widest line %d px in %d lines, fits=%d, tooltip '%s' (want '%s'); near readout %d px, fits=%d, tooltip '%s' (want '%s'); inside=%d %d (informational)\n",
+                     labelW, labelH, farW, farLines, (int) farFits, farTip.toRawUTF8(), wantFarTip.toRawUTF8(), nearW, (int) nearFits, nearTip.toRawUTF8(), wantNearTip.toRawUTF8(), (int) farInside, (int) nearInside);
+        ck (labelH == 12 && farLines == 2 && ! farFits && farW > labelW && farTip == wantFarTip && farTip.contains ("far off: stretch 25 %") && nearTip == wantNearTip && nearTip.isNotEmpty() == ! nearFits,
+            "8: the warned readout is one elided line at the 490 px panel and its whole text is the tooltip");
 
         // Stretch to fit stays lit and asks the same stretch. No mutant reaches this: informational.
         panel.showReportForTest (report (239976, 120.0, "bare_ed1.wav"), askedFit (120.0));
@@ -26783,8 +29610,9 @@ static void testLevelRow (const juce::File& tmp)
         ck (r && panel.levelEditForTest() == e1, "level: redo puts the level change back");
         std::printf ("  boxes: '%s' '%s' '%s' '%s'\n", panel.levelTextForTest (0).toRawUTF8(), panel.levelTextForTest (1).toRawUTF8(),
                      panel.levelTextForTest (2).toRawUTF8(), panel.levelTextForTest (3).toRawUTF8());
-        ck (panel.levelTextForTest (0) == "120 ms" && panel.levelTextForTest (2) == "40 ms" && panel.levelTextForTest (3) == "+3.5 dB",
-            "level: the boxes show the value with its unit");
+        // 5e554f3: the units moved to the captions, the boxes show the bare value.
+        ck (panel.levelTextForTest (0) == "120" && panel.levelTextForTest (1) == "300" && panel.levelTextForTest (2) == "40" && panel.levelTextForTest (3) == "+3.5",
+            "level: the boxes show the bare value (units on the captions)");
         TakeEdit::EditData onlyGain;
         onlyGain.gainDb = 2.0;
         panel.clickResetForTest();
@@ -27108,14 +29936,50 @@ static void testEditorAudition (const juce::File& tmp)
         }
         bool waitPlaying()
         {
+            const auto t0 = juce::Time::getMillisecondCounterHiRes();
             for (int i = 0; i < 2000 && p->editorAudition.getState() == EditorAudition::loading; ++i)
                 juce::Thread::sleep (5);
+            lastWaitMs = juce::Time::getMillisecondCounterHiRes() - t0;
             return p->editorAudition.getState() == EditorAudition::playing;
+        }
+        double lastWaitMs = 0.0;
+        // Test-side diagnostic for a Play that did not reach `playing`.
+        void auditionDiag (const juce::File& f, int attempt)
+        {
+            juce::AudioFormatManager fm;
+            fm.registerBasicFormats();
+            std::unique_ptr<juce::AudioFormatReader> rd (fm.createReaderFor (f));
+            std::printf ("AUDITION_DIAG attempt=%d path=%s exists=%d size=%lld testReaderOpen=%d waitMs=%.1f state=%d\n",
+                         attempt, f.getFullPathName().toRawUTF8(), f.existsAsFile() ? 1 : 0,
+                         (long long) f.getSize(), rd != nullptr ? 1 : 0, lastWaitMs,
+                         (int) p->editorAudition.getState());
+            std::fflush (stdout);
+        }
+        // play + wait, with up to 2 retries (200 ms apart) after a diagnostic. A retry
+        // that succeeds prints AUDITION_RETRY used so it never hides silently.
+        bool startAndWait (const juce::File& f, juce::int64 s, juce::int64 e, juce::int64 len, bool loop)
+        {
+            p->editorAudition.play (f, s, e, len, loop);
+            if (waitPlaying())
+                return true;
+            for (int attempt = 1; attempt <= 2; ++attempt)
+            {
+                auditionDiag (f, attempt);
+                juce::Thread::sleep (200);
+                p->editorAudition.play (f, s, e, len, loop);
+                if (waitPlaying())
+                {
+                    std::printf ("AUDITION_RETRY used attempt=%d path=%s\n", attempt, f.getFullPathName().toRawUTF8());
+                    std::fflush (stdout);
+                    return true;
+                }
+            }
+            auditionDiag (f, 3);
+            return false;
         }
         bool play (const juce::File& f, juce::int64 s, juce::int64 e, juce::int64 len, bool loop)
         {
-            p->editorAudition.play (f, s, e, len, loop);
-            if (! waitPlaying())
+            if (! startAndWait (f, s, e, len, loop))
                 return false;
             // The clip waits until the main output is down (EditorAudition::duckSamples
             // at the host rate; every Play of this rig starts with the duck released).
@@ -27128,8 +29992,7 @@ static void testEditorAudition (const juce::File& tmp)
         // the clip, so the hold (if any) is in what run() returns.
         bool playRaw (const juce::File& f, juce::int64 s, juce::int64 e, juce::int64 len, bool loop)
         {
-            p->editorAudition.play (f, s, e, len, loop);
-            return waitPlaying();
+            return startAndWait (f, s, e, len, loop);
         }
         // Exactly n samples through processBlock, the last block shorter if needed; same
         // input and clock as run(), the output is dropped and lastIn is left alone.
@@ -29918,6 +32781,38 @@ static void testVersionFooter()
     check (l != nullptr, "editor footer shows HOT-STEP LINK v<JucePlugin_VersionString> plugin");
 }
 
+// f6ed7339: Server URL validation table and setServerUrl keeping the old value on a bad URL.
+static void testServerUrlValidation()
+{
+    std::printf ("\n[server url validation]\n");
+    _putenv_s ("HSLINK_SERVER_URL", "");
+    const char* good[] = { "http://127.0.0.1:3001", "https://host", "  http://h:8080/  ", "HTTP://H:1", "http://h:65535" };
+    const char* bad[]  = { "", "localhost:3001", "ftp://h", "http://", "http://h:0", "http://h:65536", "http://h:abc",
+                           "http://h /", "http://h/path", "http://user@h", "http://h?x" };
+    int goodOk = 0, badOk = 0;
+    for (auto* u : good)
+    {
+        const bool v = HotStepLinkProcessor::isValidServerUrl (u);
+        goodOk += v ? 1 : 0;
+        check (v, (juce::String ("valid URL accepted: '") + u + "'").toRawUTF8());
+    }
+    for (auto* u : bad)
+    {
+        const bool v = HotStepLinkProcessor::isValidServerUrl (u);
+        badOk += v ? 0 : 1;
+        check (! v, (juce::String ("invalid URL rejected: '") + u + "'").toRawUTF8());
+    }
+    std::printf ("    good accepted %d/%d, bad rejected %d/%d\n", goodOk, (int) std::size (good), badOk, (int) std::size (bad));
+    HotStepLinkProcessor p;
+    const juce::String before ("http://127.0.0.1:3005");
+    const bool okSet = p.setServerUrl (before);
+    const bool okBad = p.setServerUrl ("http://h:65536");
+    std::printf ("    set good -> %d, set bad -> %d, url now '%s'\n", (int) okSet, (int) okBad, p.getSavedServerUrl().toRawUTF8());
+    check (okSet, "setServerUrl accepts a valid URL");
+    check (! okBad, "setServerUrl returns false on an invalid URL");
+    check (p.getSavedServerUrl() == before, "setServerUrl keeps the old URL on an invalid value");
+}
+
 static void testServerUrlOverride()
 {
     std::printf ("\n[server url override]\n");
@@ -29952,7 +32847,7 @@ static void testServerUrlOverride()
     {
         HotStepLinkProcessor p;
         p.setStateInformation (in.getData(), (int) in.getSize());
-        p.setServerUrl ("http://typed.example:9999"); // what the URL box does on each keystroke
+        p.setServerUrl ("http://typed.example:9999"); // what the URL box commits on Return or focus loss
         std::printf ("    override + typed: saved '%s', effective '%s'\n",
                      p.getSavedServerUrl().toRawUTF8(), p.getServerUrl().toRawUTF8());
         check (p.getSavedServerUrl() == saved, "typed URL is not saved while the override is active");
@@ -30090,6 +32985,498 @@ static float pgFileTp (const juce::File& f)
     return PeakGuard::truePeakDb (b);
 }
 
+// Import guard (round 3, product decision 2026-11-15): a user file over -1.05 dBTP added as a take
+// gets a guarded session copy at or under -1.05 dBTP; the user's file is never written;
+// the guard holds with Level Off; files at or under -1.05 stay in place. Teeth: compile
+// define HSLINK_TEETH_IMPORT_NO_GUARD (-DHSLINK_TEETH=IMPORT_NO_GUARD; cases a, b, d, e fail).
+static juce::File igWrite (juce::AudioFormat& fmt, const juce::File& f, double sr, int bits, bool isFloat,
+                           const juce::AudioBuffer<float>& buf)
+{
+    f.deleteFile();
+    f.getParentDirectory().createDirectory();
+    std::unique_ptr<juce::OutputStream> os (f.createOutputStream().release());
+    auto w = fmt.createWriterFor (os, juce::AudioFormatWriterOptions{}
+                                          .withSampleRate (sr).withNumChannels (buf.getNumChannels())
+                                          .withBitsPerSample (bits)
+                                          .withSampleFormat (isFloat ? juce::AudioFormatWriterOptions::SampleFormat::floatingPoint
+                                                                     : juce::AudioFormatWriterOptions::SampleFormat::integral));
+    if (w != nullptr) w->writeFromAudioSampleBuffer (buf, 0, buf.getNumSamples());
+    return f;
+}
+
+struct IgSnap { juce::MemoryBlock data; juce::int64 size = 0; juce::Time mtime; };
+static IgSnap igSnap (const juce::File& f) { IgSnap s; f.loadFileAsData (s.data); s.size = f.getSize(); s.mtime = f.getLastModificationTime(); return s; }
+static bool igSame (const IgSnap& a, const juce::File& f) { auto b = igSnap (f); return a.size > 0 && a.data == b.data && a.size == b.size && a.mtime == b.mtime; }
+
+static float igAnyTp (const juce::File& f, double* sr = nullptr, int* ch = nullptr)
+{
+    juce::AudioFormatManager fm; fm.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> rd (fm.createReaderFor (f));
+    if (rd == nullptr) return -999.0f;
+    if (sr != nullptr) *sr = rd->sampleRate;
+    if (ch != nullptr) *ch = (int) rd->numChannels;
+    juce::AudioBuffer<float> b ((int) rd->numChannels, (int) rd->lengthInSamples);
+    rd->read (&b, 0, b.getNumSamples(), 0, true, true);
+    return PeakGuard::truePeakDb (b);
+}
+
+static void testImportGuard (const juce::File& tmp)
+{
+    using P = HotStepLinkProcessor;
+    std::printf ("Import guard (round 3)%c", 10);
+    const auto root = tmp.getChildFile ("importguard"); root.createDirectory();
+    const auto user = root.getChildFile ("user files");
+    const double sr = 48000.0;
+    const int n = 48000;
+    const float target = PeakGuard::kImportTargetDbtp;
+    std::printf ("  import target %.3f dBTP (ceiling %.3f, margin %.3f)%c", target, PeakGuard::kCeilingDbtp, PeakGuard::kMarginDb, 10);
+    const int savedMode = PeakGuard::mode.load();
+    auto p = std::make_unique<P>();
+    p->setStableRoot (root.getChildFile ("stable"));
+    p->setCollectionRoot (root.getChildFile ("coll"));
+    auto findTake = [&] (const juce::File& src, HslinkTakeEntry& out)
+    {
+        for (auto& t : p->getTakes())
+            if (t.importedFrom == src || t.temp == src) { out = t; return true; }
+        return false;
+    };
+    juce::WavAudioFormat wavFmt;
+    juce::File sessionDir;
+
+    // a. hot WAV (about -0.1 dBTP): guarded copy, user file untouched
+    {
+        const auto f = igWrite (wavFmt, user.getChildFile ("hot_a.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), n));
+        const auto s0 = igSnap (f);
+        const float tp0 = igAnyTp (f);
+        const auto r = p->addShotTakeChecked (f);
+        const bool idle = p->waitTakeStretchIdle (30000);
+        HslinkTakeEntry t; const bool listed = findTake (f, t);
+        const float tp1 = listed ? igAnyTp (t.temp) : -999.0f;
+        const float gain = tp1 - tp0;
+        if (listed) sessionDir = t.temp.getParentDirectory();
+        std::printf ("  a. result=%d (want %d pending) idle=%d listed=%d temp='%s' external=%d importedFrom ok=%d src %.3f dBTP -> copy %.3f dBTP gain %.3f dB src identical=%d msg='%s'%c",
+                     (int) r, (int) P::AddTake::pending, (int) idle, (int) listed, t.temp.getFullPathName().toRawUTF8(), (int) t.external,
+                     (int) (t.importedFrom == f), tp0, tp1, gain, (int) igSame (s0, f), p->takeImportMessage().toRawUTF8(), 10);
+        check (r == P::AddTake::pending && idle && listed, "importguard a: hot WAV queued and listed");
+        check (igSame (s0, f), "importguard a: user file bytes, size and mtime unchanged");
+        check (t.temp != f && ! t.external && t.importedFrom == f, "importguard a: take lists the session copy (not external, importedFrom = user file)");
+        check (tp1 <= target + 0.001f && tp1 > -150.0f, "importguard a: copy at or under -1.05 dBTP");
+        check (gain <= -0.5f, "importguard a: attenuation at least 0.5 dB");
+    }
+    // b. Level Off + 0 dBFS: still guarded
+    {
+        PeakGuard::mode.store (PeakGuard::kOff);
+        const auto f = igWrite (wavFmt, user.getChildFile ("full_b.wav"), sr, 32, true, pgSine (sr, 997.0, 0.3, 1.0f, n));
+        const auto s0 = igSnap (f);
+        const float tp0 = igAnyTp (f);
+        p->addShotTakeChecked (f);
+        p->waitTakeStretchIdle (30000);
+        HslinkTakeEntry t; const bool listed = findTake (f, t);
+        const float tp1 = listed ? igAnyTp (t.temp) : -999.0f;
+        std::printf ("  b. Level Off: listed=%d copy=%d src %.3f dBTP -> %.3f dBTP gain %.3f dB src identical=%d%c",
+                     (int) listed, (int) (t.temp != f), tp0, tp1, tp1 - tp0, (int) igSame (s0, f), 10);
+        check (listed && t.temp != f && tp1 <= target + 0.001f && tp1 > -150.0f && tp1 - tp0 <= -0.5f, "importguard b: Level Off, 0 dBFS import gets a copy at or under -1.05 dBTP");
+        check (igSame (s0, f), "importguard b: source bytes unchanged");
+        PeakGuard::mode.store (savedMode);
+    }
+    // c. already under -1.05 dBTP but over the in-place shortcut: in place, no copy
+    {
+        const auto f = igWrite (wavFmt, user.getChildFile ("ok_c.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-2.0f), n));
+        const auto s0 = igSnap (f);
+        const float tp0 = igAnyTp (f);
+        const int files0 = sessionDir.findChildFiles (juce::File::findFiles, true).size();
+        const auto r = p->addShotTakeChecked (f);
+        p->waitTakeStretchIdle (30000);
+        HslinkTakeEntry t; const bool listed = findTake (f, t);
+        const int files1 = sessionDir.findChildFiles (juce::File::findFiles, true).size();
+        std::printf ("  c. src %.3f dBTP result=%d (want pending) listed=%d external=%d temp==src=%d session files %d -> %d identical=%d%c",
+                     tp0, (int) r, (int) listed, (int) t.external, (int) (t.temp == f), files0, files1, (int) igSame (s0, f), 10);
+        check (r == P::AddTake::pending && listed && t.external && t.temp == f, "importguard c: under -1.05 dBTP listed in place (external)");
+        check (sessionDir.isDirectory() && files0 == files1 && igSame (s0, f), "importguard c: no copy made, bytes unchanged");
+    }
+    // d. boundary: between -1.05 and -1.0 dBTP gets a copy
+    {
+        const auto f = igWrite (wavFmt, user.getChildFile ("edge_d.wav"), sr, 32, true, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-1.025f), n));
+        const auto s0 = igSnap (f);
+        const float tp0 = igAnyTp (f);
+        p->addShotTakeChecked (f);
+        p->waitTakeStretchIdle (30000);
+        HslinkTakeEntry t; const bool listed = findTake (f, t);
+        const float tp1 = listed ? igAnyTp (t.temp) : -999.0f;
+        std::printf ("  d. src %.4f dBTP (want in (-1.05, -1.0]) listed=%d copy=%d -> %.4f dBTP identical=%d%c",
+                     tp0, (int) listed, (int) (t.temp != f), tp1, (int) igSame (s0, f), 10);
+        check (tp0 > target && tp0 <= -1.0f, "importguard d: source is between -1.05 and -1.0 dBTP");
+        check (listed && t.temp != f && ! t.external && tp1 <= target + 0.001f && igSame (s0, f), "importguard d: boundary file gets a copy at or under -1.05 dBTP");
+    }
+    // e. FLAC and AIFF hot sources
+    {
+        juce::FlacAudioFormat flac; juce::AiffAudioFormat aiff;
+        struct C { juce::AudioFormat* fmt; const char* name; double rate; };
+        C cases[] = { { &flac, "hot_e.flac", 44100.0 }, { &aiff, "hot_e.aiff", 96000.0 } };
+        for (auto& c : cases)
+        {
+            const auto f = igWrite (*c.fmt, user.getChildFile (c.name), c.rate, 24, false, pgSine (c.rate, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), (int) c.rate));
+            const auto s0 = igSnap (f);
+            double r0 = 0, r1 = 0; int c0 = 0, c1 = 0;
+            const float tp0 = igAnyTp (f, &r0, &c0);
+            p->addShotTakeChecked (f);
+            p->waitTakeStretchIdle (30000);
+            HslinkTakeEntry t; const bool listed = findTake (f, t);
+            const float tp1 = listed ? igAnyTp (t.temp, &r1, &c1) : -999.0f;
+            std::printf ("  e. %s: src %.3f dBTP %.0f Hz %d ch -> copy '%s' %.3f dBTP %.0f Hz %d ch gain %.3f identical=%d%c",
+                         c.name, tp0, r0, c0, t.temp.getFileName().toRawUTF8(), tp1, r1, c1, tp1 - tp0, (int) igSame (s0, f), 10);
+            check (listed && t.temp.hasFileExtension ("wav") && t.temp != f && r1 == r0 && c1 == c0, "importguard e: FLAC/AIFF gives a WAV copy, same rate and channels");
+            check (tp1 <= target + 0.001f && tp1 > -150.0f && tp1 - tp0 <= -0.5f && igSame (s0, f), "importguard e: FLAC/AIFF copy at or under -1.05 dBTP, source unchanged");
+        }
+    }
+    // g. same hot file twice (also while pending)
+    {
+        const auto f = igWrite (wavFmt, user.getChildFile ("dup_g.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), n));
+        const auto r1 = p->addShotTakeChecked (f);
+        const auto r2 = p->addShotTakeChecked (f);
+        p->waitTakeStretchIdle (30000);
+        const auto r3 = p->addShotTakeChecked (f);
+        p->waitTakeStretchIdle (30000);
+        int count = 0;
+        for (auto& t : p->getTakes()) if (t.importedFrom == f || t.temp == f) ++count;
+        std::printf ("  g. first=%d (want %d) while pending=%d after=%d (want %d duplicate) listed=%d (want 1)%c",
+                     (int) r1, (int) P::AddTake::pending, (int) r2, (int) r3, (int) P::AddTake::duplicate, count, 10);
+        check (r1 == P::AddTake::pending && r2 == P::AddTake::duplicate && r3 == P::AddTake::duplicate && count == 1, "importguard g: second add refused as duplicate, pending and after");
+    }
+    // h. save, reload, save: copy non-external under the stable root, no extra WAV
+    {
+        const auto f = user.getChildFile ("hot_a.wav");
+        const auto sroot = root.getChildFile ("stable");
+        juce::MemoryBlock st1, st2;
+        p->getStateInformation (st1);
+        HslinkTakeEntry t; findTake (f, t);
+        const int w0 = root.findChildFiles (juce::File::findFiles, true, "*.wav").size();
+        auto q = std::make_unique<P>();
+        q->setStableRoot (sroot);
+        q->setCollectionRoot (root.getChildFile ("coll"));
+        q->setStateInformation (st1.getData(), (int) st1.getSize());
+        q->getStateInformation (st2);
+        bool found = false, ext = true, under = false;
+        for (auto& e : q->getTakes())
+            if (t.stable != juce::File() && e.stable == t.stable)
+            { found = true; ext = e.external; under = e.stable.isAChildOf (sroot); }
+        q.reset();
+        const int w1 = root.findChildFiles (juce::File::findFiles, true, "*.wav").size();
+        std::printf ("  h. stable='%s' found after reload=%d external=%d (want 0) under stable root=%d wavs %d -> %d%c",
+                     t.stable.getFullPathName().toRawUTF8(), (int) found, (int) ext, (int) under, w0, w1, 10);
+        check (found && ! ext && under && w0 == w1, "importguard h: guarded copy survives save/reload as non-external under the stable root, no extra WAV");
+    }
+    // f. delete the guarded take: the copy moves to Deleted, the user file stays
+    {
+        const auto f = user.getChildFile ("hot_a.wav");
+        const auto s0 = igSnap (f);
+        HslinkTakeEntry t; const bool listed = findTake (f, t);
+        const auto moved = t.stable != juce::File() ? t.stable : t.temp;
+        const auto r = listed ? p->deleteTake (t.temp.getFullPathName()) : P::TakeDelete::notFound;
+        p->commitTakeDelete();
+        const bool idle = p->waitTakeDeleteIdle (10000);
+        const auto inDel = moved.getParentDirectory().getChildFile ("Deleted").getChildFile (moved.getFileName());
+        std::printf ("  f. delete=%d idle=%d moved '%s' gone=%d in Deleted=%d user file present=%d identical=%d%c",
+                     (int) r, (int) idle, moved.getFileName().toRawUTF8(), (int) ! moved.exists(), (int) inDel.existsAsFile(), (int) f.existsAsFile(), (int) igSame (s0, f), 10);
+        check (r == P::TakeDelete::deleted && ! moved.exists() && inDel.existsAsFile(), "importguard f: the session copy is what moved to Deleted");
+        check (f.existsAsFile() && igSame (s0, f), "importguard f: user file still present, same bytes");
+    }
+    // Review round: i (failed import must not leave the path "duplicate"), j and k (late
+    // duplicate found inside the job). The stretch pool has one thread, so a long hot
+    // "blocker" import queued first holds the next jobs back while the test sets the
+    // scene; each case prints whether the blocker was still pending at that point.
+    const int nLong = 48000 * 60;
+    auto isListedSrc = [&] (const juce::File& src) { HslinkTakeEntry t; return findTake (src, t); };
+    auto sessionWavs = [&] (int& unlisted)
+    {
+        const auto files = sessionDir.findChildFiles (juce::File::findFiles, false, "*.wav");
+        const auto ts = p->getTakes();
+        unlisted = 0;
+        for (const auto& f : files)
+        {
+            bool l = false;
+            for (const auto& t : ts) l = l || t.temp == f;
+            if (! l) ++unlisted;
+        }
+        return files.size();
+    };
+    // i. the file turns into one the job cannot hold in memory (a 44-byte WAV header that
+    //    claims 65535 channels x 2147483632 frames) between queueing and the job: the
+    //    buffer allocation throws inside the job. After the file is put back, the same
+    //    path must import normally.
+    {
+        const auto blocker = igWrite (wavFmt, user.getChildFile ("blocker_i.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), nLong));
+        const auto f = igWrite (wavFmt, user.getChildFile ("fail_i.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), n));
+        juce::MemoryBlock good; f.loadFileAsData (good);
+        juce::MemoryOutputStream bad;
+        bad.write ("RIFF", 4); bad.writeInt (0x7fffffff); bad.write ("WAVE", 4);
+        bad.write ("fmt ", 4); bad.writeInt (16); bad.writeShort (1); bad.writeShort ((short) 0xffff);
+        bad.writeInt (48000); bad.writeInt (48000); bad.writeShort (1); bad.writeShort (72);
+        bad.write ("data", 4); bad.writeInt (0x7ffffff0);
+        p->takeImportMessage();
+        const auto rb = p->addShotTakeChecked (blocker);
+        const auto r1 = p->addShotTakeChecked (f);
+        const bool swapped = f.replaceWithData (bad.getData(), bad.getDataSize());
+        const bool blockerPending = ! isListedSrc (blocker);
+        const auto sBad = igSnap (f);
+        const bool idle1 = p->waitTakeStretchIdle (60000);
+        const auto msg1 = p->takeImportMessage();
+        const bool listedAfterFail = isListedSrc (f);
+        const bool badSame = igSame (sBad, f);
+        const bool restored = f.replaceWithData (good.getData(), good.getSize());
+        const auto sGood = igSnap (f);
+        const auto r2 = p->addShotTakeChecked (f);
+        const bool idle2 = p->waitTakeStretchIdle (60000);
+        const auto msg2 = p->takeImportMessage();
+        HslinkTakeEntry t; const bool listed2 = findTake (f, t);
+        std::printf ("  i. blocker=%d first=%d (want %d pending) swapped=%d (%d bytes) blocker still pending at swap=%d idle=%d listed after fail=%d (want 0) msg='%s' swapped file identical=%d%c",
+                     (int) rb, (int) r1, (int) P::AddTake::pending, (int) swapped, (int) bad.getDataSize(), (int) blockerPending, (int) idle1,
+                     (int) listedAfterFail, msg1.toRawUTF8(), (int) badSame, 10);
+        std::printf ("  i. after restore=%d: second=%d (want %d pending, %d = duplicate) idle=%d listed=%d (want 1) copy=%d msg='%s' file identical=%d%c",
+                     (int) restored, (int) r2, (int) P::AddTake::pending, (int) P::AddTake::duplicate, (int) idle2, (int) listed2,
+                     (int) (listed2 && t.temp != f), msg2.toRawUTF8(), (int) igSame (sGood, f), 10);
+        check (rb == P::AddTake::pending && r1 == P::AddTake::pending && swapped && blockerPending && idle1 && ! listedAfterFail,
+               "importguard i: the failing import was reached (file swapped while its job waited, nothing listed)");
+        check (msg1.startsWith ("Take not added: fail_i.wav: ") && msg1.length() > 28, "importguard i: failure message set with a reason");
+        check (badSame, "importguard i: the failing file was not written by the import");
+        check (restored && r2 == P::AddTake::pending && r2 != P::AddTake::duplicate, "importguard i: same path again is not reported duplicate");
+        check (idle2 && listed2 && t.temp != f && ! t.external && msg2.startsWith ("Added take: "), "importguard i: second attempt ends up listed as a guarded copy");
+        check (igSame (sGood, f), "importguard i: user file bytes unchanged by the second import");
+    }
+    // j, k, p. late duplicate found inside the job. Route (works on every platform): the
+    //    file is first written quiet and listed in place at once, and that state is saved
+    //    (S1). The state from before (S0) is restored so the file is unlisted, the file is
+    //    rewritten at the level under test and queued behind the blocker, and while its
+    //    job waits S1 is restored: the take list now holds the user file in place. The
+    //    job then finds it listed. j and p: hot file (the job writes a copy first, then
+    //    must drop it). k: file that needs no copy.
+    struct IgLate
+    {
+        P::AddTake rq = P::AddTake::refused, rb = P::AddTake::refused, r1 = P::AddTake::refused;
+        bool quietListed = false, unlisted = false, blockerPending = false, listedByRestore = false, idle = false, same = false;
+        juce::String midMsg, msg;
+        int count = 0, inPlace = 0, copies = 0, w0 = 0, w1 = 0;
+        bool reached() const
+        {
+            return rq == P::AddTake::added && quietListed && unlisted && rb == P::AddTake::pending && r1 == P::AddTake::pending
+                   && blockerPending && midMsg.isEmpty() && listedByRestore && idle;
+        }
+    };
+    auto runLate = [&] (const char* tag, const juce::String& base, float db)
+    {
+        IgLate o;
+        const auto f = igWrite (wavFmt, user.getChildFile (base + ".wav"), sr, 24, false, pgSine (sr, 220.0, 0.0, 0.25f, n));
+        juce::MemoryBlock st0, st1;
+        p->getStateInformation (st0);
+        o.rq = p->addShotTakeChecked (f);
+        p->waitTakeStretchIdle (30000);
+        o.quietListed = isListedSrc (f);
+        p->getStateInformation (st1);
+        p->setStateInformation (st0.getData(), (int) st0.getSize());
+        p->waitTakeStretchIdle (30000);
+        o.unlisted = ! isListedSrc (f);
+        igWrite (wavFmt, f, sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (db), n));
+        const auto blocker = igWrite (wavFmt, user.getChildFile ("blocker_" + base + ".wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), nLong));
+        const auto s0 = igSnap (f);
+        o.w0 = sessionDir.findChildFiles (juce::File::findFiles, false, "*.wav").size();
+        p->takeImportMessage();
+        o.rb = p->addShotTakeChecked (blocker);
+        o.r1 = p->addShotTakeChecked (f);
+        o.blockerPending = ! isListedSrc (blocker);
+        p->setStateInformation (st1.getData(), (int) st1.getSize());
+        o.midMsg = p->takeImportMessage(); // empty = no import job had finished when the restore returned
+        o.listedByRestore = isListedSrc (f);
+        o.idle = p->waitTakeStretchIdle (60000);
+        o.msg = p->takeImportMessage();
+        for (auto& t : p->getTakes())
+        {
+            if (t.importedFrom == f || t.temp == f) ++o.count;
+            if (t.temp == f && t.external) ++o.inPlace;
+        }
+        o.copies = sessionDir.findChildFiles (juce::File::findFiles, false, base + "*.wav").size();
+        o.w1 = sessionDir.findChildFiles (juce::File::findFiles, false, "*.wav").size();
+        o.same = igSame (s0, f);
+        std::printf ("  %s. quiet add=%d (want %d added) listed=%d unlisted by restore=%d blocker=%d first=%d (want both %d pending) blocker still pending=%d msg at restore='%s' (want empty) listed by restore=%d idle=%d%c",
+                     tag, (int) o.rq, (int) P::AddTake::added, (int) o.quietListed, (int) o.unlisted, (int) o.rb, (int) o.r1, (int) P::AddTake::pending,
+                     (int) o.blockerPending, o.midMsg.toRawUTF8(), (int) o.listedByRestore, (int) o.idle, 10);
+        std::printf ("  %s. takes referencing the file=%d (want 1) in place=%d (want 1) msg='%s' session copies named %s*=%d (want 0) session WAVs %d -> %d (want +1: blocker copy) identical=%d%c",
+                     tag, o.count, o.inPlace, o.msg.toRawUTF8(), base.toRawUTF8(), o.copies, o.w0, o.w1, (int) o.same, 10);
+        return o;
+    };
+    {
+        const auto o = runLate ("j", "late_j", -0.1f);
+        check (o.reached() && o.count == 1, "importguard j: late duplicate reached (listed by a state restore while pending, one take listed)");
+        check (o.msg == "Already in the take list: late_j.wav", "importguard j: late duplicate (hot) says already in the take list");
+        check (o.w1 == o.w0 + 1 && o.copies == 0, "importguard j: no unlisted copy left in the session temp folder");
+        check (o.same, "importguard j: user file bytes unchanged");
+    }
+    {
+        const auto o = runLate ("k", "late_k", -2.0f);
+        check (o.reached() && o.count == 1, "importguard k: late duplicate reached (listed by a state restore while pending, one take listed)");
+        check (o.msg == "Already in the take list: late_k.wav", "importguard k: late duplicate (in place) says already in the take list");
+        check (o.w1 == o.w0 + 1 && o.copies == 0 && o.same, "importguard k: no copy made, user file bytes unchanged");
+    }
+    // p. review round 3: a state that lists the user file in place is restored while a
+    //    hot import of that file is pending: the copy must not be listed as a second take.
+    {
+        const auto o = runLate ("p", "state_p", -0.1f);
+        check (o.reached(), "importguard p: state listing the file in place restored while its hot import was pending");
+        check (o.count == 1 && o.inPlace == 1, "importguard p: exactly one take references the file (the in-place one)");
+        check (o.msg == "Already in the take list: state_p.wav", "importguard p: message is the duplicate text");
+        check (o.copies == 0 && o.w1 == o.w0 + 1, "importguard p: no extra WAV left in the session temp folder");
+        check (o.same, "importguard p: user file bytes unchanged");
+    }
+    // q. product decision 2026-11-15: a pending import is left alone by a host state
+    //    load. A hot file is queued behind the blocker, a state that does not list it is
+    //    restored while its job waits, and after the drain its guarded copy is listed
+    //    (same as an in-flight download; a file the user just added is never dropped).
+    {
+        juce::MemoryBlock st;
+        p->getStateInformation (st); // taken before the file exists in the list
+        const auto blocker = igWrite (wavFmt, user.getChildFile ("blocker_q.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), nLong));
+        const auto f = igWrite (wavFmt, user.getChildFile ("load_q.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), n));
+        const auto s0 = igSnap (f);
+        const float tp0 = igAnyTp (f);
+        p->takeImportMessage();
+        const auto rb = p->addShotTakeChecked (blocker);
+        const auto r1 = p->addShotTakeChecked (f);
+        const bool blockerPending = ! isListedSrc (blocker);
+        p->setStateInformation (st.getData(), (int) st.getSize());
+        const auto midMsg = p->takeImportMessage(); // empty = no import job had finished when the load returned
+        const bool listedAtLoad = isListedSrc (f);
+        const bool idle = p->waitTakeStretchIdle (60000);
+        const auto msg = p->takeImportMessage();
+        int count = 0, inPlace = 0;
+        HslinkTakeEntry t;
+        for (auto& e : p->getTakes())
+        {
+            if (e.importedFrom == f || e.temp == f) { ++count; t = e; }
+            if (e.temp == f) ++inPlace;
+        }
+        const bool isCopy = count == 1 && t.importedFrom == f && t.temp != f && ! t.external && t.temp.existsAsFile();
+        const float tp1 = isCopy ? igAnyTp (t.temp) : -999.0f;
+        const int copies = sessionDir.findChildFiles (juce::File::findFiles, false, "load_q*.wav").size();
+        std::printf ("  q. blocker=%d first=%d (want both %d pending) blocker still pending=%d msg at load='%s' (want empty) listed right after load=%d (want 0) idle=%d%c",
+                     (int) rb, (int) r1, (int) P::AddTake::pending, (int) blockerPending, midMsg.toRawUTF8(), (int) listedAtLoad, (int) idle, 10);
+        std::printf ("  q. after drain: takes with importedFrom the file=%d (want 1) in place=%d (want 0) guarded copy listed=%d source %.3f dBTP copy %.3f dBTP (want <= %.3f) session copies named load_q*=%d (want 1) msg='%s' identical=%d%c",
+                     count, inPlace, (int) isCopy, tp0, tp1, target, copies, msg.toRawUTF8(), (int) igSame (s0, f), 10);
+        check (rb == P::AddTake::pending && r1 == P::AddTake::pending && blockerPending && midMsg.isEmpty() && ! listedAtLoad && idle,
+               "importguard q: state without the file loaded while its hot import was pending");
+        check (count == 1 && inPlace == 0 && isCopy, "importguard q: the pending import is listed after the load (exactly one take, importedFrom the file)");
+        check (tp0 > target + 0.5f && tp1 <= target + 0.001f && tp1 > -150.0f, "importguard q: listed copy at or under -1.05 dBTP");
+        check (copies == 1 && msg.startsWith ("Added take: load_q"), "importguard q: message is the Added take text, one copy in the session temp folder");
+        check (igSame (s0, f), "importguard q: user file bytes unchanged");
+    }
+    // o. review round 3: one case rule. The same file under a spelling that differs only
+    //    in case is refused as a duplicate at queue time: no second job, no second copy.
+    //    Needs a file system that ignores case (Windows, and Mac by default); on a
+    //    case-sensitive Mac volume the second spelling is another (absent) file: skipped.
+#if JUCE_WINDOWS || JUCE_MAC
+    {
+        const auto blocker = igWrite (wavFmt, user.getChildFile ("blocker_o.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), nLong));
+        const auto f = igWrite (wavFmt, user.getChildFile ("case_o.wav"), sr, 24, false, pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), n));
+        const auto fAlt = user.getChildFile ("CASE_O.WAV");
+        if (! fAlt.existsAsFile())
+        {
+            std::printf ("  o. (informational) this volume is case-sensitive: second spelling is not the same file, case skipped%c", 10);
+        }
+        else
+        {
+            const auto s0 = igSnap (f);
+            const int w0 = sessionDir.findChildFiles (juce::File::findFiles, false, "*.wav").size();
+            p->takeImportMessage();
+            const auto rb = p->addShotTakeChecked (blocker);
+            const auto r1 = p->addShotTakeChecked (f);
+            const auto r2 = p->addShotTakeChecked (fAlt);
+            const bool blockerPending = ! isListedSrc (blocker);
+            const bool idle = p->waitTakeStretchIdle (60000);
+            const auto msg = p->takeImportMessage();
+            const auto r3 = p->addShotTakeChecked (fAlt);
+            int count = 0;
+            for (auto& t : p->getTakes()) if (t.importedFrom == f || t.temp == f) ++count;
+            const int copies = sessionDir.findChildFiles (juce::File::findFiles, false, "case_o*.wav").size();
+            const int w1 = sessionDir.findChildFiles (juce::File::findFiles, false, "*.wav").size();
+            std::printf ("  o. blocker=%d first=%d (want %d pending) second spelling=%d (want %d duplicate) blocker still pending=%d idle=%d second spelling after listing=%d (want %d)%c",
+                         (int) rb, (int) r1, (int) P::AddTake::pending, (int) r2, (int) P::AddTake::duplicate, (int) blockerPending, (int) idle, (int) r3, (int) P::AddTake::duplicate, 10);
+            std::printf ("  o. takes listing the file=%d (want 1) session copies named case_o*=%d (want 1) session WAVs %d -> %d (want +2: blocker copy and one take copy) last msg='%s' identical=%d%c",
+                         count, copies, w0, w1, msg.toRawUTF8(), (int) igSame (s0, f), 10);
+            check (rb == P::AddTake::pending && r1 == P::AddTake::pending && blockerPending && r2 == P::AddTake::duplicate,
+                   "importguard o: second spelling (case only) refused as duplicate at queue time");
+            check (idle && count == 1 && copies == 1 && w1 == w0 + 2, "importguard o: one take, exactly one WAV added for it in the session temp folder");
+            check (r3 == P::AddTake::duplicate && msg.startsWith ("Added take: case_o"), "importguard o: no second job ran (last message is the one import), still duplicate once listed");
+            check (igSame (s0, f), "importguard o: user file bytes unchanged");
+        }
+    }
+#endif
+    // Review round 2 (in-place shortcut): l, m, n. The sample-peak shortcut that lists a
+    // file in place with no true-peak scan sits at kImportInPlaceDbfs. l: a worst-case
+    // pattern (alternating signs with a sign slip every 64 samples) has its sample peak
+    // under -6 dBFS and its true peak over the guard; it must be scanned and get a
+    // guarded copy. m: a plain sine at -9 dBFS must be scanned (pending), then listed in
+    // place. n (informational): a 0.25 sine (-12.04 dBFS) is still listed at once.
+    std::printf ("  in-place shortcut kImportInPlaceDbfs = %.2f dBFS%c", (double) P::kImportInPlaceDbfs, 10);
+    auto samplePeakDb = [] (const juce::AudioBuffer<float>& b)
+    {
+        return juce::Decibels::gainToDecibels (b.getMagnitude (0, b.getNumSamples()), -200.0f);
+    };
+    {
+        juce::AudioBuffer<float> b (2, n);
+        const float amp = juce::Decibels::decibelsToGain (-6.1f);
+        for (int i = 0; i < n; ++i)
+        {
+            const float v = ((i + i / 64) % 2 == 0) ? amp : -amp;
+            b.setSample (0, i, v); b.setSample (1, i, v);
+        }
+        const float sp = samplePeakDb (b);
+        const auto f = igWrite (wavFmt, user.getChildFile ("slip_l.wav"), sr, 32, true, b);
+        const auto s0 = igSnap (f);
+        const float tp0 = igAnyTp (f);
+        p->takeImportMessage();
+        const auto r = p->addShotTakeChecked (f);
+        HslinkTakeEntry tNow; const bool listedAtOnce = findTake (f, tNow);
+        const bool idle = p->waitTakeStretchIdle (30000);
+        HslinkTakeEntry t; const bool listed = findTake (f, t);
+        const float tp1 = listed ? igAnyTp (t.temp) : -999.0f;
+        std::printf ("  l. sample peak %.3f dBFS, true peak %.3f dBTP (overshoot %.3f dB) result=%d (want %d pending, %d = added) listed at once=%d (want 0) idle=%d listed=%d copy=%d external=%d listed file %.3f dBTP (want <= %.3f) identical=%d msg='%s'%c",
+                     sp, tp0, tp0 - sp, (int) r, (int) P::AddTake::pending, (int) P::AddTake::added, (int) listedAtOnce, (int) idle, (int) listed,
+                     (int) (listed && t.temp != f), (int) t.external, tp1, target, (int) igSame (s0, f), p->takeImportMessage().toRawUTF8(), 10);
+        check (sp <= -6.0f && tp0 > target, "importguard l: crafted file has sample peak at or under -6 dBFS and true peak over -1.05 dBTP");
+        check (r == P::AddTake::pending && ! listedAtOnce, "importguard l: the file is scanned (pending), not listed at once");
+        check (idle && listed && t.temp != f && ! t.external && t.importedFrom == f && tp1 <= target + 0.001f && tp1 > -150.0f,
+               "importguard l: listed as a guarded copy at or under -1.05 dBTP");
+        check (igSame (s0, f), "importguard l: user file bytes unchanged");
+    }
+    {
+        const auto buf = pgSine (sr, 997.0, 0.3, juce::Decibels::decibelsToGain (-9.0f), n);
+        const float sp = samplePeakDb (buf);
+        const auto f = igWrite (wavFmt, user.getChildFile ("mid_m.wav"), sr, 24, false, buf);
+        const auto s0 = igSnap (f);
+        const float tp0 = igAnyTp (f);
+        const int files0 = sessionDir.findChildFiles (juce::File::findFiles, true).size();
+        const auto r = p->addShotTakeChecked (f);
+        const bool idle = p->waitTakeStretchIdle (30000);
+        HslinkTakeEntry t; const bool listed = findTake (f, t);
+        const int files1 = sessionDir.findChildFiles (juce::File::findFiles, true).size();
+        std::printf ("  m. sample peak %.3f dBFS, true peak %.3f dBTP result=%d (want %d pending, %d = added) idle=%d listed=%d external=%d temp==src=%d session files %d -> %d identical=%d%c",
+                     sp, tp0, (int) r, (int) P::AddTake::pending, (int) P::AddTake::added, (int) idle, (int) listed, (int) t.external, (int) (t.temp == f),
+                     files0, files1, (int) igSame (s0, f), 10);
+        check (sp > -12.0f && sp <= -6.0f && r == P::AddTake::pending, "importguard m: a -9 dBFS file is scanned (pending), not listed at once");
+        check (idle && listed && t.external && t.temp == f && files0 == files1 && igSame (s0, f), "importguard m: scanned file under the guard is listed in place, no copy, bytes unchanged");
+    }
+    {
+        const auto buf = pgSine (sr, 220.0, 0.0, 0.25f, n);
+        const float sp = samplePeakDb (buf);
+        const auto f = igWrite (wavFmt, user.getChildFile ("quiet_n.wav"), sr, 24, false, buf);
+        const auto r = p->addShotTakeChecked (f);
+        HslinkTakeEntry t; const bool listedAtOnce = findTake (f, t);
+        p->waitTakeStretchIdle (30000);
+        std::printf ("  n. (informational) 0.25 sine: sample peak %.3f dBFS result=%d (%d = added) listed at once=%d%c",
+                     sp, (int) r, (int) P::AddTake::added, (int) listedAtOnce, 10);
+    }
+    p.reset();
+    PeakGuard::mode.store (savedMode);
+}
+
 // KNOWN_ISSUES row 15: Level mode. A -20 dBFS sine through applyToFile: Normalise
 // brings it to about -1 dBTP, Guard and Off leave it at -20. Teeth: HSLINK_TEETH=NO_NORMALISE.
 static void testPeakNormalise (const juce::File& tmp)
@@ -30113,6 +33500,2553 @@ static void testPeakNormalise (const juce::File& tmp)
         check (std::abs (tp1 - want[k]) <= 0.3f, (juce::String ("row 15: level mode ") + juce::String (modes[k]) + " lands at the expected true peak").toRawUTF8());
     }
     PeakGuard::mode.store (saved);
+}
+
+// Reference mode round 2: repaint, lego and the strength box are ACE-Step only; the
+// strength box clamps 0..1, persists in state, is half the Mode row and has no steppers;
+// cover_strength goes out only for ACE with a source WAV, value unchanged.
+static int rlCountButtons (juce::Component& c)
+{
+    int n = 0;
+    for (auto* k : c.getChildren())
+        n += (dynamic_cast<juce::Button*> (k) != nullptr ? 1 : 0) + rlCountButtons (*k);
+    return n;
+}
+
+static bool rlSetBackend (HotStepLinkProcessor& p, const juce::String& id)
+{
+    auto* bp = p.apvts.getParameter ("backend");
+    if (bp == nullptr) return false;
+    for (int i = 0; i < 16; ++i)
+        if (HotStepLinkProcessor::backendIdForIndex (i) == id)
+        {
+            bp->setValueNotifyingHost (bp->convertTo0to1 ((float) i));
+            return p.getSelectedBackendId() == id;
+        }
+    return false;
+}
+
+// First-run hint flag in LINK.settings (card db147151 round 2). The flag write must keep every
+// other key, never replace an unreadable file, and happen once on a click or the first capture.
+// Scratch settings file only. Teeth: HSLINK_TEETH=REFHINT_DEFAULTS (the write rebuilds the file
+// from nothing) and HSLINK_TEETH=NO_CAPTURE_HINT (a capture does not save the flag).
+static std::map<juce::String, juce::String> rhReadKeys (const juce::File& f)
+{
+    std::map<juce::String, juce::String> m;
+    if (auto xml = juce::parseXML (f))
+        for (auto* e : xml->getChildIterator())
+            m[e->getStringAttribute ("name")] = e->toString (juce::XmlElement::TextFormat().singleLine());
+    return m;
+}
+
+static bool rhCapture (HotStepLinkProcessor& proc, FakePlayHead& ph, HotStepLinkEditor* ed)
+{
+    const double rate = 44100.0, hostBpm = 120.0;
+    const int block = 512;
+    juce::AudioBuffer<float> buf (2, block);
+    juce::MidiBuffer midi;
+    ph.info.setIsPlaying (false);
+    ph.info.setPpqPosition (0.0);
+    if (! proc.armCapture (true))
+        return false;
+    proc.processBlock (buf, midi);
+    ph.info.setIsPlaying (true);
+    double ppq = 0.0;
+    for (int b = 0; b < 400 && proc.isArmed(); ++b)
+    {
+        ph.info.setPpqPosition (ppq);
+        for (int i = 0; i < block; ++i)
+        {
+            buf.setSample (0, i, 0.25f);
+            buf.setSample (1, i, 0.25f);
+        }
+        proc.processBlock (buf, midi);
+        ppq += block / rate * hostBpm / 60.0;
+        if (ppq >= 4.0)
+            ppq -= 4.0;
+    }
+    if (ed != nullptr)
+    {
+        const auto fileBefore = proc.getSourceFile();
+        ed->refreshSourceForTest(); // the editor's own poll, as its timer does
+        return proc.sourceLoaded() && proc.getSourceFile() != fileBefore;
+    }
+    return proc.pollCapture();
+}
+
+static void testRefHintSettings (const juce::File& tmp)
+{
+    std::printf ("First-run hint flag: safe settings write, click and first capture%c", 10);
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    HotStepLinkProcessor::testRefHintFromDefaults.store (teeth == "REFHINT_DEFAULTS");
+    HotStepLinkProcessor::testNoCaptureHintHook.store (teeth == "NO_CAPTURE_HINT");
+    const auto before = juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {});
+    const auto dir = tmp.getChildFile ("refhint_store");
+    dir.createDirectory();
+    const auto f = dir.getChildFile ("LINK.settings");
+    _putenv_s ("HSLINK_SETTINGS_FILE", f.getFullPathName().toRawUTF8());
+    check (HotStepLinkProcessor::keyStoreFile() == f && f.isAChildOf (tmp), "refhint: the settings file under test is the scratch one");
+    const juce::String dummyKey ("DUMMY-KEY-FOR-TEST-0001");
+    const juce::String seedText = juce::String ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<PROPERTIES>\n")
+        + "  <VALUE name=\"dawKey\" val=\"" + dummyKey + "\"/>\n"
+        + "  <VALUE name=\"futureKeyFromNewerVersion\" val=\"keep me 123\"/>\n"
+        + "  <VALUE name=\"futureSpecial\" val=\"a &amp; b &lt;c&gt; &quot;q&quot;\"/>\n"
+        + "  <VALUE name=\"futureEmpty\" val=\"\"/>\n"
+        + "  <VALUE name=\"futureNumber\" val=\"0.125\"/>\n"
+        + "  <VALUE name=\"futureXml\"><NESTED a=\"1\"><LEAF b=\"two\"/></NESTED></VALUE>\n"
+        + "</PROPERTIES>\n";
+    auto compare = [&] (const std::map<juce::String, juce::String>& seeded, int& identical, int& lost)
+    {
+        const auto now = rhReadKeys (f);
+        identical = 0;
+        lost = 0;
+        for (const auto& kv : seeded)
+        {
+            const auto it = now.find (kv.first);
+            if (it == now.end())
+                ++lost;
+            else if (it->second == kv.second)
+                ++identical;
+        }
+        return (int) now.size();
+    };
+
+    // A. Click on the hint with every known key, a dummy key value and unknown keys in the file.
+    {
+        f.replaceWithText (seedText);
+        const auto seeded = rhReadKeys (f);
+        const int n = (int) seeded.size();
+        const int w0 = HotStepLinkProcessor::refHintWritesForTest.load();
+        const bool flag0 = HotStepLinkProcessor::loadRefHintSeen();
+        {
+            HotStepLinkProcessor p;
+            auto ed = std::make_unique<HotStepLinkEditor> (p);
+            const bool seenAtOpen = ed->refHintSeenForTest();
+            ed->dismissRefHintForTest();
+            check (! seenAtOpen && ed->refHintSeenForTest(), "refhint A: the editor opens with the hint unseen and the click marks it seen");
+        }
+        int identical = 0, lost = 0;
+        const int total = compare (seeded, identical, lost);
+        const bool flag1 = HotStepLinkProcessor::loadRefHintSeen();
+        const int w1 = HotStepLinkProcessor::refHintWritesForTest.load();
+        const bool keyOk = HotStepLinkProcessor::loadStoredKey() == dummyKey;
+        std::printf ("  A click: keys seeded %d, compared %d, identical %d, lost %d; keys in file after %d (want %d); flag %d -> %d; dummy key intact=%d; writes %d%c",
+                     n, n, identical, lost, total, n + 1, flag0 ? 1 : 0, flag1 ? 1 : 0, keyOk ? 1 : 0, w1 - w0, 10);
+        check (n == 6, "refhint A: six keys seeded (dawKey and five unknown)");
+        check (! flag0 && flag1, "refhint A: the click sets refHintSeen in the file");
+        check (identical == n && lost == 0 && total == n + 1, "refhint A: every other key and value is identical after the flag write");
+        check (keyOk, "refhint A: the stored key reads back unchanged");
+        check (w1 - w0 == 1, "refhint A: exactly one write");
+
+        // B. Written twice: no second write, file bytes unchanged.
+        const auto bytes1 = f.loadFileAsString();
+        const bool again = HotStepLinkProcessor::saveRefHintSeen();
+        {
+            HotStepLinkProcessor p;
+            auto ed = std::make_unique<HotStepLinkEditor> (p);
+            ed->dismissRefHintForTest();
+        }
+        const int w2 = HotStepLinkProcessor::refHintWritesForTest.load();
+        const bool same = f.loadFileAsString() == bytes1;
+        int identical2 = 0, lost2 = 0;
+        compare (seeded, identical2, lost2);
+        std::printf ("  B twice: second save returned %d, extra writes %d (want 0), file bytes same=%d, identical %d of %d, lost %d%c",
+                     again ? 1 : 0, w2 - w1, same ? 1 : 0, identical2, n, lost2, 10);
+        check (again && w2 - w1 == 0 && same && identical2 == n && lost2 == 0, "refhint B: a second flag write changes nothing and writes nothing");
+    }
+
+    // C. No file before the write: the file is created holding only the flag.
+    {
+        f.deleteFile();
+        const bool flag0 = HotStepLinkProcessor::loadRefHintSeen();
+        const bool ok = HotStepLinkProcessor::saveRefHintSeen();
+        const auto now = rhReadKeys (f);
+        std::printf ("  C missing file: flag before %d, save returned %d, file exists %d, keys in file %d (want 1), flag after %d, stored key empty=%d%c",
+                     flag0 ? 1 : 0, ok ? 1 : 0, f.existsAsFile() ? 1 : 0, (int) now.size(), HotStepLinkProcessor::loadRefHintSeen() ? 1 : 0,
+                     HotStepLinkProcessor::loadStoredKey().isEmpty() ? 1 : 0, 10);
+        check (! flag0 && ok && f.existsAsFile() && now.size() == 1 && now.count ("refHintSeen") == 1 && HotStepLinkProcessor::loadRefHintSeen()
+               && HotStepLinkProcessor::loadStoredKey().isEmpty(), "refhint C: with no file the write creates one holding only the flag");
+    }
+
+    // D. A file that cannot be parsed (half written, then zero length): no write, bytes untouched.
+    {
+        const juce::String halves[] = { seedText.substring (0, seedText.length() / 2), juce::String() };
+        for (const auto& half : halves)
+        {
+            f.replaceWithText (half);
+            juce::MemoryBlock b0, b1;
+            f.loadFileAsData (b0);
+            const int w0 = HotStepLinkProcessor::refHintWritesForTest.load();
+            const bool ok = HotStepLinkProcessor::saveRefHintSeen();
+            f.loadFileAsData (b1);
+            std::printf ("  D unreadable file (%d bytes): save returned %d (want 0), writes %d (want 0), bytes after %d, identical=%d%c",
+                         (int) b0.getSize(), ok ? 1 : 0, HotStepLinkProcessor::refHintWritesForTest.load() - w0, (int) b1.getSize(), b0 == b1 ? 1 : 0, 10);
+            check (! ok && HotStepLinkProcessor::refHintWritesForTest.load() == w0 && b0 == b1, "refhint D: an unreadable settings file is left exactly as it is");
+        }
+    }
+
+    // E. First capture: the flag is saved once, repeated captures write nothing more.
+    {
+        f.replaceWithText (seedText);
+        const auto seeded = rhReadKeys (f);
+        const int n = (int) seeded.size();
+        const int w0 = HotStepLinkProcessor::refHintWritesForTest.load();
+        const bool flag0 = HotStepLinkProcessor::loadRefHintSeen();
+        FakePlayHead ph;
+        ph.info.setBpm (120.0);
+        ph.info.setTimeSignature (juce::AudioPlayHead::TimeSignature { 4, 4 });
+        ph.info.setIsLooping (true);
+        ph.info.setLoopPoints (juce::AudioPlayHead::LoopPoints { 0.0, 4.0 });
+        int captures = 0, showBefore = 0, seenOpenEditor = 0, showAfterClear = 0;
+        {
+            HotStepLinkProcessor proc;
+            proc.setPlayHead (&ph);
+            proc.prepareToPlay (44100.0, 512);
+            auto ed = std::make_unique<HotStepLinkEditor> (proc);
+            showBefore = ed->sourceWaveForTest().refHintShowing() ? 1 : 0;
+            for (int k = 0; k < 3; ++k)
+                captures += rhCapture (proc, ph, k == 1 ? nullptr : ed.get()) ? 1 : 0;
+            ed->refreshSourceForTest();
+            seenOpenEditor = ed->refHintSeenForTest() ? 1 : 0;
+            proc.clearSource();
+            ed->refreshSourceForTest();
+            showAfterClear = ed->sourceWaveForTest().refHintShowing() ? 1 : 0;
+        }
+        const int w1 = HotStepLinkProcessor::refHintWritesForTest.load();
+        const bool flag1 = HotStepLinkProcessor::loadRefHintSeen();
+        int identical = 0, lost = 0;
+        compare (seeded, identical, lost);
+        int freshSeen = 0, freshShowing = 0;
+        {
+            HotStepLinkProcessor p2;
+            auto ed2 = std::make_unique<HotStepLinkEditor> (p2);
+            freshSeen = ed2->refHintSeenForTest() ? 1 : 0;
+            freshShowing = ed2->sourceWaveForTest().refHintShowing() ? 1 : 0;
+        }
+        std::printf ("  E capture: captures done %d (want 3), settings writes %d (want 1), flag %d -> %d, hint showing before %d (want 1), open editor seen %d, showing with source cleared %d (want 0), fresh editor seen %d showing %d (want 1, 0); identical %d of %d, lost %d%c",
+                     captures, w1 - w0, flag0 ? 1 : 0, flag1 ? 1 : 0, showBefore, seenOpenEditor, showAfterClear, freshSeen, freshShowing, identical, n, lost, 10);
+        check (captures == 3, "refhint E: three captures finished");
+        check (showBefore == 1, "refhint E: the hint shows before the first capture (control)");
+        check (! flag0 && flag1, "refhint E: the first capture sets refHintSeen in the file");
+        check (w1 - w0 == 1, "refhint E: exactly one settings write across three captures");
+        check (seenOpenEditor == 1 && showAfterClear == 0, "refhint E: the open editor keeps the hint off once the source is cleared");
+        check (freshSeen == 1 && freshShowing == 0, "refhint E: a fresh editor on a new instance no longer shows the hint");
+        check (identical == n && lost == 0, "refhint E: the capture write keeps every other key");
+    }
+
+    HotStepLinkProcessor::testRefHintFromDefaults.store (false);
+    HotStepLinkProcessor::testNoCaptureHintHook.store (false);
+    _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+}
+
+// Key save never silently replaces an unreadable settings file; a failed first-run flag
+// write is retried on the next capture. Scratch settings file and folder only, dummy keys only.
+// Teeth: HSLINK_TEETH=KEYSAVE_NO_ASIDE (an unreadable file is replaced with no copy, the old
+// behaviour) and HSLINK_TEETH=CAPTURE_NOTED_FIRST (a failed flag save is never retried).
+static juce::String ksHash (const juce::MemoryBlock& b)
+{
+    juce::uint64 h = 1469598103934665603ull; // FNV-1a 64
+    for (size_t i = 0; i < b.getSize(); ++i)
+        h = (h ^ (juce::uint8) b[i]) * 1099511628211ull;
+    return juce::String::toHexString ((juce::int64) h);
+}
+
+static juce::StringArray ksAsides (const juce::File& f)
+{
+    juce::StringArray names;
+    for (const auto& c : f.getParentDirectory().findChildFiles (juce::File::findFiles, false, f.getFileName() + ".unreadable-*"))
+        names.add (c.getFileName());
+    names.sort (false);
+    return names;
+}
+
+static juce::String ksGarbage (int bytes)
+{
+    juce::String s;
+    while (s.length() < bytes)
+        s << "DUMMY-GARBAGE-NOT-A-SETTINGS-FILE " << s.length() << " ";
+    return s.substring (0, bytes);
+}
+
+static void testKeySave (const juce::File& tmp)
+{
+    std::printf ("Key save: an unreadable settings file is copied aside, never silently replaced%c", 10);
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    HotStepLinkProcessor::testKeySaveNoAside.store (teeth == "KEYSAVE_NO_ASIDE");
+    HotStepLinkProcessor::testCaptureNotedFirst.store (teeth == "CAPTURE_NOTED_FIRST");
+    HotStepLinkProcessor::testKeyAsideFails.store (false);
+    const auto before = juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {});
+    const auto dir = tmp.getChildFile ("keysave_store");
+    dir.createDirectory();
+    const auto f = dir.getChildFile ("LINK.settings");
+    _putenv_s ("HSLINK_SETTINGS_FILE", f.getFullPathName().toRawUTF8());
+    const bool scratch = HotStepLinkProcessor::keyStoreFile() == f && f.isAChildOf (tmp);
+    check (scratch, "keysave: the settings file under test is the scratch one");
+    if (! scratch)
+    {
+        _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+        return; // never run these cases against any other file
+    }
+    const juce::String oldKey ("DUMMY-KEY-FOR-TEST-0001"), newKey ("DUMMY-KEY-FOR-TEST-0002");
+    const juce::String seedText = juce::String ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<PROPERTIES>\n")
+        + "  <VALUE name=\"dawKey\" val=\"" + oldKey + "\"/>\n"
+        + "  <VALUE name=\"refHintSeen\" val=\"1\"/>\n"
+        + "  <VALUE name=\"futureKeyFromNewerVersion\" val=\"keep me 123\"/>\n"
+        + "  <VALUE name=\"futureSpecial\" val=\"a &amp; b &lt;c&gt; &quot;q&quot;\"/>\n"
+        + "  <VALUE name=\"futureEmpty\" val=\"\"/>\n"
+        + "  <VALUE name=\"futureNumber\" val=\"0.125\"/>\n"
+        + "  <VALUE name=\"futureXml\"><NESTED a=\"1\"><LEAF b=\"two\"/></NESTED></VALUE>\n"
+        + "</PROPERTIES>\n";
+    auto clearAsides = [&]
+    {
+        for (const auto& n : ksAsides (f))
+            dir.getChildFile (n).deleteFile();
+    };
+
+    // A. A valid file with the key, the flag and five unknown keys: only the key changes, no copy.
+    {
+        f.replaceWithText (seedText);
+        auto seeded = rhReadKeys (f);
+        seeded.erase ("dawKey");
+        const bool ok = HotStepLinkProcessor::saveStoredKey (newKey);
+        const auto now = rhReadKeys (f);
+        int identical = 0, lost = 0;
+        for (const auto& kv : seeded)
+        {
+            const auto it = now.find (kv.first);
+            if (it == now.end())
+                ++lost;
+            else if (it->second == kv.second)
+                ++identical;
+        }
+        const int asides = ksAsides (f).size();
+        const bool keyOk = HotStepLinkProcessor::loadStoredKey() == newKey;
+        std::printf ("  A valid file: save returned %d (want 1), other keys identical %d of %d (want 6 of 6), lost %d, total %d (want 7), new key reads back %d, aside copies %d (want 0)%c",
+                     ok ? 1 : 0, identical, (int) seeded.size(), lost, (int) now.size(), keyOk ? 1 : 0, asides, 10);
+        check (ok && keyOk, "keysave A: the new key is stored in a valid file");
+        check ((int) seeded.size() == 6 && identical == 6 && lost == 0 && (int) now.size() == 7, "keysave A: all six other keys are identical after the key save");
+        check (asides == 0, "keysave A: a valid file makes no aside copy");
+    }
+
+    // B, C. A 209-byte garbage file, then a zero-length file: one identical aside copy, then a valid new file.
+    {
+        const int sizes[] = { 209, 0 };
+        for (const int size : sizes)
+        {
+            clearAsides();
+            f.replaceWithText (ksGarbage (size));
+            juce::MemoryBlock b0, a0;
+            f.loadFileAsData (b0);
+            const bool ok = HotStepLinkProcessor::saveStoredKey (newKey);
+            const auto asides = ksAsides (f);
+            if (asides.size() == 1)
+                dir.getChildFile (asides[0]).loadFileAsData (a0);
+            const auto now = rhReadKeys (f);
+            const bool keyOk = HotStepLinkProcessor::loadStoredKey() == newKey;
+            const bool same = asides.size() == 1 && a0 == b0;
+            std::printf ("  %s unreadable file %d bytes hash %s: save returned %d (want 1), aside copies %d (want 1), aside %d bytes hash %s identical=%d (want 1), new file keys %d (want 1), new key reads back %d (want 1)%c",
+                         size > 0 ? "B" : "C", (int) b0.getSize(), ksHash (b0).toRawUTF8(), ok ? 1 : 0, asides.size(),
+                         (int) a0.getSize(), ksHash (a0).toRawUTF8(), same ? 1 : 0, (int) now.size(), keyOk ? 1 : 0, 10);
+            check ((int) b0.getSize() == size, "keysave B/C: the unreadable file has the intended size (control)");
+            check (asides.size() == 1 && same, "keysave B/C: exactly one aside copy, byte-identical to the unreadable file");
+            check (ok && keyOk && (int) now.size() == 1, "keysave B/C: the new file is valid and holds the new key");
+        }
+    }
+
+    // D. Five unreadable saves in a row: the newest two copies remain, nothing else is deleted.
+    {
+        clearAsides();
+        const juce::String decoys[] = { "LINK.settings.unreadable-notastamp", "LINK.settings.unreadable-20200101-000000.bak", "other.unreadable-20200101-000000" };
+        for (const auto& d : decoys)
+            dir.getChildFile (d).replaceWithText ("DUMMY-DECOY");
+        juce::StringArray made;
+        juce::Array<int> madeSize;
+        int okCount = 0;
+        for (int i = 0; i < 5; ++i)
+        {
+            const auto had = ksAsides (f);
+            f.replaceWithText (ksGarbage (209 + i));
+            okCount += HotStepLinkProcessor::saveStoredKey (newKey) ? 1 : 0;
+            for (const auto& n : ksAsides (f))
+                if (! had.contains (n))
+                {
+                    made.add (n);
+                    madeSize.add (209 + i);
+                }
+        }
+        juce::StringArray left;
+        for (const auto& n : ksAsides (f))
+            if (n != decoys[0] && n != decoys[1])
+                left.add (n);
+        int newest = 0, sizeOk = 0, decoysLeft = 0;
+        for (int i = 3; i < 5 && made.size() == 5; ++i)
+            if (left.contains (made[i]))
+            {
+                ++newest;
+                sizeOk += (int) dir.getChildFile (made[i]).getSize() == madeSize[i] ? 1 : 0;
+            }
+        for (const auto& d : decoys)
+            decoysLeft += dir.getChildFile (d).existsAsFile() ? 1 : 0;
+        std::printf ("  D five unreadable saves: saves ok %d (want 5), copies made %d (want 5), copies left %d (want 2), of the newest two %d (want 2) with sizes 212..213 right %d (want 2), other files left %d of 3 (want 3)%c",
+                     okCount, made.size(), left.size(), newest, sizeOk, decoysLeft, 10);
+        check (okCount == 5 && made.size() == 5, "keysave D: each of five unreadable saves makes its own aside copy");
+        check (left.size() == 2 && newest == 2 && sizeOk == 2, "keysave D: exactly the newest two aside copies remain");
+        check (decoysLeft == 3, "keysave D: files that do not match the aside name exactly are not deleted");
+        for (const auto& d : decoys)
+            dir.getChildFile (d).deleteFile();
+    }
+
+    // E. The aside copy cannot be made: the save fails and the unreadable file is untouched.
+    {
+        clearAsides();
+        f.replaceWithText (ksGarbage (209));
+        juce::MemoryBlock b0, b1;
+        f.loadFileAsData (b0);
+        HotStepLinkProcessor::testKeyAsideFails.store (true);
+        const bool ok = HotStepLinkProcessor::saveStoredKey (newKey);
+        HotStepLinkProcessor::testKeyAsideFails.store (false);
+        f.loadFileAsData (b1);
+        const int asides = ksAsides (f).size();
+        std::printf ("  E aside copy impossible: save returned %d (want 0), file before %d bytes hash %s, after %d bytes hash %s, identical=%d (want 1), aside copies %d (want 0)%c",
+                     ok ? 1 : 0, (int) b0.getSize(), ksHash (b0).toRawUTF8(), (int) b1.getSize(), ksHash (b1).toRawUTF8(), b0 == b1 ? 1 : 0, asides, 10);
+        check (! ok, "keysave E: the save reports failure when the aside copy cannot be made");
+        check (b0 == b1 && (int) b1.getSize() == 209 && asides == 0, "keysave E: the unreadable file is left byte-identical");
+    }
+
+    // F. No file: an empty key creates nothing, a key creates the file, no copy either way.
+    {
+        clearAsides();
+        f.deleteFile();
+        const bool okEmpty = HotStepLinkProcessor::saveStoredKey ({});
+        const bool madeByEmpty = f.existsAsFile();
+        const bool ok = HotStepLinkProcessor::saveStoredKey (newKey);
+        const auto now = rhReadKeys (f);
+        const bool keyOk = HotStepLinkProcessor::loadStoredKey() == newKey;
+        const int asides = ksAsides (f).size();
+        std::printf ("  F missing file: empty key returned %d created %d (want 1, 0); key save returned %d, file exists %d, keys %d (want 1), key reads back %d, aside copies %d (want 0)%c",
+                     okEmpty ? 1 : 0, madeByEmpty ? 1 : 0, ok ? 1 : 0, f.existsAsFile() ? 1 : 0, (int) now.size(), keyOk ? 1 : 0, asides, 10);
+        check (okEmpty && ! madeByEmpty, "keysave F: clearing a key with no file creates nothing");
+        check (ok && f.existsAsFile() && (int) now.size() == 1 && keyOk && asides == 0, "keysave F: a missing file is created holding the key, with no aside copy");
+    }
+
+    // G. A refused first-run flag write is retried on the next capture, once per capture, never from the poll.
+    {
+        clearAsides();
+        f.replaceWithText (ksGarbage (209));
+        juce::MemoryBlock b0, b1;
+        f.loadFileAsData (b0);
+        FakePlayHead ph;
+        ph.info.setBpm (120.0);
+        ph.info.setTimeSignature (juce::AudioPlayHead::TimeSignature { 4, 4 });
+        ph.info.setIsLooping (true);
+        ph.info.setLoopPoints (juce::AudioPlayHead::LoopPoints { 0.0, 4.0 });
+        auto calls = [] { return HotStepLinkProcessor::refHintSaveCallsForTest.load(); };
+        const int w0 = HotStepLinkProcessor::refHintWritesForTest.load();
+        int captures = 0, c1 = 0, cPoll = 0, c2 = 0, c3 = 0, c4 = 0, saved2 = 0, saved3 = 0, seenEd = 0, wBad = 0;
+        {
+            HotStepLinkProcessor proc;
+            proc.setPlayHead (&ph);
+            proc.prepareToPlay (44100.0, 512);
+            auto ed = std::make_unique<HotStepLinkEditor> (proc);
+            int c = calls();
+            captures += rhCapture (proc, ph, ed.get()) ? 1 : 0; // unreadable file: the write is refused
+            c1 = calls() - c;
+            c = calls();
+            for (int k = 0; k < 10; ++k)
+                ed->refreshSourceForTest();
+            cPoll = calls() - c;
+            seenEd = ed->refHintSeenForTest() ? 1 : 0;
+            c = calls();
+            captures += rhCapture (proc, ph, ed.get()) ? 1 : 0; // still unreadable: one more try
+            c2 = calls() - c;
+            saved2 = proc.refHintSavedForTest() ? 1 : 0;
+            f.loadFileAsData (b1);
+            wBad = HotStepLinkProcessor::refHintWritesForTest.load() - w0;
+            f.replaceWithText (seedText.replace ("  <VALUE name=\"refHintSeen\" val=\"1\"/>\n", ""));
+            c = calls();
+            captures += rhCapture (proc, ph, ed.get()) ? 1 : 0; // readable now: the retry writes the flag
+            c3 = calls() - c;
+            saved3 = proc.refHintSavedForTest() ? 1 : 0;
+            c = calls();
+            captures += rhCapture (proc, ph, ed.get()) ? 1 : 0; // saved: nothing more
+            c4 = calls() - c;
+        }
+        const int wAll = HotStepLinkProcessor::refHintWritesForTest.load() - w0;
+        const bool flag = HotStepLinkProcessor::loadRefHintSeen();
+        std::printf ("  G flag retry: captures %d (want 4); save attempts capture1 %d (want 2: capture + editor), 10 polls %d (want 0), capture2 %d (want 1), capture3 %d (want 1), capture4 %d (want 0); writes while unreadable %d (want 0), file identical=%d; saved state after capture2 %d (want 0), after capture3 %d (want 1); writes total %d (want 1), flag in file %d (want 1), editor seen %d (want 1)%c",
+                     captures, c1, cPoll, c2, c3, c4, wBad, b0 == b1 ? 1 : 0, saved2, saved3, wAll, flag ? 1 : 0, seenEd, 10);
+        check (captures == 4, "keysave G: four captures finished");
+        check (c1 == 2 && cPoll == 0 && seenEd == 1, "keysave G: a refused write is not retried from the poll and the hint stays hidden");
+        check (wBad == 0 && b0 == b1 && saved2 == 0, "keysave G: an unreadable file is not written and the flag is not noted as saved");
+        check (c2 == 1 && c3 == 1, "keysave G: the write is tried again once per capture until it succeeds");
+        check (saved3 == 1 && wAll == 1 && flag, "keysave G: the retry sets the flag in the file with one write");
+        check (c4 == 0, "keysave G: once saved, later captures write nothing");
+    }
+
+    clearAsides();
+    HotStepLinkProcessor::testKeySaveNoAside.store (false);
+    HotStepLinkProcessor::testCaptureNotedFirst.store (false);
+    HotStepLinkProcessor::testKeyAsideFails.store (false);
+    _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+}
+
+// Settings file lock: two processes that read, change and write the same settings file never
+// lose each other's update. Scratch settings file only, dummy keys only; the second writer is
+// this exe in its hidden --settings-helper mode (it ends by itself within a few seconds).
+// Teeth: HSLINK_TEETH=NO_SETTINGS_LOCK (no lock taken, in both processes).
+static void testSettingsLock (const juce::File& tmp)
+{
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    const bool noLock = teeth == "NO_SETTINGS_LOCK";
+    std::printf ("Settings file lock across two processes%s%c", noLock ? "  [TEETH: NO_SETTINGS_LOCK]" : "", 10);
+    HotStepLinkProcessor::testNoSettingsLock.store (noLock);
+    const auto before = juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {});
+    const auto dir = tmp.getChildFile ("settingslock_store");
+    dir.createDirectory();
+    const auto f = dir.getChildFile ("LINK.settings");
+    _putenv_s ("HSLINK_SETTINGS_FILE", f.getFullPathName().toRawUTF8());
+    const bool scratch = HotStepLinkProcessor::keyStoreFile() == f && f.isAChildOf (tmp);
+    check (scratch, "settingslock: the settings file under test is the scratch one");
+    if (! scratch)
+    {
+        _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+        return; // never run these cases against any other file
+    }
+    const int kTimeout = HotStepLinkProcessor::kSettingsLockTimeoutMs;
+    const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile);
+    const auto readDone = f.getSiblingFile (f.getFileName() + ".readdone");
+    const auto heldFlag = f.getSiblingFile (f.getFileName() + ".held");
+    const juce::String oldKey ("DUMMY-KEY-FOR-TEST-OLD");
+    const juce::String seedText = juce::String ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n<PROPERTIES>\n")
+        + "  <VALUE name=\"dawKey\" val=\"" + oldKey + "\"/>\n"
+        + "  <VALUE name=\"futureKeyFromNewerVersion\" val=\"keep me 123\"/>\n"
+        + "  <VALUE name=\"futureNumber\" val=\"0.125\"/>\n"
+        + "</PROPERTIES>\n";
+    auto now = [] { return juce::Time::getMillisecondCounterHiRes(); };
+    auto waitFor = [&] (std::function<bool()> done, double limitMs)
+    {
+        const auto s = now();
+        while (now() - s < limitMs)
+        {
+            if (done())
+                return true;
+            juce::Thread::sleep (2);
+        }
+        return done();
+    };
+    auto helper = [&] (juce::ChildProcess& c, const juce::String& mode, int ms)
+    {
+        return c.start (juce::StringArray { exe.getFullPathName(), "--settings-helper", mode, f.getFullPathName(), juce::String (ms) }, 0);
+    };
+    auto finish = [&] (juce::ChildProcess& c) // true when it ended by itself within 6 s
+    {
+        const bool ended = c.waitForProcessToFinish (6000);
+        if (! ended)
+            c.kill();
+        return ended;
+    };
+    std::printf ("  lock name %s, timeout %d ms%c", HotStepLinkProcessor::settingsLockNameForTest().toRawUTF8(), kTimeout, 10);
+
+    // (a) Interleaved writers, 20 times: B (the helper) reads the file, then pauses 100 ms before
+    //     it writes the flag; A saves a new key inside that pause. Both must be in the file after.
+    {
+        const int kRuns = 20, kPauseMs = 100;
+        int interleaved = 0, aOk = 0, bOk = 0, lostKey = 0, lostFlag = 0, lostOther = 0, lostRuns = 0, selfEnded = 0;
+        double waitMin = 1.0e9, waitMax = 0.0;
+        for (int i = 0; i < kRuns; ++i)
+        {
+            const juce::String newKey = "DUMMY-KEY-FOR-TEST-A" + juce::String (i);
+            f.replaceWithText (seedText);
+            readDone.deleteFile();
+            juce::ChildProcess b;
+            const bool started = helper (b, "flag", kPauseMs);
+            const bool sawRead = started && waitFor ([&] { return readDone.existsAsFile(); }, 5000.0);
+            const auto t0 = now();
+            const bool ok = HotStepLinkProcessor::saveStoredKey (newKey); // A writes inside B's pause
+            const double waited = now() - t0;
+            const bool ended = finish (b);
+            const int code = ended ? (int) b.getExitCode() : -1;
+            const auto keys = rhReadKeys (f);
+            const bool keyThere = HotStepLinkProcessor::loadStoredKey() == newKey;
+            const bool flagThere = HotStepLinkProcessor::loadRefHintSeen();
+            const bool otherThere = keys.count ("futureKeyFromNewerVersion") == 1 && keys.count ("futureNumber") == 1 && keys.size() == 4;
+            interleaved += sawRead ? 1 : 0;
+            aOk += ok ? 1 : 0;
+            bOk += code == 0 ? 1 : 0;
+            selfEnded += ended ? 1 : 0;
+            lostKey += keyThere ? 0 : 1;
+            lostFlag += flagThere ? 0 : 1;
+            lostOther += otherThere ? 0 : 1;
+            lostRuns += (keyThere && flagThere && otherThere) ? 0 : 1;
+            waitMin = juce::jmin (waitMin, waited);
+            waitMax = juce::jmax (waitMax, waited);
+        }
+        std::printf ("  a interleaved writers: runs %d, B read before A wrote %d (want %d), A saves ok %d (want %d), B saves ok %d (want %d), lost updates %d of %d (want 0): key lost %d, flag lost %d, other keys lost %d; A's save took %.0f..%.0f ms (B pauses %d ms holding the lock); helpers ended by themselves %d (want %d)%c",
+                     kRuns, interleaved, kRuns, aOk, kRuns, bOk, kRuns, lostRuns, kRuns, lostKey, lostFlag, lostOther, waitMin, waitMax, kPauseMs, selfEnded, kRuns, 10);
+        check (interleaved == kRuns && selfEnded == kRuns, "settingslock a: every run really interleaved (B had read before A wrote) and every helper ended by itself");
+        check (aOk == kRuns && bOk == kRuns, "settingslock a: both writers report success every time");
+        check (lostRuns == 0 && lostKey == 0 && lostFlag == 0 && lostOther == 0, "settingslock a: the key, the flag and the other keys are all in the file after both writers, 20 of 20");
+        readDone.deleteFile();
+    }
+
+    // (b) The other process holds the lock for longer than the timeout: nothing is written.
+    // (c) The lock is free again when the holder is killed, and when a holder ends normally.
+    {
+        const juce::String newKey ("DUMMY-KEY-FOR-TEST-B");
+        f.replaceWithText (seedText);
+        heldFlag.deleteFile();
+        juce::ChildProcess h;
+        const bool started = helper (h, "hold", 4000);
+        const bool held = started && waitFor ([&] { return heldFlag.existsAsFile(); }, 5000.0);
+        juce::MemoryBlock b0, b1;
+        f.loadFileAsData (b0);
+        const int w0 = HotStepLinkProcessor::refHintWritesForTest.load();
+        auto t0 = now();
+        const bool okKey = HotStepLinkProcessor::saveStoredKey (newKey);
+        const double msKey = now() - t0;
+        t0 = now();
+        const bool okFlag = HotStepLinkProcessor::saveRefHintSeen();
+        const double msFlag = now() - t0;
+        f.loadFileAsData (b1);
+        const int flagWrites = HotStepLinkProcessor::refHintWritesForTest.load() - w0;
+        const bool stillHeld = h.isRunning();
+        const int kMargin = 250;
+        std::printf ("  b lock held by the other process: holder ready %d, still holding after %d (want 1 1); key save returned %d in %.0f ms, flag save returned %d in %.0f ms (want 0 0, each %d..%d ms); file %d bytes hash %s before, %d bytes hash %s after (want identical); flag writes %d (want 0)%c",
+                     held ? 1 : 0, stillHeld ? 1 : 0, okKey ? 1 : 0, msKey, okFlag ? 1 : 0, msFlag, kTimeout - 50, kTimeout + kMargin,
+                     (int) b0.getSize(), ksHash (b0).toRawUTF8(), (int) b1.getSize(), ksHash (b1).toRawUTF8(), flagWrites, 10);
+        check (held && stillHeld, "settingslock b: the helper held the lock for the whole case (control)");
+        check (! okKey && ! okFlag, "settingslock b: both writers report failure when the lock cannot be had");
+        check (b0 == b1 && b0.getSize() > 100 && flagWrites == 0, "settingslock b: the file is byte-identical, nothing was written");
+        check (msKey >= kTimeout - 50 && msKey <= kTimeout + kMargin && msFlag >= kTimeout - 50 && msFlag <= kTimeout + kMargin,
+               "settingslock b: each refused write waits the timeout and no longer (250 ms margin)");
+
+        // (c1) The holder is killed while it holds the lock.
+        h.kill();
+        const bool gone = waitFor ([&] { return ! h.isRunning(); }, 5000.0);
+        t0 = now();
+        const bool okAfterKill = HotStepLinkProcessor::saveStoredKey (newKey);
+        const double msAfterKill = now() - t0;
+        const bool keyAfterKill = HotStepLinkProcessor::loadStoredKey() == newKey;
+        std::printf ("  c1 holder killed: helper gone %d (want 1), key save returned %d in %.0f ms (want 1, under %d ms), key in the file %d (want 1)%c",
+                     gone ? 1 : 0, okAfterKill ? 1 : 0, msAfterKill, kTimeout - 50, keyAfterKill ? 1 : 0, 10);
+        check (gone && okAfterKill && keyAfterKill && msAfterKill < kTimeout - 50, "settingslock c1: after the holder is killed the next write succeeds without waiting out the timeout");
+
+        // (c2) A holder that ends by itself (150 ms hold, never releases the lock in code).
+        heldFlag.deleteFile();
+        juce::ChildProcess h2;
+        const bool started2 = helper (h2, "hold", 150);
+        const bool held2 = started2 && waitFor ([&] { return heldFlag.existsAsFile(); }, 5000.0);
+        const bool ended2 = finish (h2);
+        t0 = now();
+        const bool okFlag2 = HotStepLinkProcessor::saveRefHintSeen();
+        const double msFlag2 = now() - t0;
+        const bool flag2 = HotStepLinkProcessor::loadRefHintSeen();
+        const bool keyKept = HotStepLinkProcessor::loadStoredKey() == newKey;
+        std::printf ("  c2 holder ended by itself: held %d, ended %d (want 1 1), flag save returned %d in %.0f ms (want 1, under %d ms), flag in the file %d, key kept %d (want 1 1)%c",
+                     held2 ? 1 : 0, ended2 ? 1 : 0, okFlag2 ? 1 : 0, msFlag2, kTimeout - 50, flag2 ? 1 : 0, keyKept ? 1 : 0, 10);
+        check (held2 && ended2 && okFlag2 && flag2 && keyKept && msFlag2 < kTimeout - 50, "settingslock c2: after the holder exits the next write succeeds and keeps the key");
+        heldFlag.deleteFile();
+    }
+
+    HotStepLinkProcessor::testNoSettingsLock.store (false);
+    _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+}
+
+// Hidden mode for testSettingsLock: the second process. "hold" takes the settings file lock,
+// makes <file>.held and keeps the lock for ms (5 s at most), then ends without releasing it in
+// code. "flag" writes the first-run flag with a pause of ms (2 s at most) between its read and
+// its write. Refuses any settings file under the user's application data folder.
+static int runSettingsHelper (const juce::String& mode, const juce::String& path, int ms)
+{
+    if (! juce::File::isAbsolutePath (path))
+        return 4;
+    const juce::File f (path);
+    if (f.isAChildOf (juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)))
+        return 4;
+    _putenv_s ("HSLINK_SETTINGS_FILE", f.getFullPathName().toRawUTF8());
+    if (HotStepLinkProcessor::keyStoreFile() != f)
+        return 4;
+    HotStepLinkProcessor::testNoSettingsLock.store (juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "NO_SETTINGS_LOCK");
+    if (mode == "hold")
+    {
+        auto* lock = new juce::InterProcessLock (HotStepLinkProcessor::settingsLockNameForTest()); // never released in code
+        if (! lock->enter (2000))
+            return 3;
+        f.getSiblingFile (f.getFileName() + ".held").create();
+        juce::Thread::sleep (juce::jlimit (0, 5000, ms));
+        return 0;
+    }
+    if (mode == "flag")
+    {
+        HotStepLinkProcessor::testFlagPauseAfterReadMs.store (juce::jlimit (0, 2000, ms));
+        return HotStepLinkProcessor::saveRefHintSeen() ? 0 : 2;
+    }
+    return 5;
+}
+
+// First-run hint view rules (card db147151 round 2 part 2): the hint shows only with no source
+// and the flag unset, never over a waveform, never when it does not fit (no clipped text), the
+// one-line form in the mid-size case; Settings note per backend; tooltips.
+// Teeth: HSLINK_TEETH=HINT_ALWAYS_FITS (refHintFits always true) and
+// HSLINK_TEETH=HINT_IGNORES_SOURCE (refHintShowing ignores the source).
+struct RvInk
+{
+    int text = 0, accent = 0;      // pixels in the hint text colour / in the waveform colour
+    juce::Rectangle<int> box;      // bounds of the text-colour pixels (component coordinates)
+};
+
+static RvInk rvInk (SourceWaveView& v) // wave area only: the card header and ruler are not hint area
+{
+    RvInk r;
+    const auto img = v.createComponentSnapshot (v.getLocalBounds(), true, 1.0f);
+    int x0 = 1 << 30, y0 = 1 << 30, x1 = -1, y1 = -1;
+    const auto wa = v.waveArea().getIntersection (img.getBounds());
+    for (int y = wa.getY(); y < wa.getBottom(); ++y)
+        for (int x = wa.getX(); x < wa.getRight(); ++x)
+        {
+            const auto c = img.getPixelAt (x, y);
+            const int a = c.getAlpha(), cr = c.getRed() * a / 255, cg = c.getGreen() * a / 255;
+            if (cr > 150 && cg > 150) // kText (214, 219); kDim tops out at 124, 133
+            {
+                ++r.text;
+                x0 = juce::jmin (x0, x);
+                y0 = juce::jmin (y0, y);
+                x1 = juce::jmax (x1, x);
+                y1 = juce::jmax (y1, y);
+            }
+            else if (cr > 150 && cg < 130) // kAccent waveform columns
+                ++r.accent;
+        }
+    if (r.text > 0)
+        r.box = { x0, y0, x1 - x0 + 1, y1 - y0 + 1 };
+    return r;
+}
+
+static juce::Point<float> rvTextSize (const juce::String& s)
+{
+    juce::AttributedString as;
+    as.append (s, juce::FontOptions (SourceWaveView::kRefHintFontH));
+    juce::TextLayout tl;
+    tl.createLayout (as, 100000.0f);
+    return { tl.getWidth(), tl.getHeight() };
+}
+
+static void testRefHintView (const juce::File& tmp)
+{
+    std::printf ("First-run hint view: when it shows, fit and one-line fallback, Settings note, tooltips%c", 10);
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    const bool oldA = HotStepLinkProcessor::testRefHintFromDefaults.load(), oldB = HotStepLinkProcessor::testNoCaptureHintHook.load();
+    std::printf ("  0 switches at entry: HSLINK_TEETH='%s' REFHINT_DEFAULTS active=%d NO_CAPTURE_HINT active=%d (want 0 0)%c", teeth.toRawUTF8(), oldA ? 1 : 0, oldB ? 1 : 0, 10);
+    check (! oldA && ! oldB, "refhintview 0: the two settings-write mutants are off outside their own group");
+    SourceWaveView::testHintAlwaysFits.store (teeth == "HINT_ALWAYS_FITS");
+    SourceWaveView::testHintIgnoresSource.store (teeth == "HINT_IGNORES_SOURCE");
+
+    // Measured text: the layout the product uses and, apart from it, a glyph run.
+    const auto two = SourceWaveView::refHintLines (false, false);
+    const auto one = SourceWaveView::refHintLines (false, true);
+    float w2 = 0.0f, hMax = 0.0f;
+    for (const auto& l : two)
+    {
+        w2 = juce::jmax (w2, rvTextSize (l).x);
+        hMax = juce::jmax (hMax, rvTextSize (l).y);
+    }
+    const float w1 = rvTextSize (one[0]).x;
+    hMax = juce::jmax (hMax, rvTextSize (one[0]).y);
+    juce::GlyphArrangement ga;
+    ga.addLineOfText (juce::Font (juce::FontOptions (SourceWaveView::kRefHintFontH)), one[0], 0.0f, 0.0f);
+    const float w1Glyph = ga.getBoundingBox (0, -1, true).getWidth();
+    std::printf ("  1 text: two-line form %d lines, widest %.2f px; one-line form %.2f px (glyph run %.2f px); line height measured %.2f px in a %d px line%c",
+                 two.size(), (double) w2, (double) w1, (double) w1Glyph, (double) hMax, SourceWaveView::kRefHintLineH, 10);
+    check (two.size() == 2 && one.size() == 1 && w2 > 150.0f && w1 > w2 + 20.0f, "refhintview 1: two lines and one longer single line, both measured");
+    check (std::abs (w1 - w1Glyph) <= 3.0f, "refhintview 1: layout width and glyph run width agree within 3 px");
+    check (hMax <= (float) SourceWaveView::kRefHintLineH + 1.0f, "refhintview 1: a line of text is no taller than its 13 px line (1 px slack)");
+
+    // Wave area = component minus 4 px width and 34 px height (16 header, 14 ruler, 2 px each side).
+    struct Case { const char* tag; int areaW, areaH, wantLines; };
+    const int roomy = (int) std::ceil (w1) + 20, mid = (int) std::ceil (w2) + (int) ((w1 - w2) * 0.5f), tight = (int) std::floor (w2) - 30;
+    const Case cases[] = {
+        { "a roomy", roomy, 40, 2 },
+        { "b mid: wide, short", roomy, 20, 1 },
+        { "c too narrow", tight, 40, 0 },
+        { "d between widths, short", mid, 20, 0 },
+        { "e between widths, tall", mid, 40, 2 },
+        { "f too short", roomy, 12, 0 },
+        { "g one line exact", (int) std::ceil (w1), 13, 1 },
+        { "h one line minus 2 px", (int) std::ceil (w1) - 2, 13, 0 },
+        { "i two lines exact", (int) std::ceil (w2), 26, 2 },
+        { "j two lines minus 1 px high", (int) std::ceil (w2), 25, 0 },
+    };
+    int caseNo = 0;
+    for (const auto& c : cases)
+    {
+        SourceWaveView v;
+        v.setBounds (0, 0, c.areaW + 4, c.areaH + 34);
+        v.setRefHint (true, false);
+        const auto wa = v.waveArea();
+        const auto lines = SourceWaveView::refHintFor (false, wa);
+        const bool showing = v.refHintShowing();
+        const auto ink = rvInk (v);
+        float need = 0.0f;
+        for (const auto& l : lines)
+            need = juce::jmax (need, rvTextSize (l).x);
+        const int left = ink.text > 0 ? ink.box.getX() - wa.getX() : -1, right = ink.text > 0 ? wa.getRight() - ink.box.getRight() : -1;
+        const int top = ink.text > 0 ? ink.box.getY() - wa.getY() : -1, bottom = ink.text > 0 ? wa.getBottom() - ink.box.getBottom() : -1;
+        std::printf ("  2%s: area %dx%d px, lines %d (want %d), showing %d, text need %.1fx%d px, text pixels %d, ink box %dx%d, margins L%d R%d T%d B%d%c",
+                     c.tag, wa.getWidth(), wa.getHeight(), lines.size(), c.wantLines, showing ? 1 : 0, (double) need, lines.size() * SourceWaveView::kRefHintLineH,
+                     ink.text, ink.box.getWidth(), ink.box.getHeight(), left, right, top, bottom, 10);
+        ++caseNo;
+        check (wa.getWidth() == c.areaW && wa.getHeight() == c.areaH, "refhintview 2: the wave area is the size the case asks for");
+        check (lines.size() == c.wantLines && showing == (c.wantLines > 0), "refhintview 2: lines chosen and showing state for this area");
+        if (c.wantLines == 0)
+            check (ink.text == 0, "refhintview 2: an area the hint does not fit gets no hint pixels at all (no clipped text)");
+        else
+            check (ink.text >= 300 && left >= 0 && right >= 0 && top >= 0 && bottom >= 0
+                   && std::abs ((float) ink.box.getWidth() - need) <= 6.0f, "refhintview 2: the drawn hint is whole (full measured width) and inside the wave area");
+        if (c.wantLines == 1)
+            check (lines[0] == one[0], "refhintview 2: the single line is the compact text");
+    }
+    check (caseNo == 10, "refhintview 2: ten areas run");
+
+    // 3. Flag, recording, source: who gets a hint.
+    {
+        const auto wav = tmp.getChildFile ("refhintview").getChildFile ("src.wav");
+        wav.getParentDirectory().createDirectory();
+        juce::AudioBuffer<float> b (2, 48000);
+        for (int i = 0; i < b.getNumSamples(); ++i)
+        {
+            b.setSample (0, i, 0.8f * std::sin (0.02f * (float) i));
+            b.setSample (1, i, 0.8f * std::sin (0.02f * (float) i));
+        }
+        writeWav (wav, b, 48000.0);
+        SourceWaveView v;
+        v.setBounds (0, 0, roomy + 4, 40 + 34);
+        int clicks = 0;
+        v.onRefHintDismiss = [&clicks] { ++clicks; };
+        auto click = [&v]
+        {
+            const auto pos = v.waveArea().getCentre().toFloat();
+            const juce::MouseEvent e (juce::Desktop::getInstance().getMainMouseSource(), pos, juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier),
+                                      juce::MouseInputSource::defaultPressure, 0.0f, 0.0f, 0.0f, 0.0f, &v, &v, juce::Time::getCurrentTime(), pos,
+                                      juce::Time::getCurrentTime(), 1, false);
+            v.mouseDown (e);
+        };
+        const bool offShow = v.refHintShowing();
+        const auto offInk = rvInk (v);
+        click();
+        const int offClicks = clicks;
+        v.setRefHint (true, false);
+        const bool onShow = v.refHintShowing();
+        const auto onInk = rvInk (v);
+        click();
+        const int onClicks = clicks;
+        v.setRecording (true);
+        const bool recShow = v.refHintShowing();
+        const auto recInk = rvInk (v);
+        v.setRecording (false);
+        v.setSource (wav, 1.0, 120.0); // peaks are only taken in poll(): until then the card is "reading..."
+        const bool srcShow = v.refHintShowing();
+        const auto srcInk = rvInk (v);
+        click();
+        const int srcClicks = clicks - onClicks;
+        bool peaksIn = false;
+        for (int k = 0; k < 300 && ! peaksIn; ++k)
+        {
+            v.poll();
+            peaksIn = v.hasPeaksForTest();
+            if (! peaksIn)
+                juce::Thread::sleep (10);
+        }
+        const bool waveShow = v.refHintShowing();
+        const auto waveInk = rvInk (v);
+        v.setSource (juce::File(), 0.0, 0.0);
+        const bool backShow = v.refHintShowing();
+        std::printf ("  3 view: flag off showing %d text px %d clicks %d | flag on, no source showing %d text px %d clicks %d | recording showing %d text px %d | source loading showing %d text px %d clicks %d | waveform (peaks=%d) showing %d text px %d waveform px %d | source cleared showing %d%c",
+                     offShow ? 1 : 0, offInk.text, offClicks, onShow ? 1 : 0, onInk.text, onClicks, recShow ? 1 : 0, recInk.text, srcShow ? 1 : 0, srcInk.text, srcClicks,
+                     peaksIn ? 1 : 0, waveShow ? 1 : 0, waveInk.text, waveInk.accent, backShow ? 1 : 0, 10);
+        check (! offShow && offInk.text == 0 && offClicks == 0, "refhintview 3: flag off = no hint, no hint pixels, a click does nothing");
+        check (onShow && onInk.text >= 300 && onClicks == 1, "refhintview 3: flag on with no source = hint drawn (300+ text pixels) and one click reaches the dismiss call");
+        check (! recShow && recInk.text == 0, "refhintview 3: no hint while recording");
+        check (! srcShow && srcInk.text == 0 && srcClicks == 0, "refhintview 3: no hint, no hint pixels and no dismiss click once a source is set");
+        check (peaksIn && ! waveShow && waveInk.text == 0 && waveInk.accent >= 500, "refhintview 3: the waveform is drawn (500+ pixels) with no hint over it");
+        check (backShow, "refhintview 3: with the source cleared and the flag still on the hint is back (control)");
+
+        // 4. The editor: flag unset and no source = hint; flag set = none; a source = none.
+        const auto before = juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {});
+        const auto f = tmp.getChildFile ("refhintview").getChildFile ("LINK.settings");
+        f.deleteFile();
+        _putenv_s ("HSLINK_SETTINGS_FILE", f.getFullPathName().toRawUTF8());
+        check (HotStepLinkProcessor::keyStoreFile() == f && f.isAChildOf (tmp), "refhintview 4: the settings file under test is the scratch one");
+        int freshShow = 0, freshSeen = 0, srcEdShow = 0, srcEdInk = 0, seenShow = 0, seenInk = 0, freshInk = 0;
+        juce::String tipFresh, tipSeen, tipRe;
+        {
+            HotStepLinkProcessor p;
+            auto ed = std::make_unique<HotStepLinkEditor> (p);
+            ed->refreshSourceForTest();
+            freshSeen = ed->refHintSeenForTest() ? 1 : 0;
+            freshShow = ed->sourceWaveForTest().refHintShowing() ? 1 : 0;
+            freshInk = rvInk (ed->sourceWaveForTest()).text;
+            tipFresh = ed->sourceWaveForTest().getTooltip();
+            tipRe = ed->reanalyzeTooltipForTest();
+        }
+        {
+            HotStepLinkProcessor p;
+            p.setSourceFile (wav);
+            auto ed = std::make_unique<HotStepLinkEditor> (p);
+            ed->refreshSourceForTest();
+            srcEdShow = ed->sourceWaveForTest().refHintShowing() ? 1 : 0;
+            srcEdInk = rvInk (ed->sourceWaveForTest()).text;
+        }
+        const int w0 = HotStepLinkProcessor::refHintWritesForTest.load();
+        const bool flagBefore = HotStepLinkProcessor::loadRefHintSeen();
+        {
+            HotStepLinkProcessor p;
+            auto ed = std::make_unique<HotStepLinkEditor> (p);
+            ed->dismissRefHintForTest();
+        }
+        {
+            HotStepLinkProcessor p;
+            auto ed = std::make_unique<HotStepLinkEditor> (p);
+            ed->refreshSourceForTest();
+            seenShow = ed->sourceWaveForTest().refHintShowing() ? 1 : 0;
+            seenInk = rvInk (ed->sourceWaveForTest()).text;
+            tipSeen = ed->sourceWaveForTest().getTooltip();
+        }
+        std::printf ("  4 editor: fresh (flag %d, no source) seen %d showing %d text px %d | with a source showing %d text px %d | flag set (writes %d) showing %d text px %d%c",
+                     flagBefore ? 1 : 0, freshSeen, freshShow, freshInk, srcEdShow, srcEdInk, HotStepLinkProcessor::refHintWritesForTest.load() - w0, seenShow, seenInk, 10);
+        check (! flagBefore && freshSeen == 0 && freshShow == 1 && freshInk >= 300, "refhintview 4: first run (flag unset, no source) shows the hint in the editor");
+        check (srcEdShow == 0 && srcEdInk == 0, "refhintview 4: an editor that opens with a source shows no hint");
+        check (seenShow == 0 && seenInk == 0, "refhintview 4: with the flag set and no source there is no hint");
+
+        // 5. Tooltips.
+        std::printf ("  5 tooltips: source card unseen '%s' (%d chars) | seen '%s' | re-analyze %d chars: '%s'%c", tipFresh.toRawUTF8(), tipFresh.length(),
+                     tipSeen.toRawUTF8(), tipRe.length(), tipRe.toRawUTF8(), 10);
+        check (tipFresh.contains ("Click the hint to hide it") && tipSeen.isNotEmpty() && ! tipSeen.contains ("hint"), "refhintview 5: the source card tooltip names the click only while the hint is on");
+        check (tipRe.length() >= 60 && tipRe.contains ("understand job") && tipRe.contains ("current source") && tipRe.contains ("Generate does not use them"),
+               "refhintview 5: RE-ANALYZE CAPTURE tooltip says what it runs, on what, and that Generate ignores it");
+        _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+    }
+
+    // 6. Settings note per backend.
+    {
+        struct Row { const char* id; const char* want; };
+        const Row rows[] = { { "", "pick a backend to use reference audio" }, { "ace", "" }, { "sa3", "reference audio needs ACE-Step" },
+                             { "yue2", "reference audio needs ACE-Step" }, { "minimax-m3", "reference audio needs ACE-Step" },
+                             { "heartmula", "reference audio needs ACE-Step" } };
+        int right = 0, inList = 0;
+        for (const auto& r : rows)
+        {
+            const auto got = HotStepLinkEditor::refLockNoteText (r.id);
+            bool listed = false;
+            for (int i = 0; i < HotStepLinkProcessor::kBackendChoices; ++i)
+                listed = listed || HotStepLinkProcessor::backendIdForIndex (i) == juce::String (r.id);
+            right += got == juce::String (r.want) ? 1 : 0;
+            inList += listed ? 1 : 0;
+            std::printf ("  6 note: backend '%s' in the product list=%d note '%s' (want '%s')%c", r.id[0] != 0 ? r.id : "auto", listed ? 1 : 0, got.toRawUTF8(), r.want, 10);
+        }
+        check (right == 6 && inList == 6 && HotStepLinkProcessor::kBackendChoices == 6, "refhintview 6: note text for all six backend choices (Auto, ACE none, four need ACE-Step)");
+    }
+
+    SourceWaveView::testHintAlwaysFits.store (false);
+    SourceWaveView::testHintIgnoresSource.store (false);
+    check (! HotStepLinkProcessor::testRefHintFromDefaults.load() && ! HotStepLinkProcessor::testNoCaptureHintHook.load(),
+           "refhintview 0: the two settings-write mutants are still off at the end");
+}
+
+// srclabel: the small label in the SOURCE waveform card header says only what is true.
+// No source = no label at all; recording = RECORDING; a source = CAPTURED (the code has
+// one source slot: a captured clip and a loaded file are not told apart).
+// Teeth HSLINK_TEETH=LABEL_ALWAYS_CAPTURED: the old code, CAPTURED with no source.
+static int slHeaderInk (SourceWaveView& v) // drawn pixels in the left 90 px of the 16 px header
+{
+    const auto img = v.createComponentSnapshot (v.getLocalBounds(), true, 1.0f);
+    int n = 0;
+    for (int y = 0; y < juce::jmin (16, img.getHeight()); ++y)
+        for (int x = 0; x < juce::jmin (90, img.getWidth()); ++x)
+            if (img.getPixelAt (x, y).getAlpha() > 60)
+                ++n;
+    return n;
+}
+
+static void testSourceLabel (const juce::File& tmp)
+{
+    const bool teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {}) == "LABEL_ALWAYS_CAPTURED";
+    SourceWaveView::testLabelAlwaysCaptured.store (teeth);
+    std::printf ("srclabel%s%c", teeth ? " (teeth LABEL_ALWAYS_CAPTURED: the old label)" : "", 10);
+    const auto dir = tmp.getChildFile ("srclabel");
+    dir.createDirectory();
+    const auto wav = dir.getChildFile ("src.wav");
+    {
+        juce::AudioBuffer<float> b (2, 48000);
+        for (int i = 0; i < b.getNumSamples(); ++i)
+        {
+            b.setSample (0, i, 0.8f * std::sin (0.02f * (float) i));
+            b.setSample (1, i, 0.8f * std::sin (0.02f * (float) i));
+        }
+        writeWav (wav, b, 48000.0);
+    }
+
+    // 1. The pure table.
+    {
+        const auto none = SourceWaveView::headerLabelFor (false, false), rec = SourceWaveView::headerLabelFor (true, false),
+                   recSrc = SourceWaveView::headerLabelFor (true, true), src = SourceWaveView::headerLabelFor (false, true);
+        std::printf ("  1 table: none '%s' | recording '%s' | recording over a source '%s' | source '%s'%c",
+                     none.toRawUTF8(), rec.toRawUTF8(), recSrc.toRawUTF8(), src.toRawUTF8(), 10);
+        check (none.isEmpty() && rec == "RECORDING" && recSrc == "RECORDING" && src == "CAPTURED", "srclabel 1: label per state in the pure table");
+    }
+
+    // 2. The view alone: text and header pixels per state.
+    {
+        SourceWaveView v;
+        v.setBounds (0, 0, 280, 74);
+        const auto noneT = v.headerLabelForTest();
+        const int noneInk = slHeaderInk (v);
+        v.setRecording (true);
+        const auto recT = v.headerLabelForTest();
+        const int recInk = slHeaderInk (v);
+        v.setRecording (false);
+        v.setSource (wav, 1.0, 120.0);
+        const auto srcT = v.headerLabelForTest();
+        const int srcInk = slHeaderInk (v);
+        v.setSource (juce::File(), 0.0, 0.0);
+        const auto backT = v.headerLabelForTest();
+        const int backInk = slHeaderInk (v);
+        std::printf ("  2 view: no source '%s' header px %d | recording '%s' header px %d | source '%s' header px %d | source cleared '%s' header px %d%c",
+                     noneT.toRawUTF8(), noneInk, recT.toRawUTF8(), recInk, srcT.toRawUTF8(), srcInk, backT.toRawUTF8(), backInk, 10);
+        check (noneT.isEmpty() && noneInk == 0, "srclabel 2: no source = no label text and no header pixels");
+        check (recT == "RECORDING" && recInk >= 60, "srclabel 2: recording reads RECORDING, drawn (60+ header pixels)");
+        check (srcT == "CAPTURED" && srcInk >= 60, "srclabel 2: a source reads CAPTURED, drawn (60+ header pixels)");
+        check (backT.isEmpty() && backInk == 0, "srclabel 2: the label goes when the source is cleared");
+    }
+
+    // 3. The editor on a scratch settings file: true first run, a loaded file, a real capture.
+    {
+        const auto before = juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {});
+        const auto f = dir.getChildFile ("LINK.settings");
+        f.deleteFile();
+        _putenv_s ("HSLINK_SETTINGS_FILE", f.getFullPathName().toRawUTF8());
+        check (HotStepLinkProcessor::keyStoreFile() == f && f.isAChildOf (tmp), "srclabel 3: the settings file under test is the scratch one");
+        juce::String firstT, firstSrc, loadT, loadSrc, capT, capSrc;
+        int firstInk = -1, loadInk = -1, capInk = -1;
+        bool got = false;
+        {
+            HotStepLinkProcessor p;
+            auto ed = std::make_unique<HotStepLinkEditor> (p);
+            ed->refreshSourceForTest();
+            firstT = ed->sourceWaveForTest().headerLabelForTest();
+            firstSrc = ed->sourceTextForTest();
+            firstInk = slHeaderInk (ed->sourceWaveForTest());
+            // The path of "Add as take..." / a dropped file as far as the source slot goes.
+            p.setSourceFile (wav);
+            ed->refreshSourceForTest();
+            loadT = ed->sourceWaveForTest().headerLabelForTest();
+            loadSrc = ed->sourceTextForTest();
+            loadInk = slHeaderInk (ed->sourceWaveForTest());
+        }
+        {
+            HotStepLinkProcessor p;
+            FakePlayHead head;
+            auto ed = std::make_unique<HotStepLinkEditor> (p);
+            ed->refreshSourceForTest();
+            head.info.setBpm (120.0);
+            head.info.setTimeSignature (juce::AudioPlayHead::TimeSignature { 4, 4 });
+            head.info.setIsLooping (true);
+            head.info.setLoopPoints (juce::AudioPlayHead::LoopPoints { 0.0, 4.0 });
+            p.setPlayHead (&head);
+            p.prepareToPlay (44100.0, 512);
+            got = rhCapture (p, head, ed.get());
+            p.setPlayHead (nullptr);
+            ed->refreshSourceForTest();
+            capT = ed->sourceWaveForTest().headerLabelForTest();
+            capSrc = ed->sourceTextForTest();
+            capInk = slHeaderInk (ed->sourceWaveForTest());
+        }
+        std::printf ("  3 editor: first run label '%s' header px %d, source line '%s' | loaded file label '%s' header px %d, source line '%s' | capture done=%d label '%s' header px %d, source line '%s'%c",
+                     firstT.toRawUTF8(), firstInk, firstSrc.toRawUTF8(), loadT.toRawUTF8(), loadInk, loadSrc.toRawUTF8(),
+                     got ? 1 : 0, capT.toRawUTF8(), capInk, capSrc.toRawUTF8(), 10);
+        check (firstSrc == "Source: none" && firstT.isEmpty() && firstInk == 0, "srclabel 3: true first run (Source: none) has no label and no header pixels");
+        check (loadSrc.startsWith ("Source: ready") && loadT == "CAPTURED" && loadInk >= 60, "srclabel 3: a loaded file reads CAPTURED as before (one source slot, not told apart)");
+        check (got && capSrc.startsWith ("Source: ready") && capT == "CAPTURED" && capInk >= 60, "srclabel 3: after a real capture the label reads CAPTURED");
+        _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+    }
+    SourceWaveView::testLabelAlwaysCaptured.store (false);
+}
+
+static void testRefLock (const juce::File& tmp)
+{
+    std::printf ("Reference lock + cover_strength (ref round 2)%c", 10);
+    // RL1-RL3: lock per backend (server reports both models, so only the backend can lock).
+    const juce::StringArray ids { "", "sa3", "yue2", "minimax-m3", "heartmula", "ace" };
+    for (const auto& id : ids)
+    {
+        HotStepLinkProcessor p;
+        const bool set = rlSetBackend (p, id);
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        ed->setSettingsOpenForTest (true);
+        ed->setServerModelsForTest (true, true);
+        const bool rp = ed->modeItemEnabledForTest (2), lg = ed->modeItemEnabledForTest (3);
+        auto& se = ed->strengthEditorForTest();
+        const bool st = se.isEnabled() && ! se.isReadOnly();
+        const auto& note = ed->refLockNoteForTest();
+        const bool noteOn = note.isVisible() && note.getParentComponent() != nullptr && note.getParentComponent()->isVisible();
+        const juce::String label = id.isEmpty() ? juce::String ("auto") : id;
+        std::printf ("  RL %s: set=%d repaint=%d lego=%d strength=%d note=%d text='%s' noteW=%d%c", label.toRawUTF8(), set ? 1 : 0,
+                     rp ? 1 : 0, lg ? 1 : 0, st ? 1 : 0, noteOn ? 1 : 0, note.getText().toRawUTF8(), note.getWidth(), 10);
+        if (id == "ace")
+            check (set && rp && lg && st && ! noteOn, "ref lock: ACE unlocks repaint, lego and strength, no note");
+        else
+            check (set && ! rp && ! lg && ! st, ("ref lock: " + label + " locks repaint, lego and strength").toRawUTF8());
+        if (id.isEmpty())
+            check (noteOn && note.getText() == "pick a backend to use reference audio" && note.getWidth() > 50,
+                   "ref lock: Auto shows the pick-a-backend note");
+        else if (id != "ace")
+            check (noteOn && note.getText() == "reference audio needs ACE-Step" && note.getWidth() > 50,
+                   ("ref lock: " + label + " shows the needs-ACE-Step note").toRawUTF8());
+    }
+    // RL4: cover_strength in the request.
+    {
+        const auto src = tmp.getChildFile ("rl_src.wav");
+        struct C { const char* be; bool withSrc; bool want; };
+        const C cases[] = { { "ace", true, true }, { "ace", false, false }, { "sa3", true, false }, { "", true, false }, { "yue2", true, false } };
+        for (const auto& c : cases)
+        {
+            HotStepLinkProcessor p;
+            rlSetBackend (p, c.be);
+            p.setCoverStrength (0.35);
+            auto r = p.makeRequest ("rl", 0.0);
+            if (c.withSrc) r.sourceWav = src;
+            const auto v = juce::JSON::parse (r.toJson());
+            const bool has = v.hasProperty ("cover_strength");
+            const double got = has ? (double) v["cover_strength"] : -1.0;
+            std::printf ("  RL4 backend='%s' src=%d: cover_strength present=%d value=%.4f (want present=%d value 0.35)%c",
+                         c.be, c.withSrc ? 1 : 0, has ? 1 : 0, got, c.want ? 1 : 0, 10);
+            check (has == c.want && (! c.want || std::abs (got - 0.35) < 1e-9),
+                   (juce::String ("cover_strength ") + (c.want ? "sent as 0.35" : "absent") + " for backend '" + c.be
+                    + "'" + (c.withSrc ? " with source" : " without source")).toRawUTF8());
+        }
+    }
+    // RL5: clamp through the box and the setter.
+    {
+        HotStepLinkProcessor p;
+        rlSetBackend (p, "ace");
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        auto& se = ed->strengthEditorForTest();
+        se.setText ("1.7", false);
+        if (se.onReturnKey) se.onReturnKey();
+        const double hi = p.getCoverStrength();
+        const auto hiText = se.getText();
+        se.setText ("0.35", false);
+        if (se.onReturnKey) se.onReturnKey();
+        const double mid = p.getCoverStrength();
+        p.setCoverStrength (-0.5);
+        const double lo = p.getCoverStrength();
+        p.setCoverStrength (3.0);
+        const double hi2 = p.getCoverStrength();
+        std::printf ("  RL5 box 1.7 -> %.4f text '%s'; box 0.35 -> %.4f; set -0.5 -> %.4f; set 3.0 -> %.4f%c",
+                     hi, hiText.toRawUTF8(), mid, lo, hi2, 10);
+        check (hi == 1.0 && hiText == "1.00" && std::abs (mid - 0.35) < 1e-9 && lo == 0.0 && hi2 == 1.0,
+               "strength clamps to 0..1 (box 1.7 -> 1.00, set -0.5 -> 0, set 3 -> 1)");
+    }
+    // RL6: persists through state.
+    {
+        juce::MemoryBlock state;
+        {
+            HotStepLinkProcessor a;
+            a.setCoverStrength (0.35);
+            a.getStateInformation (state);
+        }
+        HotStepLinkProcessor b;
+        const double before = b.getCoverStrength();
+        b.setStateInformation (state.getData(), (int) state.getSize());
+        const double after = b.getCoverStrength();
+        auto ed = std::make_unique<HotStepLinkEditor> (b);
+        const auto txt = ed->strengthEditorForTest().getText();
+        std::printf ("  RL6 fresh %.4f, after load %.4f, box '%s' (want 0.35)%c", before, after, txt.toRawUTF8(), 10);
+        check (std::abs (after - 0.35) < 1e-9 && txt == "0.35" && before == 1.0, "strength 0.35 persists through state save and load");
+    }
+    // RL8: the ACE mode is remembered across a non-ACE backend (lego -> sa3 text2music -> ace lego).
+    {
+        HotStepLinkProcessor p;
+        rlSetBackend (p, "ace");
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        ed->setServerModelsForTest (true, true);
+        auto& mb = ed->modeBoxForTest();
+        mb.setSelectedId (3, juce::sendNotificationSync);
+        const int m0 = p.getModeId(), b0 = mb.getSelectedId();
+        rlSetBackend (p, "sa3");
+        ed->applyBackendRefLockForTest();
+        const int m1 = p.getModeId(), b1 = mb.getSelectedId();
+        rlSetBackend (p, "ace");
+        ed->applyBackendRefLockForTest();
+        const int m2 = p.getModeId(), b2 = mb.getSelectedId();
+        juce::MemoryBlock st;
+        rlSetBackend (p, "sa3");
+        ed->applyBackendRefLockForTest();
+        p.getStateInformation (st);
+        ed.reset();
+        HotStepLinkProcessor q;
+        q.setStateInformation (st.getData(), (int) st.getSize());
+        const int saved = q.getAceModeId();
+        std::printf ("  RL8 ace+lego mode=%d box=%d; sa3 mode=%d box=%d (want 1); ace mode=%d box=%d (want 3); saved in state=%d (want 3)%c",
+                     m0, b0, m1, b1, m2, b2, saved, 10);
+        check (m0 == 3 && b0 == 3 && m1 == 1 && b1 == 1, "ref lock: ACE lego switches to text2music on SA3");
+        check (m2 == 3 && b2 == 3, "ref lock: switching back to ACE restores lego");
+        check (saved == 3, "ref lock: the ACE mode persists through state");
+    }
+    // RL7: half the Mode row, no stepper buttons.
+    {
+        HotStepLinkProcessor p;
+        rlSetBackend (p, "ace");
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        ed->setSize (1182, 760);
+        ed->setSettingsOpenForTest (true);
+        auto& se = ed->strengthEditorForTest();
+        const auto mb = ed->modeBoxBoundsForTest();
+        const auto sb = se.getBounds();
+        const int rowW = sb.getRight() - mb.getX();
+        const int buttons = rlCountButtons (se);
+        std::printf ("  RL7 mode box x=%d w=%d, strength x=%d w=%d, row %d px, strength/row %.3f, stepper buttons %d%c",
+                     mb.getX(), mb.getWidth(), sb.getX(), sb.getWidth(), rowW, rowW > 0 ? (double) sb.getWidth() / rowW : -1.0, buttons, 10);
+        check (rowW > 100 && sb.getWidth() > 30 && sb.getWidth() * 2 <= rowW && sb.getY() == mb.getY(),
+               "strength box is at most half the Mode row, same line");
+        check (buttons == 0, "strength box has no stepper buttons");
+    }
+}
+
+// Key save note (Settings, "DAW key" caption row): a refused key save shows one line, a save
+// that goes through clears it, an unchanged key does neither. Scratch settings file only,
+// dummy keys only; driven through the editor's own key field handler.
+// Teeth: HSLINK_TEETH=RESULT_IGNORED (case 1 fails), CLEAR_ON_UNCHANGED (case 2 fails).
+static double knLum (juce::Colour c)
+{
+    auto lin = [] (double v) { return v <= 0.03928 ? v / 12.92 : std::pow ((v + 0.055) / 1.055, 2.4); };
+    return 0.2126 * lin (c.getFloatRed()) + 0.7152 * lin (c.getFloatGreen()) + 0.0722 * lin (c.getFloatBlue());
+}
+
+static double knContrast (juce::Colour a, juce::Colour b)
+{
+    const double la = knLum (a), lb = knLum (b);
+    return (juce::jmax (la, lb) + 0.05) / (juce::jmin (la, lb) + 0.05);
+}
+
+struct KnInk
+{
+    int capRight = -1, left = -1, right = -1, top = -1, bottom = -1, pixels = 0;
+    double best = 0.0;
+};
+
+// Ink in one caption row of an editor snapshot: left of splitX is the caption, the rest the note.
+static KnInk knMeasure (const juce::Image& img, juce::Rectangle<int> row, int splitX, juce::Colour bg)
+{
+    KnInk k;
+    for (int y = row.getY(); y < row.getBottom(); ++y)
+        for (int x = row.getX(); x < row.getRight(); ++x)
+        {
+            const double c = knContrast (img.getPixelAt (x, y), bg);
+            if (c < 1.25)
+                continue;
+            if (x < splitX)
+            {
+                k.capRight = juce::jmax (k.capRight, x);
+                continue;
+            }
+            ++k.pixels;
+            k.best = juce::jmax (k.best, c);
+            k.left = k.left < 0 ? x : juce::jmin (k.left, x);
+            k.right = juce::jmax (k.right, x);
+            k.top = k.top < 0 ? y : juce::jmin (k.top, y);
+            k.bottom = juce::jmax (k.bottom, y);
+        }
+    return k;
+}
+
+static void testKeyNote (const juce::File& tmp)
+{
+    std::printf ("Key save note: a refused DAW key save shows a line in Settings%c", 10);
+    HotStepLinkProcessor::testKeyAsideFails.store (false);
+    const auto before = juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {});
+    const auto dir = tmp.getChildFile ("keynote_store");
+    dir.createDirectory();
+    const auto f = dir.getChildFile ("LINK.settings");
+    _putenv_s ("HSLINK_SETTINGS_FILE", f.getFullPathName().toRawUTF8());
+    const bool scratch = HotStepLinkProcessor::keyStoreFile() == f && f.isAChildOf (tmp);
+    check (scratch, "keynote: the settings file under test is the scratch one");
+    if (! scratch)
+    {
+        _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+        return; // never run these cases against any other file
+    }
+    const auto shotDirName = juce::SystemStats::getEnvironmentVariable ("HSLINK_KEYNOTE_SHOTS", {});
+    const juce::String longText ("Key not saved to disk. It works until you close LINK.");
+    const juce::String shortText ("Not saved to disk. Works until LINK closes.");
+    const juce::String key3 ("DUMMY-KEY-FOR-TEST-0003"), key4 ("DUMMY-KEY-FOR-TEST-0004"), key5 ("DUMMY-KEY-FOR-TEST-0005");
+    auto type = [] (HotStepLinkEditor& ed, const juce::String& text)
+    {
+        auto& ke = ed.keyEditorForTest();
+        ke.setText (text, false);
+        if (ke.onTextChange != nullptr)
+            ke.onTextChange(); // the editor's own handler
+    };
+    auto shown = [] (HotStepLinkEditor& ed)
+    {
+        const auto& n = ed.keySaveNoteForTest();
+        return n.isVisible() && n.getParentComponent() != nullptr && n.getParentComponent()->isVisible();
+    };
+    auto snap = [&] (HotStepLinkEditor& ed, const char* name)
+    {
+        const auto img = ed.createComponentSnapshot (ed.getLocalBounds(), true, 1.0f);
+        if (shotDirName.isNotEmpty() && juce::File::isAbsolutePath (shotDirName))
+        {
+            const auto out = juce::File (shotDirName).getChildFile (name);
+            out.deleteFile();
+            juce::FileOutputStream os (out);
+            const bool ok = os.openedOk() && juce::PNGImageFormat().writeImageToStream (img, os);
+            std::printf ("  shot %s wrote=%d (%dx%d)%c", out.getFullPathName().toRawUTF8(), ok ? 1 : 0, img.getWidth(), img.getHeight(), 10);
+            // The settings card alone, 3x, for reading the small text.
+            const auto pr = ed.settingsPopoverBoundsForTest();
+            const auto crop = img.getClippedImage (pr.expanded (4).getIntersection (img.getBounds()))
+                                  .rescaled ((pr.getWidth() + 8) * 3, (pr.getHeight() + 8) * 3, juce::Graphics::lowResamplingQuality);
+            const auto cf = out.getSiblingFile (out.getFileNameWithoutExtension() + "_card3x.png");
+            cf.deleteFile();
+            juce::FileOutputStream cs (cf);
+            if (cs.openedOk())
+                juce::PNGImageFormat().writeImageToStream (crop, cs);
+        }
+        return img;
+    };
+    // Pixel numbers for the "DAW key" caption row of a snapshot.
+    auto measure = [] (HotStepLinkEditor& ed, const juce::Image& img, const char* tag)
+    {
+        const auto pr = ed.settingsPopoverBoundsForTest();
+        const auto cap = ed.keyCaptionForTest().getBounds() + pr.getPosition();
+        const auto nb = ed.keySaveNoteForTest().getBounds() + pr.getPosition();
+        const auto bg = img.getPixelAt (pr.getX() + 6, cap.getCentreY());
+        const auto k = knMeasure (img, cap, nb.getX(), bg);
+        std::printf ("  px %s: card %d %d %d %d | caption row %d %d %d %d | note label %d %d %d %d | plate #%s | caption ink right x=%d | note ink %d px, bounds x %d..%d y %d..%d, peak contrast %.2f:1 | clear of caption %d px, of card right edge %d px%c",
+                     tag, pr.getX(), pr.getY(), pr.getWidth(), pr.getHeight(), cap.getX(), cap.getY(), cap.getWidth(), cap.getHeight(),
+                     nb.getX(), nb.getY(), nb.getWidth(), nb.getHeight(), bg.toDisplayString (false).toRawUTF8(), k.capRight,
+                     k.pixels, k.left, k.right, k.top, k.bottom, k.best,
+                     k.pixels > 0 ? k.left - k.capRight - 1 : -1, k.pixels > 0 ? pr.getRight() - 1 - k.right : -1, 10);
+        return k;
+    };
+
+    // Cases 1 to 3: one editor. The settings file is unreadable and its aside copy cannot be made.
+    {
+        f.replaceWithText (ksGarbage (209));
+        juce::MemoryBlock b0, b1, b2;
+        f.loadFileAsData (b0);
+        HotStepLinkProcessor p;
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        ed->setSettingsOpenForTest (true);
+        const auto& note = ed->keySaveNoteForTest();
+        const auto& cap = ed->keyCaptionForTest();
+        const bool atOpen = shown (*ed);
+
+        // Fit: the text against the free width of the caption row.
+        const float wLong = HotStepLinkEditor::keySaveNoteWidth (longText), wShort = HotStepLinkEditor::keySaveNoteWidth (shortText);
+        const int avail = note.getWidth() - note.getBorderSize().getRight();
+        const juce::String want = wLong <= (float) avail ? longText : shortText;
+        std::printf ("  fit: caption row %d px wide, note label x=%d w=%d, text area %d px; long text %.1f px, short text %.1f px; chosen '%s'%c",
+                     cap.getWidth(), note.getX(), note.getWidth(), avail, (double) wLong, (double) wShort, note.getText().toRawUTF8(), 10);
+        check (note.getText().isNotEmpty() && note.getText() == want && HotStepLinkEditor::keySaveNoteWidth (note.getText()) <= (float) avail,
+               "keynote fit: the chosen text fits the free width of the caption row unscaled");
+        check (note.getY() == cap.getY() && note.getHeight() == cap.getHeight() && note.getRight() == cap.getRight(),
+               "keynote fit: the note sits in the DAW key caption row, no row added");
+
+        HotStepLinkProcessor::testKeyAsideFails.store (true);
+        type (*ed, key3);
+        const bool v1 = shown (*ed);
+        const juce::String t1 = note.getText();
+        f.loadFileAsData (b1);
+        std::printf ("  1 refused save: note at open %d (want 0), after the refused save visible=%d (want 1) text='%s', file identical=%d (want 1), key in use=%d (want 1)%c",
+                     atOpen ? 1 : 0, v1 ? 1 : 0, t1.toRawUTF8(), b0 == b1 ? 1 : 0, p.getDawKey() == key3 ? 1 : 0, 10);
+        check (! atOpen && v1 && t1 == want, "keynote 1: a refused key save shows the note with the exact text");
+        check (b0 == b1 && p.getDawKey() == key3, "keynote 1: the refused save wrote nothing and the key is used for the session");
+
+        type (*ed, key3);
+        const bool v2a = shown (*ed);
+        type (*ed, "  " + key3 + " ");
+        const bool v2b = shown (*ed);
+        f.loadFileAsData (b2);
+        std::printf ("  2 same key again: visible=%d, with spaces around visible=%d (want 1, 1) text='%s', file identical=%d (want 1)%c",
+                     v2a ? 1 : 0, v2b ? 1 : 0, note.getText().toRawUTF8(), b0 == b2 ? 1 : 0, 10);
+        check (v2a && v2b && note.getText() == want && b0 == b2, "keynote 2: an unchanged key leaves the note showing and writes nothing");
+
+        // Shot c + pixel numbers with the note showing.
+        {
+            const auto img = snap (*ed, "c_settings_note_showing.png");
+            const auto k = measure (*ed, img, "c");
+            const auto pr = ed->settingsPopoverBoundsForTest();
+            check (k.pixels > 40 && k.best >= 4.5, "keynote px: the note is drawn at 4.5:1 or better against the card");
+            check (k.pixels > 40 && k.left - k.capRight - 1 >= 6 && pr.getRight() - 1 - k.right >= 6,
+                   "keynote px: the note ink is 6 px or more clear of the caption text and of the card's right edge");
+        }
+        // Shot e: a non-ACE backend, so the Mode-row note shows too.
+        {
+            const bool set = rlSetBackend (p, "sa3");
+            ed->setServerModelsForTest (true, true);
+            const auto& rn = ed->refLockNoteForTest();
+            const auto img = snap (*ed, "e_settings_both_notes.png");
+            const auto k = measure (*ed, img, "e");
+            const auto kb = note.getBounds(), rb = rn.getBounds(), keb = ed->keyEditorForTest().getBounds();
+            std::printf ("  e both notes: backend set=%d, key note visible=%d bounds %d %d %d %d, mode note visible=%d text='%s' bounds %d %d %d %d, key field %d %d %d %d, notes intersect=%d, key note over field=%d%c",
+                         set ? 1 : 0, shown (*ed) ? 1 : 0, kb.getX(), kb.getY(), kb.getWidth(), kb.getHeight(), rn.isVisible() ? 1 : 0, rn.getText().toRawUTF8(),
+                         rb.getX(), rb.getY(), rb.getWidth(), rb.getHeight(), keb.getX(), keb.getY(), keb.getWidth(), keb.getHeight(),
+                         kb.intersects (rb) ? 1 : 0, kb.intersects (keb) ? 1 : 0, 10);
+            check (set && shown (*ed) && rn.isVisible() && ! kb.intersects (rb) && ! kb.intersects (keb) && k.pixels > 40,
+                   "keynote e: both notes show at once and neither covers the other or a control");
+        }
+
+        HotStepLinkProcessor::testKeyAsideFails.store (false);
+        type (*ed, key4);
+        const bool v3 = shown (*ed);
+        const bool stored4 = HotStepLinkProcessor::loadStoredKey() == key4;
+        std::printf ("  3 save that writes: visible=%d (want 0), key reads back from the file=%d (want 1), aside copies %d (want 1)%c",
+                     v3 ? 1 : 0, stored4 ? 1 : 0, ksAsides (f).size(), 10);
+        check (! v3 && stored4, "keynote 3: a save that really writes clears the note");
+        {
+            const auto img = snap (*ed, "d_settings_after_good_save.png");
+            const auto k = measure (*ed, img, "d");
+            check (v3 || k.pixels == 0, "keynote px: nothing is drawn right of the caption once the note is gone");
+        }
+    }
+    for (const auto& n : ksAsides (f))
+        dir.getChildFile (n).deleteFile();
+
+    // Case 4: fresh editor, no file, a normal save.
+    {
+        f.deleteFile();
+        HotStepLinkProcessor p;
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        ed->setSettingsOpenForTest (true);
+        const bool v0 = shown (*ed);
+        type (*ed, key5);
+        const bool v1 = shown (*ed);
+        const bool stored = HotStepLinkProcessor::loadStoredKey() == key5;
+        std::printf ("  4 fresh editor, good save: visible at open=%d, after the save=%d (want 0, 0), key reads back=%d (want 1)%c", v0 ? 1 : 0, v1 ? 1 : 0, stored ? 1 : 0, 10);
+        check (! v0 && ! v1 && stored, "keynote 4: a normal save never shows the note");
+    }
+    // Case 5: fresh editor, the stored key typed again (unchanged, nothing saved).
+    {
+        juce::MemoryBlock b0, b1;
+        f.loadFileAsData (b0);
+        const auto m0 = f.getLastModificationTime();
+        HotStepLinkProcessor p;
+        const bool loaded = p.getDawKey() == key5;
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        ed->setSettingsOpenForTest (true);
+        HotStepLinkProcessor::testKeyAsideFails.store (true); // a save, were one tried, could only be told by the file
+        type (*ed, key5);
+        HotStepLinkProcessor::testKeyAsideFails.store (false);
+        const bool v = shown (*ed);
+        f.loadFileAsData (b1);
+        const bool same = b0 == b1 && m0 == f.getLastModificationTime();
+        std::printf ("  5 fresh editor, unchanged key: stored key loaded=%d (want 1), visible=%d (want 0), file bytes and mtime unchanged=%d (want 1)%c",
+                     loaded ? 1 : 0, v ? 1 : 0, same ? 1 : 0, 10);
+        check (loaded && ! v && same, "keynote 5: an unchanged key does not show the note and writes nothing");
+    }
+    HotStepLinkProcessor::testKeyAsideFails.store (false);
+    _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+}
+
+// keyreveal: the Show / Hide button beside the DAW key field in SETTINGS. Display only:
+// masked at open, plain after Show, masked again after Hide and whenever the panel opens
+// or closes; the settings file is never written by it. Scratch settings file and a fake key.
+// Teeth: HSLINK_TEETH=KEYREVEAL_M1 (the toggle leaves the password character alone),
+// KEYREVEAL_M2 (the panel does not mask again), KEYREVEAL_M3 (the toggle saves),
+// KEYREVEAL_M4 (the key field's text is set before the field has a parent: white text),
+// KEYREVEAL_M5 (hiding the editor does not mask again), KEYREVEAL_M6 (opening the take editor
+// does not mask again), KEYREVEAL_M7 (the button is 26 px high), KEYREVEAL_M8 (the job line
+// sets no tooltip), KEYREVEAL_M9 (the tooltip ignores the full server text), KEYREVEAL_M10
+// (the tooltip is always the line's own text, also for a short line like 'Idle').
+static juce::uint64 krHash (const juce::MemoryBlock& b) // FNV-1a 64
+{
+    juce::uint64 h = 1469598103934665603ull;
+    for (size_t i = 0; i < b.getSize(); ++i)
+        h = (h ^ (juce::uint8) b[i]) * 1099511628211ull;
+    return h;
+}
+
+static void testKeyReveal (const juce::File& tmp)
+{
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    const int mutant = teethVar.startsWith ("KEYREVEAL_M") ? juce::jlimit (0, 10, teethVar.substring (11).getIntValue()) : 0;
+    std::printf ("keyreveal: Show / Hide beside the DAW key field (mutant %d)%c", mutant, 10);
+    const auto before = juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {});
+    const auto dir = tmp.getChildFile ("keyreveal_store");
+    dir.createDirectory();
+    const auto f = dir.getChildFile ("LINK.settings");
+    _putenv_s ("HSLINK_SETTINGS_FILE", f.getFullPathName().toRawUTF8());
+    const bool scratch = HotStepLinkProcessor::keyStoreFile() == f && f.isAChildOf (tmp);
+    check (scratch, "keyreveal: the settings file under test is the scratch one");
+    if (! scratch)
+    {
+        _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+        return; // never run these cases against any other file
+    }
+    const juce::String key ("TESTKEY-1234");
+    const bool seeded = HotStepLinkProcessor::saveStoredKey (key);
+    {
+        juce::MemoryBlock b0, b1;
+        f.loadFileAsData (b0);
+        const auto m0 = f.getLastModificationTime();
+        HotStepLinkProcessor p;
+        HotStepLinkEditor::testKeyRevealMutant = mutant >= 4 ? mutant : 0; // 4 and 7 act while the editor is built and laid out
+        auto ed = std::make_unique<HotStepLinkEditor> (p); // 1 to 3: built with the code as shipped
+        HotStepLinkEditor::testKeyRevealMutant = mutant;
+        auto& ke = ed->keyEditorForTest();
+        auto& btn = ed->keyRevealButtonForTest();
+        auto click = [&] { if (btn.onClick != nullptr) btn.onClick(); };
+        auto mask = [&] { return (int) ke.getPasswordCharacter(); };
+        auto shot = [&] { return ke.createComponentSnapshot (ke.getLocalBounds(), true, 1.0f); };
+        auto differing = [] (const juce::Image& a, const juce::Image& b)
+        {
+            int n = 0;
+            for (int y = 0; y < juce::jmin (a.getHeight(), b.getHeight()); ++y)
+                for (int x = 0; x < juce::jmin (a.getWidth(), b.getWidth()); ++x)
+                    if (a.getPixelAt (x, y) != b.getPixelAt (x, y))
+                        ++n;
+            return n;
+        };
+        const int calls0 = HotStepLinkProcessor::keySaveCallsForTest.load();
+
+        // 1. Open: masked.
+        ed->setSettingsOpenForTest (true);
+        const int mk1 = mask();
+        const bool rv1 = ed->keyRevealedForTest();
+        const juce::String bt1 = btn.getButtonText(), tip1 = btn.getTooltip(), ttl1 = btn.getTitle();
+        const bool vis1 = btn.isVisible() && btn.getParentComponent() != nullptr && btn.getParentComponent()->isVisible();
+        const bool txt1 = ke.getText() == key;
+        const auto imgMasked = shot();
+        std::printf ("  1 open: seeded=%d mask char=%d (want 42) revealed=%d (want 0) button '%s' visible=%d field holds the fake key=%d%c",
+                     seeded ? 1 : 0, mk1, rv1 ? 1 : 0, bt1.toRawUTF8(), vis1 ? 1 : 0, txt1 ? 1 : 0, 10);
+        check (seeded && mk1 == 42 && ! rv1 && bt1 == "Show" && vis1 && txt1, "keyreveal 1: the panel opens with the key masked ('*') and a visible Show button");
+
+        // 1b. Text colour before any toggle: the brightest pixel of the drawn text is the theme's
+        // bright text colour (243,245,250), not the default look's white.
+        {
+            auto brightest = [] (const juce::Image& im, int& count)
+            {
+                juce::Colour best (0, 0, 0);
+                int bestSum = -1;
+                count = 0;
+                for (int y = 0; y < im.getHeight(); ++y)
+                    for (int x = 0; x < im.getWidth(); ++x)
+                    {
+                        const auto c = im.getPixelAt (x, y);
+                        const int sum = (int) c.getRed() + (int) c.getGreen() + (int) c.getBlue();
+                        if (sum > bestSum) { bestSum = sum; best = c; count = 0; }
+                        if (sum == bestSum) ++count;
+                    }
+                return best;
+            };
+            auto& ue = ed->urlEditorForTest();
+            const auto imgUrl = ue.createComponentSnapshot (ue.getLocalBounds(), true, 1.0f);
+            int nKey = 0, nUrl = 0;
+            const auto ck = brightest (imgMasked, nKey), cu = brightest (imgUrl, nUrl);
+            std::printf ("  1b text colour before any toggle: key field brightest pixel %d,%d,%d (%d px, want 243,245,250); URL field '%s' brightest pixel %d,%d,%d (%d px, want 243,245,250)%c",
+                         (int) ck.getRed(), (int) ck.getGreen(), (int) ck.getBlue(), nKey, ue.getText().toRawUTF8(),
+                         (int) cu.getRed(), (int) cu.getGreen(), (int) cu.getBlue(), nUrl, 10);
+            check (ck.getRed() == 243 && ck.getGreen() == 245 && ck.getBlue() == 250 && nKey >= 1, "keyreveal 1b: the masked key text is drawn in the theme colour 243,245,250 before any toggle (teeth: KEYREVEAL_M4)");
+            check (ue.getText().isNotEmpty() && cu.getRed() == 243 && cu.getGreen() == 245 && cu.getBlue() == 250 && nUrl >= 1, "keyreveal 1b: the URL text is drawn in the theme colour 243,245,250");
+        }
+
+        // 2. Show.
+        click();
+        const int mk2 = mask();
+        const bool rv2 = ed->keyRevealedForTest();
+        const juce::String bt2 = btn.getButtonText(), tip2 = btn.getTooltip(), ttl2 = btn.getTitle();
+        const bool txt2 = ke.getText() == key;
+        const auto imgShown = shot();
+        const int px12 = differing (imgMasked, imgShown);
+        std::printf ("  2 Show: mask char=%d (want 0) revealed=%d (want 1) button '%s' (want Hide) field text is the fake key=%d, field pixels changed vs masked=%d (want >= 20)%c",
+                     mk2, rv2 ? 1 : 0, bt2.toRawUTF8(), txt2 ? 1 : 0, px12, 10);
+        check (mk2 == 0 && rv2, "keyreveal 2: Show sets the password character to 0 (plain text)");
+        check (bt2 == "Hide" && txt2, "keyreveal 2: the button reads Hide and the field text equals the fake key");
+        check (px12 >= 20, "keyreveal 2: the drawn field changes by 20 or more pixels when shown");
+
+        // 3. Hide.
+        click();
+        const int mk3 = mask();
+        const auto imgMaskedAgain = shot();
+        const int px13 = differing (imgMasked, imgMaskedAgain);
+        // The same picture, exactly: the first text already has the theme colour, so a round
+        // trip changes no pixel at all (it was white before: about 225 pixels moved by up to 12).
+        int shape13 = 0, shape23 = 0, maxDelta13 = 0;
+        for (int y = 0; y < imgMasked.getHeight(); ++y)
+            for (int x = 0; x < imgMasked.getWidth(); ++x)
+            {
+                auto delta = [] (juce::Colour a, juce::Colour b)
+                {
+                    return juce::jmax (std::abs ((int) a.getRed() - (int) b.getRed()), std::abs ((int) a.getGreen() - (int) b.getGreen()),
+                                       std::abs ((int) a.getBlue() - (int) b.getBlue()), std::abs ((int) a.getAlpha() - (int) b.getAlpha()));
+                };
+                const int d13 = delta (imgMasked.getPixelAt (x, y), imgMaskedAgain.getPixelAt (x, y));
+                maxDelta13 = juce::jmax (maxDelta13, d13);
+                if (d13 > 32) ++shape13;
+                if (delta (imgShown.getPixelAt (x, y), imgMaskedAgain.getPixelAt (x, y)) > 32) ++shape23;
+            }
+        {
+            // Where the two masked pictures differ (box), and the pictures themselves when asked for.
+            int l = -1, r = -1, t = -1, b = -1;
+            for (int y = 0; y < imgMasked.getHeight(); ++y)
+                for (int x = 0; x < imgMasked.getWidth(); ++x)
+                    if (imgMasked.getPixelAt (x, y) != imgMaskedAgain.getPixelAt (x, y))
+                    {
+                        l = l < 0 ? x : juce::jmin (l, x); r = juce::jmax (r, x);
+                        t = t < 0 ? y : juce::jmin (t, y); b = juce::jmax (b, y);
+                    }
+            std::printf ("  3 masked before vs masked after: differing box x %d..%d y %d..%d of %dx%d%c", l, r, t, b, imgMasked.getWidth(), imgMasked.getHeight(), 10);
+            const auto shotDirName = juce::SystemStats::getEnvironmentVariable ("HSLINK_KEYREVEAL_SHOTS", {});
+            if (shotDirName.isNotEmpty() && juce::File::isAbsolutePath (shotDirName))
+            {
+                const juce::Image* imgs[] = { &imgMasked, &imgShown, &imgMaskedAgain };
+                const char* names[] = { "kr_masked.png", "kr_shown.png", "kr_masked_again.png" };
+                for (int i = 0; i < 3; ++i)
+                {
+                    const auto out = juce::File (shotDirName).getChildFile (names[i]);
+                    out.deleteFile();
+                    juce::FileOutputStream os (out);
+                    if (os.openedOk())
+                        juce::PNGImageFormat().writeImageToStream (imgs[i]->rescaled (imgs[i]->getWidth() * 3, imgs[i]->getHeight() * 3, juce::Graphics::lowResamplingQuality), os);
+                }
+            }
+        }
+        std::printf ("  3 Hide: mask char=%d (want 42) revealed=%d (want 0) button '%s' (want Show); vs first masked picture: pixels over 32/255 apart=%d (want 0), any difference=%d px (want 0), largest channel shift=%d (want 0); vs shown picture: pixels over 32/255 apart=%d (want >= 20)%c",
+                     mk3, ed->keyRevealedForTest() ? 1 : 0, btn.getButtonText().toRawUTF8(), shape13, px13, maxDelta13, shape23, 10);
+        check (mk3 == 42 && ! ed->keyRevealedForTest() && btn.getButtonText() == "Show" && ke.getText() == key, "keyreveal 3: a second click masks again ('*', Show, text kept)");
+        check (px13 == 0 && maxDelta13 == 0 && shape13 == 0 && shape23 >= 20, "keyreveal 3: the masked field is pixel for pixel the picture from before the reveal (0 differing pixels) and not the shown text (20+ apart) (teeth: KEYREVEAL_M4)");
+
+        // 4. Shown, then close; then open again.
+        click();
+        const int mk4a = mask();
+        ed->setSettingsOpenForTest (false);
+        const int mk4b = mask();
+        const bool rv4b = ed->keyRevealedForTest();
+        ed->setSettingsOpenForTest (true);
+        const int mk4c = mask();
+        const bool rv4c = ed->keyRevealedForTest();
+        const juce::String bt4c = btn.getButtonText();
+        std::printf ("  4 shown (mask %d, want 0), closed: mask=%d revealed=%d (want 42, 0); open again: mask=%d revealed=%d button '%s' (want 42, 0, Show)%c",
+                     mk4a, mk4b, rv4b ? 1 : 0, mk4c, rv4c ? 1 : 0, bt4c.toRawUTF8(), 10);
+        check (mk4a == 0 && mk4b == 42 && ! rv4b, "keyreveal 4: closing the panel while shown masks the key");
+        check (mk4a == 0 && mk4c == 42 && ! rv4c && bt4c == "Show" && ed->settingsOpenForTest(), "keyreveal 4: the panel reopens masked with a Show button");
+        // 4b. Shown, then an open call with the panel already open.
+        if (ed->keyRevealedForTest())
+            click(); // back to masked first, whatever the case above left
+        click();
+        const int mk4d = mask();
+        ed->setSettingsOpenForTest (true);
+        const int mk4e = mask();
+        std::printf ("  4b shown (mask %d, want 0), open called again: mask=%d revealed=%d (want 42, 0)%c", mk4d, mk4e, ed->keyRevealedForTest() ? 1 : 0, 10);
+        check (mk4d == 0 && mk4e == 42 && ! ed->keyRevealedForTest(), "keyreveal 4b: an open call while shown masks the key");
+
+        // 4c. Shown, then the editor is hidden and shown again (a host closing the window
+        // without destroying the editor): masked, nothing saved.
+        {
+            if (ed->keyRevealedForTest())
+                click();
+            ed->setVisible (true);
+            ed->setSettingsOpenForTest (true);
+            click();
+            const int mkA = mask();
+            const int sv0 = HotStepLinkProcessor::keySaveCallsForTest.load();
+            ed->setVisible (false);
+            const int mkB = mask();
+            const bool rvB = ed->keyRevealedForTest();
+            ed->setVisible (true);
+            const int mkC = mask();
+            const bool rvC = ed->keyRevealedForTest();
+            const int sv = HotStepLinkProcessor::keySaveCallsForTest.load() - sv0;
+            std::printf ("  4c shown (mask %d, want 0), editor hidden: mask=%d revealed=%d (want 42, 0); visible again: mask=%d revealed=%d button '%s' (want 42, 0, Show); save calls=%d (want 0)%c",
+                         mkA, mkB, rvB ? 1 : 0, mkC, rvC ? 1 : 0, btn.getButtonText().toRawUTF8(), sv, 10);
+            check (mkA == 0 && mkB == 42 && ! rvB, "keyreveal 4c: hiding the editor while the key is shown masks it (teeth: KEYREVEAL_M5)");
+            check (mkA == 0 && mkC == 42 && ! rvC && btn.getButtonText() == "Show" && sv == 0, "keyreveal 4c: the editor comes back masked with a Show button, 0 save calls (teeth: KEYREVEAL_M5)");
+            if (ed->keyRevealedForTest())
+                click(); // the cases below start masked, whatever this one left
+        }
+
+        // 5. Nothing was saved by the clicks and panel calls above.
+        f.loadFileAsData (b1);
+        const int calls = HotStepLinkProcessor::keySaveCallsForTest.load() - calls0;
+        const bool sameBytes = b0 == b1, sameTime = m0 == f.getLastModificationTime();
+        const bool keyKept = p.getDawKey() == key && HotStepLinkProcessor::loadStoredKey() == key && ke.getText() == key;
+        std::printf ("  5 settings file: %d bytes hash %016llx before, %d bytes hash %016llx after (identical=%d, mtime same=%d); save calls=%d (want 0); stored key, session key and field text still the fake key=%d%c",
+                     (int) b0.getSize(), (unsigned long long) krHash (b0), (int) b1.getSize(), (unsigned long long) krHash (b1),
+                     sameBytes ? 1 : 0, sameTime ? 1 : 0, calls, keyKept ? 1 : 0, 10);
+        check (b0.getSize() > 0 && sameBytes && krHash (b0) == krHash (b1) && sameTime, "keyreveal 5: the settings file bytes, hash and time are unchanged across the toggles");
+        check (calls == 0, "keyreveal 5: no save was attempted (0 calls of the key save)");
+        check (keyKept, "keyreveal 5: the stored key, the session key and the field text are still the fake key");
+        HotStepLinkEditor::testKeyRevealMutant = 0;
+
+        // 6. Geometry of the key row (panel coordinates, px).
+        {
+            const auto kb = ke.getBounds(), bb = btn.getBounds();
+            juce::Rectangle<int> ub; // the URL field: the widest text field above the key row
+            int boxRight = -1;       // right edge of the combo boxes in the panel
+            if (auto* parent = ke.getParentComponent())
+                for (auto* c : parent->getChildren())
+                {
+                    if (auto* te = dynamic_cast<juce::TextEditor*> (c))
+                        if (te != &ke && te->getBottom() <= kb.getY() && te->getWidth() > ub.getWidth())
+                            ub = te->getBounds();
+                    if (auto* cb = dynamic_cast<juce::ComboBox*> (c))
+                        if (cb->isVisible())
+                            boxRight = juce::jmax (boxRight, cb->getRight());
+                }
+            const int gapPx = bb.getX() - kb.getRight();
+            std::printf ("  6 geometry: key field x=%d y=%d w=%d h=%d right=%d; button x=%d y=%d w=%d h=%d right=%d; gap=%d; URL field x=%d w=%d right=%d; combo right=%d; panel w=%d%c",
+                         kb.getX(), kb.getY(), kb.getWidth(), kb.getHeight(), kb.getRight(), bb.getX(), bb.getY(), bb.getWidth(), bb.getHeight(), bb.getRight(),
+                         gapPx, ub.getX(), ub.getWidth(), ub.getRight(), boxRight, ke.getParentWidth(), 10);
+            check (ub.getWidth() >= 200 && bb.getRight() == ub.getRight() && bb.getRight() == 288, "keyreveal 6: the button's right edge is the URL field's right edge (288)");
+            check (kb.getX() == ub.getX() && kb.getX() == 12, "keyreveal 6: the key field starts at the URL field's left edge (12)");
+            int closeH = -1; // the panel's other text button (Close)
+            if (auto* parent = ke.getParentComponent())
+                for (auto* c : parent->getChildren())
+                    if (auto* tb = dynamic_cast<juce::TextButton*> (c))
+                        if (tb != &btn && tb->getButtonText() == "Close")
+                            closeH = tb->getHeight();
+            std::printf ("  6 heights: button %d, Close %d, key field %d; button centre y %d, field centre y %d%c", bb.getHeight(), closeH, kb.getHeight(), bb.getCentreY(), kb.getCentreY(), 10);
+            check (bb.getHeight() == 24 && bb.getHeight() == closeH && kb.getHeight() == 26 && bb.getY() == kb.getY() + 1 && bb.getCentreY() == kb.getCentreY(), "keyreveal 6: the button is 24 px high like Close, centred on the 26 px key field (y + 1)");
+            check (bb.getWidth() >= 36 && bb.getWidth() == 44, "keyreveal 6: the button is 44 px wide (36 px least)");
+            check (! kb.intersects (bb) && gapPx == 6, "keyreveal 6: field and button do not overlap, 6 px apart");
+            check (kb.getWidth() == 226 && kb.getWidth() + gapPx + bb.getWidth() == ub.getWidth(), "keyreveal 6: field 226 + gap 6 + button 44 = the URL field's width (276)");
+        }
+
+        // 7. Tooltip and accessible title per state.
+        std::printf ("  7 masked: title '%s' tooltip '%s'; shown: title '%s' tooltip '%s'%c", ttl1.toRawUTF8(), tip1.toRawUTF8(), ttl2.toRawUTF8(), tip2.toRawUTF8(), 10);
+        check (tip1.length() >= 10 && tip2.length() >= 10 && tip1 != tip2, "keyreveal 7: both states have a tooltip of 10+ characters, not the same one");
+        check (ttl1 == "Show DAW key" && ttl2 == "Hide DAW key", "keyreveal 7: accessible title is 'Show DAW key' masked and 'Hide DAW key' shown");
+
+        // 8. Control: the save counter and the file comparison do see a real save (a typed key).
+        {
+            juce::MemoryBlock b2, b3;
+            f.loadFileAsData (b2);
+            const int c0 = HotStepLinkProcessor::keySaveCallsForTest.load();
+            ke.setText ("TESTKEY-5678", false);
+            if (ke.onTextChange != nullptr)
+                ke.onTextChange();
+            f.loadFileAsData (b3);
+            const int c = HotStepLinkProcessor::keySaveCallsForTest.load() - c0;
+            std::printf ("  8 control, a typed key: save calls=%d (want 1), file bytes changed=%d (want 1), hash %016llx%c", c, b3 != b2 ? 1 : 0, (unsigned long long) krHash (b3), 10);
+            guardCheck (c == 1 && b3 != b2 && HotStepLinkProcessor::loadStoredKey() == "TESTKEY-5678", "keyreveal 8 [guard]: typing a key is one save call and changes the file (the counter and the compare can tell)");
+        }
+
+        // 10. The job line's tooltip: the complete status text when the line shows less (the
+        // server text is cut at 120 characters on the line), and none at all for a line that
+        // is all there is and fits ('Idle'). A failed job with a 300 character server text.
+        {
+            HotStepLinkEditor::testKeyRevealMutant = mutant;
+            auto& jl = ed->jobLabelForTest();
+            const auto tipIdle = jl.getTooltip();
+            const auto textIdle = jl.getText();
+            const juce::String head ("FileNotFoundError: checkpoint heartmula_v1.safetensors not found in /srv/hot-step/models/heartmula ");
+            const juce::String tail ("END-OF-SERVER-TEXT-300");
+            const juce::String raw (head + juce::String::repeatedString ("0123456789", 30).substring (0, 300 - head.length() - tail.length()) + tail);
+            DawJob j;
+            j.state = DawJob::State::failed;
+            j.request.caption = "keyreveal tooltip";
+            j.request.expectedBackend = "heartmula";
+            j.request.takes = 1;
+            j.takeCount = 1;
+            j.error = DawWorker::plainServerError ("heartmula", raw, {}, &j.errorFull);
+            const int id = p.daw.addJobForTest (j);
+            ed->setCurrentJobForTest (id);
+            ed->runRefreshForTest();
+            const auto shown = jl.getText();
+            const auto tipLong = jl.getTooltip();
+            const juce::String cutTail (raw.substring (0, 120) + "...");
+            const int lead = shown.length() - j.error.length(); // the line's words before the error
+            const juce::String wantTip (shown.dropLastCharacters (123) + raw);
+            std::printf ("  10a server text %d chars (ends '%s'); job error %d chars (want 250 = 113 + 14 + 123), ends with the first 120 + '...'=%d; stored full %d chars (want 427 = 113 + 14 + 300)%c",
+                         raw.length(), raw.substring (raw.length() - 22).toRawUTF8(), j.error.length(), j.error.endsWith (cutTail) ? 1 : 0, j.errorFull.length(), 10);
+            std::printf ("  10a visible line %d chars (want %d = %d + 250), ends '%s', holds the tail=%d (want 0); tooltip %d chars (want %d = %d + 427), ends '%s', equal to the line with the uncut text=%d, holds all 300 chars=%d%c",
+                         shown.length(), lead + 250, lead, shown.substring (juce::jmax (0, shown.length() - 12)).toRawUTF8(), shown.contains (tail) ? 1 : 0,
+                         tipLong.length(), lead + 427, lead, tipLong.substring (juce::jmax (0, tipLong.length() - 22)).toRawUTF8(), tipLong == wantTip ? 1 : 0, tipLong.contains (raw) ? 1 : 0, 10);
+            check (raw.length() == 300 && j.error.length() == 250 && j.error.endsWith (cutTail) && j.errorFull.length() == 427 && j.errorFull.endsWith (raw)
+                       && lead > 0 && shown.length() == lead + 250 && shown.endsWith ("  " + j.error) && ! shown.contains (tail),
+                   "keyreveal 10a: a 300 character server text gives a job line cut at 120 characters and '...' (error 250, line without the tail), the job keeps the full 427");
+            check (tipLong.length() == lead + 427 && tipLong == wantTip && tipLong.endsWith (tail) && tipLong.contains (raw) && ! tipLong.endsWith ("..."),
+                   "keyreveal 10a: the job line's tooltip is the complete status text, all 300 server characters, ending 'END-OF-SERVER-TEXT-300' (teeth: KEYREVEAL_M8, KEYREVEAL_M9)");
+
+            // b. No job: 'Idle', and no tooltip.
+            ed->setCurrentJobForTest (0);
+            ed->runRefreshForTest();
+            const auto textBack = jl.getText();
+            const auto tipBack = jl.getTooltip();
+            std::printf ("  10b at start: text '%s', tooltip '%s' (%d chars, want 0); after the job: text '%s', tooltip '%s' (%d chars, want 0)%c",
+                         textIdle.toRawUTF8(), tipIdle.toRawUTF8(), tipIdle.length(), textBack.toRawUTF8(), tipBack.toRawUTF8(), tipBack.length(), 10);
+            check (textIdle == "Idle" && tipIdle.isEmpty() && tipIdle.length() == 0 && textBack == "Idle" && tipBack.isEmpty() && tipBack.length() == 0,
+                   "keyreveal 10b: 'Idle' has no tooltip (0 characters), at start and again after the long status (teeth: KEYREVEAL_M10)");
+
+            // c. A plain line with no fuller text: a tooltip only when the box cuts it short.
+            const juce::String wide (juce::String::repeatedString ("lost the job ", 30).trim()); // 389 characters
+            jl.setText (wide, juce::dontSendNotification);
+            const auto tipWide = jl.getTooltip();
+            const juce::String brief ("Queue full: 8 jobs waiting");
+            jl.setText (brief, juce::dontSendNotification);
+            const auto tipBrief = jl.getTooltip();
+            std::printf ("  10c label box %d x %d px; a %d char line: tooltip %d chars (want %d, the line itself); '%s' (%d chars): tooltip %d chars (want 0)%c",
+                         jl.getWidth(), jl.getHeight(), wide.length(), tipWide.length(), wide.length(), brief.toRawUTF8(), brief.length(), tipBrief.length(), 10);
+            check (wide.length() == 389 && jl.getWidth() >= 100 && tipWide == wide && tipWide.length() == 389,
+                   "keyreveal 10c: a 389 character line the box cuts short has itself as its tooltip (teeth: KEYREVEAL_M8)");
+            check (brief.length() == 26 && tipBrief.isEmpty() && tipBrief.length() == 0,
+                   "keyreveal 10c: a 26 character line that fits has no tooltip (teeth: KEYREVEAL_M10)");
+
+            // d. The stored full text is bounded. No mutant reaches it: informational.
+            {
+                juce::String fullHuge;
+                const juce::String huge (head + juce::String::repeatedString ("0123456789", 500));
+                const auto cutHuge = DawWorker::plainServerError ("heartmula", huge, {}, &fullHuge);
+                juce::String fullNone ("stale");
+                const auto shortErr = DawWorker::plainServerError ("heartmula", "checkpoint not found", {}, &fullNone);
+                std::printf ("  10d informational (no mutant reaches it, not counted): a %d char server text: shown %d chars (want 250), stored full %d chars (want 4130 = 113 + 14 + 4000 + 3); an uncut one: shown %d chars, stored full %d chars (want 0)%c",
+                             huge.length(), cutHuge.length(), fullHuge.length(), shortErr.length(), fullNone.length(), 10);
+            }
+            HotStepLinkEditor::testKeyRevealMutant = 0;
+        }
+    }
+
+    // 9. Shown, then the take editor opens over the panel: masked, nothing saved. Its own
+    // processor, with one take, in the scratch folders.
+    {
+        using P = HotStepLinkProcessor;
+        const juce::String key2 ("TESTKEY-1234");
+        HotStepLinkProcessor::saveStoredKey (key2);
+        const auto take = dir.getChildFile ("dl").getChildFile ("keyreveal_take.wav");
+        take.getParentDirectory().createDirectory();
+        const double seconds = 4.0;
+        auto x = TempoTest::render (TempoTest::drums (TempoTest::steadyBeats (120.0, 0.0, seconds)), 48000.0, seconds);
+        juce::AudioBuffer<float> b (2, (int) x.size());
+        b.copyFrom (0, 0, x.data(), (int) x.size());
+        b.copyFrom (1, 0, x.data(), (int) x.size());
+        writeWav (take, b, 48000.0);
+        auto p2 = std::make_unique<P>();
+        p2->setStableRoot (dir.getChildFile ("stable"));
+        p2->setCollectionRoot (dir.getChildFile ("coll"));
+        DawJob j;
+        j.localId = 1;
+        j.request.caption = "keyreveal take";
+        j.request.expectedBackend = "sa3";
+        j.request.bpm = 120.0;
+        j.request.seed = 1;
+        j.request.durationS = seconds;
+        j.takeFiles.add (take);
+        j.takeSeeds.add (1);
+        p2->registerTakeAndWait (j, 0);
+        p2->waitTakeMeasureIdle();
+        const auto takes = p2->getTakes();
+        check (! takes.empty(), "keyreveal 9: the take is listed");
+        if (! takes.empty())
+        {
+            auto ed2 = std::make_unique<HotStepLinkEditor> (*p2);
+            HotStepLinkEditor::testKeyRevealMutant = mutant;
+            ed2->runRefreshForTest();
+            ed2->selectTakeForTest (takes[0].name);
+            ed2->runRefreshForTest();
+            auto& ke2 = ed2->keyEditorForTest();
+            ed2->setSettingsOpenForTest (true);
+            if (ed2->keyRevealButtonForTest().onClick != nullptr)
+                ed2->keyRevealButtonForTest().onClick();
+            const int mkA = (int) ke2.getPasswordCharacter();
+            const bool rvA = ed2->keyRevealedForTest();
+            juce::MemoryBlock f0, f1;
+            f.loadFileAsData (f0);
+            const int sv0 = HotStepLinkProcessor::keySaveCallsForTest.load();
+            const bool opened = ed2->openTakeEditorForTest();
+            const int mkB = (int) ke2.getPasswordCharacter();
+            const bool rvB = ed2->keyRevealedForTest();
+            const int sv = HotStepLinkProcessor::keySaveCallsForTest.load() - sv0;
+            f.loadFileAsData (f1);
+            std::printf ("  9 take editor: key shown (mask %d revealed=%d, want 0, 1); take editor opened=%d visible=%d: mask=%d revealed=%d button '%s' (want 42, 0, Show); save calls=%d (want 0), settings file identical=%d, field text kept=%d%c",
+                         mkA, rvA ? 1 : 0, opened ? 1 : 0, ed2->getTakeEditorForTest().isVisible() ? 1 : 0, mkB, rvB ? 1 : 0,
+                         ed2->keyRevealButtonForTest().getButtonText().toRawUTF8(), sv, f0 == f1 ? 1 : 0, ke2.getText() == key2 ? 1 : 0, 10);
+            check (mkA == 0 && rvA && opened && ed2->getTakeEditorForTest().isVisible(), "keyreveal 9: the key is shown, then the take editor opens");
+            check (mkA == 0 && opened && mkB == 42 && ! rvB && ed2->keyRevealButtonForTest().getButtonText() == "Show",
+                   "keyreveal 9: opening the take editor while the key is shown masks it (teeth: KEYREVEAL_M6)");
+            check (sv == 0 && f0.getSize() > 0 && f0 == f1 && ke2.getText() == key2, "keyreveal 9: nothing was saved by it (0 save calls, the settings file is byte for byte the same)");
+            HotStepLinkEditor::testKeyRevealMutant = 0;
+            ed2.reset();
+        }
+        p2.reset();
+    }
+    HotStepLinkEditor::testKeyRevealMutant = 0;
+    _putenv_s ("HSLINK_SETTINGS_FILE", before.toRawUTF8());
+}
+
+// weightsmsg: DawWorker::missingWeightsText / plainServerError. The plain message shows only
+// for a HeartMuLa context + a model-file word + an absent word; anything else keeps the
+// server's text (byte for byte when it is short with plain spaces only, else on one line and
+// cut like the matched text). The trigger words are inferred (no real server text captured).
+// Teeth: HSLINK_TEETH=WEIGHTS_M1 (context not looked at), WEIGHTS_M2 (never matches),
+// WEIGHTS_M3 (the job-error site shows the raw text), WEIGHTS_M4 (the switch-failure site
+// passes no hint), WEIGHTS_M5 (the exclusion words are ignored), WEIGHTS_M6 (no clip),
+// WEIGHTS_M7 (the debug log's once-set has no cap), WEIGHTS_M8 (only space, tab and line
+// ends are collapsed), WEIGHTS_M9 (the scan of the server text has no bound), WEIGHTS_M10
+// (every character past ASCII is taken for a space), WEIGHTS_M11 (the old match: plain
+// substrings on the whole text as sent), WEIGHTS_M12 (the exclusion words veto a strong
+// weights-file signal too), WEIGHTS_M13, M14, M15 (the refused-submit, refused-status and
+// lost-job sites show the server text as sent), WEIGHTS_M16 (a text that does not match is
+// returned as sent, whole: the code before the no-match bound).
+namespace
+{
+// A listener inside this process (127.0.0.1, port chosen by the OS) for the real
+// DawWorker::request(): the heartbeat is answered 200, the submit and the job poll with the
+// code and error message set before start().
+struct WmHttpStub
+{
+    juce::StreamingSocket listener;
+    std::thread th;
+    std::atomic<bool> quit { false };
+    std::atomic<int> submits { 0 }, polls { 0 }, backends { 0 }, others { 0 };
+    int submitCode = 200, pollCode = 200; // set before start()
+    juce::String submitMsg, pollMsg;      // set before start(): error.message of a reply that is not 200
+    int port = 0;
+
+    bool start()
+    {
+        if (! listener.createListener (0, "127.0.0.1"))
+            return false;
+        port = listener.getBoundPort();
+        th = std::thread ([this] { run(); });
+        return port > 0;
+    }
+    void stop()
+    {
+        quit = true;
+        {
+            juce::StreamingSocket wake;
+            wake.connect ("127.0.0.1", port, 2000);
+        }
+        if (th.joinable())
+            th.join();
+        listener.close();
+    }
+    juce::String url() const { return "http://127.0.0.1:" + juce::String (port); }
+    void run()
+    {
+        while (! quit.load())
+        {
+            std::unique_ptr<juce::StreamingSocket> c (listener.waitForNextConnection());
+            if (c == nullptr || quit.load())
+                break;
+            serve (*c);
+        }
+    }
+    static juce::String errBody (const juce::String& msg) { return "{\"error\":{\"message\":\"" + msg + "\"}}"; }
+    void serve (juce::StreamingSocket& c)
+    {
+        juce::String req;
+        char buf[2048];
+        const auto complete = [&req]
+        {
+            const int end = req.indexOf ("\r\n\r\n");
+            if (end < 0)
+                return false;
+            const int cl = req.indexOfIgnoreCase ("content-length:");
+            const int need = cl >= 0 && cl < end ? req.substring (cl + 15).getIntValue() : 0;
+            return req.length() >= end + 4 + need;
+        };
+        while (! complete() && c.waitUntilReady (true, 3000) == 1)
+        {
+            const int n = c.read (buf, (int) sizeof (buf), false);
+            if (n <= 0)
+                break;
+            req += juce::String::fromUTF8 (buf, n);
+        }
+        const auto line = req.upToFirstOccurrenceOf ("\r\n", false, false);
+        const auto method = line.upToFirstOccurrenceOf (" ", false, false);
+        const auto path = line.fromFirstOccurrenceOf (" ", false, false).upToFirstOccurrenceOf (" ", false, false);
+        int code = 404;
+        juce::String body ("{\"error\":\"not found\"}");
+        if (method == "GET" && path == "/api/v1/daw/status")
+        {
+            code = 200;
+            body = R"({"api":1,"loaded_model":"m1","base_available":true,"non_turbo_available":false,"eta":{"backend":"heartmula"}})";
+        }
+        else if (method == "GET" && path == "/api/backends")
+        {
+            ++backends;
+            code = 200;
+            body = R"({"activeId":"heartmula"})";
+        }
+        else if (method == "POST" && path == "/api/v1/daw/generate")
+        {
+            ++submits;
+            code = submitCode;
+            body = code == 200 ? juce::String (R"({"id":"wm1","eta_s":60})") : errBody (submitMsg);
+        }
+        else if (method == "GET" && path == "/api/v1/daw/jobs/wm1")
+        {
+            ++polls;
+            code = pollCode;
+            body = code == 200 ? juce::String (R"({"id":"wm1","state":"running","progress":0.1,"take_count":1,"takes":[]})") : errBody (pollMsg);
+        }
+        else if (line.isNotEmpty())
+            ++others;
+        const auto out = "HTTP/1.1 " + juce::String (code) + (code == 200 ? " OK" : code >= 500 ? " Internal Server Error" : " Bad Request")
+                         + "\r\nContent-Type: application/json\r\nContent-Length: " + juce::String ((int) body.getNumBytesAsUTF8())
+                         + "\r\nConnection: close\r\n\r\n" + body;
+        c.write (out.toRawUTF8(), (int) out.getNumBytesAsUTF8());
+        c.close();
+    }
+};
+
+struct WmSiteResult { DawJob job; bool started = false, finished = false; int submits = 0, polls = 0; };
+
+// One HeartMuLa job through the real worker against the stub (no backend switch asked).
+WmSiteResult wmSiteRun (const juce::File& tmp, const char* tag, int submitCode, const juce::String& submitMsg, int pollCode, const juce::String& pollMsg)
+{
+    WmSiteResult r;
+    WmHttpStub stub;
+    stub.submitCode = submitCode; stub.submitMsg = submitMsg;
+    stub.pollCode = pollCode; stub.pollMsg = pollMsg;
+    r.started = stub.start();
+    if (! r.started)
+        return r;
+    {
+        DawWorker w;
+        w.switchBackend = false;
+        w.setEndpoint (stub.url(), "test-key");
+        w.setTakesFolder (tmp.getChildFile (juce::String ("wm_site_") + tag));
+        w.start();
+        const int id = w.submitGenerate (bsReq ("weights call site", "heartmula"));
+        r.finished = waitFinished (w, id, 40.0, r.job);
+        w.stop();
+    }
+    r.submits = stub.submits.load();
+    r.polls = stub.polls.load();
+    stub.stop();
+    return r;
+}
+} // namespace
+
+static void testWeightsMsg (const juce::File& tmp)
+{
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    DawWorker::testWeightsMutant.store (teethVar.startsWith ("WEIGHTS_M") ? juce::jlimit (0, 16, teethVar.substring (9).getIntValue()) : 0);
+    std::printf ("weightsmsg: plain message for missing HeartMuLa weights (mutant %d)%c", DawWorker::testWeightsMutant.load(), 10);
+    const juce::String want ("HeartMuLa is not installed on the server (model weights missing). Pick another backend or install it in HOT-Step.");
+    struct Case { const char* id; const char* backend; const char* text; bool hit; const char* flatNeg = nullptr; }; // flatNeg: a negative whose text has line ends or tabs comes back on one line
+    const Case cases[] = {
+        { "P1 backend given, weights + not found",          "heartmula",   "Model weights not found", true },
+        { "P2 backend in capitals, text in capitals",       "HeartMuLa",   "CHECKPOINT MISSING", true },
+        { "P3 backend with spaces, enoent + safetensors",   " heartmula ", "ENOENT: no such file or directory, open 'hm.safetensors'", true },
+        { "P4 Auto, text names the backend",                "",            "HeartMuLa checkpoint not downloaded", true },
+        { "P5 Auto, text names it in lower case",           "",            "backend heartmula: could not find weights", true },
+        { "P6 bare 'model' is no file word any more",       "ace",         "HEARTMULA model does not exist", false },
+        { "P7 prefixed text, cannot find",                  "heartmula",   "lost the job: cannot find safetensors file", true },
+        { "P8 model + not installed",                       "heartmula",   "Model not installed", true },
+        { "P9 no such file + checkpoint",                   "heartmula",   "No such file: checkpoint.pt", true },
+        { "N1 other backend, weights wording",              "ace",         "Model weights not found", false },
+        { "N2 heartmula, timeout",                          "heartmula",   "request timed out", false },
+        { "N3 heartmula, out of memory",                    "heartmula",   "CUDA out of memory", false },
+        { "N4 heartmula, empty text",                       "heartmula",   "", false },
+        { "N5 Auto, empty text",                            "",            "", false },
+        { "N6 Auto, no backend named",                      "",            "Model weights not found", false },
+        { "N7 file word only (no absent word)",             "heartmula",   "loading model weights", false },
+        { "N8 absent word only (no file word)",             "heartmula",   "route not found", false },
+        { "N9 context only",                                "",            "heartmula failed", false },
+        { "N10 other backend, checkpoint + enoent",         "ace-step",    "checkpoint missing, enoent", false },
+        { "N11 near-miss backend id",                       "heartmula2",  "weights missing", false },
+        { "N12 other backend, spaces, CR LF and UTF-8",     "ace",         "  Weights not found\r\n caf\xc3\xa9 \t", false, "Weights not found caf\xc3\xa9" },
+        { "N13 heartmula, model is busy",                   "heartmula",   "The model is busy", false },
+        { "N14 request field named model",                  "heartmula",   "HTTP 422 validation_error: field 'model' missing", false },
+        { "N15 missing argument (model_kwargs)",            "heartmula",   "TypeError: generate() missing 1 required positional argument: 'model_kwargs'", false },
+        { "N16 device not found",                           "heartmula",   "CUDA device not found, cannot load model", false },
+        { "N17 LoRA file not found",                        "heartmula",   "LoRA file x.safetensors not found", false },
+        { "N18 an uploaded reference file under /models/",  "heartmula",   "No such file or directory: /srv/models/uploads/ref_123.wav", false },
+        { "N19 bare model, backend given",                  "heartmula",   "HeartMuLa model does not exist", false },
+        { "N20 required field named checkpoint",            "heartmula",   "validation error: required field 'checkpoint' is missing", false },
+        { "N21 device not found, weights named",            "heartmula",   "CUDA device not found, cannot load model weights", false },
+        { "P10 .ckpt not found",                            "heartmula",   ".ckpt not found", true },
+        { "P11 Auto, file name carries the backend",        "",            "heartmula.safetensors missing", true },
+        { "P12 model weights not downloaded",               "heartmula",   "model weights not downloaded", true },
+        { "P13 checkpoint file does not exist",             "heartmula",   "checkpoint file does not exist", true },
+        { "P14 mixed case, backend and text",               "HeartMULA",   "HeartMuLa.SafeTensors MISSING", true },
+        { "P15 mixed case .CKPT",                           "heartmula",   "Model.CKPT Does Not Exist", true },
+    };
+    int pos = 0, neg = 0;
+    for (const auto& c : cases)
+    {
+        const auto raw = juce::String::fromUTF8 (c.text);
+        const auto got = DawWorker::missingWeightsText (c.backend, raw);
+        const auto plain = DawWorker::plainServerError (c.backend, raw);
+        const auto wantShown = want + " Server said: " + raw; // the positive texts are one line, under 120 characters
+        const bool rawSame = plain.getNumBytesAsUTF8() == std::strlen (c.text) && std::strcmp (plain.toRawUTF8(), c.text) == 0;
+        std::printf ("  %-46s backend='%s' text='%s' -> mapper %s (%d chars), shown %s (%d bytes, raw %d bytes)%c", c.id, c.backend,
+                     raw.replace ("\r", "<CR>").replace ("\n", "<LF>").replace ("\t", "<TAB>").toRawUTF8(),
+                     got.isEmpty() ? "EMPTY" : (got == want ? "FRIENDLY" : "OTHER"), got.length(),
+                     plain == wantShown ? "FRIENDLY+SAID" : (rawSame ? "RAW" : "OTHER"), (int) plain.getNumBytesAsUTF8(), (int) std::strlen (c.text), 10);
+        const auto name = juce::String ("weightsmsg ") + c.id;
+        if (c.hit)
+        {
+            ++pos;
+            check (got == want && got.length() == 113, (name + ": the mapper returns the plain message (113 characters)").toRawUTF8());
+            check (plain == wantShown && raw.length() <= 120 && plain.length() == 113 + 14 + raw.length() && ! rawSame, (name + ": the shown error is the plain message, ' Server said: ' and the server text").toRawUTF8());
+        }
+        else
+        {
+            ++neg;
+            check (got.isEmpty(), (name + ": the mapper returns empty").toRawUTF8());
+            if (c.flatNeg == nullptr)
+                check (rawSame && plain != want, (name + ": the shown error is the server text byte for byte").toRawUTF8());
+            else
+                check (! rawSame && plain == juce::String::fromUTF8 (c.flatNeg) && plain.length() == 22 && raw.length() == 28,
+                       (name + ": the shown error is the server text on one line (28 characters as sent, 22 shown), not the plain message (teeth: WEIGHTS_M16)").toRawUTF8());
+        }
+    }
+    std::printf ("  cases: %d positive, %d negative%c", pos, neg, 10);
+    check (pos >= 14 && neg >= 21, "weightsmsg: at least 14 positive and 21 negative cases ran");
+
+    // W. Whole words, extensions at a token end, and a strong weights-file signal that the
+    // exclusion words do not veto. Every case gives the exact shown text.
+    {
+        const juce::String said (want + " Server said: ");
+        struct WCase { const char* id; const char* backend; const char* text; const char* flat; const char* teeth; }; // flat: the one-line text of a hit, nullptr = not mapped
+        const WCase wcases[] = {
+            { "WP1 weights not found, download required",   "heartmula", "HeartMuLa weights not found, download required",
+              "HeartMuLa weights not found, download required", "WEIGHTS_M11, M12" },
+            { "WP2 traceback, device='cuda', .safetensors",  "",          "load_file(path, device='cuda')\nFileNotFoundError: No such file or directory: 'models/heartmula/hm.safetensors'",
+              "load_file(path, device='cuda') FileNotFoundError: No such file or directory: 'models/heartmula/hm.safetensors'", "WEIGHTS_M11, M12" },
+            { "WP3 checkpoint file, required",               "heartmula", "checkpoint file missing (required for HeartMuLa)",
+              "checkpoint file missing (required for HeartMuLa)", "WEIGHTS_M11, M12" },
+            { "WP4 .pth, device",                            "heartmula", "torch.load: hm.pth does not exist on device cuda:0",
+              "torch.load: hm.pth does not exist on device cuda:0", "WEIGHTS_M11, M12" },
+            { "WP5 absent phrase split by a line end",       "heartmula", "checkpoint not\nfound",
+              "checkpoint not found", "WEIGHTS_M11" },
+            { "WP6 missing weights, required download",      "heartmula", "missing weights (required download)",
+              "missing weights (required download)", "WEIGHTS_M11, M12" },
+            { "WN1 folder checkpoints, a wav file",          "heartmula", "/checkpoints/uploads/ref.wav: no such file", nullptr, "WEIGHTS_M11" },
+            { "WN2 weighted",                                "heartmula", "weighted sampler not found", nullptr, "WEIGHTS_M11" },
+            { "WN3 .ptx file",                               "heartmula", "preset.ptx not found", nullptr, "WEIGHTS_M11" },
+            { "WN4 .bin folder in a path",                   "heartmula", "node_modules/.bin/ffmpeg: no such file or directory", nullptr, "WEIGHTS_M11" },
+            { "WN5 folder weights, a wav file",              "heartmula", "C:\\srv\\weights\\uploads\\ref.wav does not exist", nullptr, "WEIGHTS_M11" },
+            { "WN6 required field named weights",            "heartmula", "validation error: field 'weights' is required but missing", nullptr, "WEIGHTS_M5" },
+            { "WN7 field required, nothing else",            "heartmula", "HTTP 422: field required", nullptr, "none: guard only" },
+            { "WN8 LoRA weights, .safetensors",              "heartmula", "LoRA weights not found: style.safetensors", nullptr, "WEIGHTS_M5" },
+        };
+        for (const auto& c : wcases)
+        {
+            const auto raw = juce::String::fromUTF8 (c.text);
+            const auto got = DawWorker::missingWeightsText (c.backend, raw);
+            const auto plain = DawWorker::plainServerError (c.backend, raw);
+            const bool rawSame = plain.getNumBytesAsUTF8() == std::strlen (c.text) && std::strcmp (plain.toRawUTF8(), c.text) == 0;
+            const juce::String wantShown (c.flat != nullptr ? said + juce::String::fromUTF8 (c.flat) : raw);
+            std::printf ("  %-44s backend='%s' text='%s' -> mapper %d chars (want %d), shown %d chars (want %d) equal=%d raw=%d%c", c.id, c.backend,
+                         raw.replace ("\n", "<LF>").toRawUTF8(), got.length(), c.flat != nullptr ? 113 : 0,
+                         plain.length(), wantShown.length(), plain == wantShown ? 1 : 0, rawSame ? 1 : 0, 10);
+            const auto name = juce::String ("weightsmsg ") + c.id;
+            if (c.flat != nullptr)
+            {
+                check (got == want && got.length() == 113, (name + ": the mapper returns the plain message (113 characters) (teeth: " + c.teeth + ")").toRawUTF8());
+                check (plain == wantShown && plain.length() == 127 + (int) std::strlen (c.flat) && ! rawSame,
+                       (name + ": the shown error is exactly the plain message, ' Server said: ' and the server text on one line (teeth: " + c.teeth + ")").toRawUTF8());
+            }
+            else
+            {
+                check (got.isEmpty(), (name + ": the mapper returns empty (teeth: " + c.teeth + ")").toRawUTF8());
+                check (rawSame && plain == raw && ! plain.contains ("not installed on the server"),
+                       (name + ": the shown error is the server text byte for byte (teeth: " + c.teeth + ")").toRawUTF8());
+            }
+        }
+        // The match reads the same bounded prefix as the shown line: words past it are not seen.
+        const auto rawW9 = juce::String::repeatedString ("x ", 4500) + "checkpoint not found";
+        const auto gotW9 = DawWorker::missingWeightsText ("heartmula", rawW9);
+        const auto sW9 = DawWorker::plainServerError ("heartmula", rawW9);
+        const auto rawW10 = juce::String::repeatedString ("x ", 4000) + "checkpoint not found";
+        const auto gotW10 = DawWorker::missingWeightsText ("heartmula", rawW10);
+        std::printf ("  WN9 weights words from character 9001 of %d: mapper %d chars (want 0), shown %d chars (want 123), starts with the plain message=%d; WP10 from character 8001 of %d: mapper %d chars (want 113)%c",
+                     rawW9.length(), gotW9.length(), sW9.length(), sW9.startsWith (want) ? 1 : 0, rawW10.length(), gotW10.length(), 10);
+        check (rawW9.length() == 9020 && gotW9.isEmpty() && sW9 == rawW9.substring (0, 120) + "..." && sW9.length() == 123,
+               "weightsmsg WN9: weights words past the first 8192 characters are not read; the server text is shown without the plain message, cut to 120 + '...' (123 characters) (teeth: WEIGHTS_M11, M16)");
+        check (rawW10.length() == 8020 && gotW10 == want,
+               "weightsmsg WP10: weights words that end at character 8020 are read (113 characters) (teeth: WEIGHTS_M2)");
+    }
+
+    // F. Format of the shown text.
+    {
+        // 300 characters over several lines: words joined by line ends, tabs and runs of spaces.
+        const char* seps[] = { "\n", "\t", "\r\n  ", "   ", " \t\n" };
+        juce::String raw ("\n  HeartMuLa checkpoint not found"), flat ("HeartMuLa checkpoint not found");
+        for (int i = 0; raw.length() < 262; ++i)
+        {
+            const juce::String word ("line" + juce::String (i) + ":loader_step_" + juce::String (i * 7));
+            raw << seps[i % 5] << word;
+            flat << " " << word;
+        }
+        while (raw.length() < 298) { raw << "x"; flat << "x"; }
+        raw << "\r\n";
+        const auto shown = DawWorker::plainServerError ("heartmula", raw);
+        const auto wantLong = want + " Server said: " + flat.substring (0, 120) + "...";
+        const bool oneLine = ! shown.containsAnyOf ("\r\n\t") && ! shown.contains ("  ");
+        std::printf ("  F1 long text: raw %d chars, %d line ends, %d tabs; collapsed %d chars; shown %d chars (want %d = 113 + 14 + 120 + 3), one line=%d, equal=%d%c    shown='%s'%c",
+                     raw.length(), raw.length() - raw.removeCharacters ("\n").length(), raw.length() - raw.removeCharacters ("\t").length(),
+                     flat.length(), shown.length(), wantLong.length(), oneLine ? 1 : 0, shown == wantLong ? 1 : 0, 10, shown.toRawUTF8(), 10);
+        check (raw.length() == 300 && flat.length() > 200, "weightsmsg F1: the raw text is 300 characters on several lines");
+        check (shown == wantLong && shown.length() == 250 && wantLong.length() == 250 && shown.endsWith ("...") && oneLine,
+               "weightsmsg F1: shown = plain message + ' Server said: ' + the first 120 collapsed characters + '...' (250 characters) (teeth: WEIGHTS_M6)");
+        check (shown.substring (113, 127) == " Server said: " && shown.substring (127, 157) == "HeartMuLa checkpoint not found" && shown.substring (0, 113) == want,
+               "weightsmsg F1: characters 0 to 112 are the plain message, 113 to 126 ' Server said: ', then the server text");
+        // Exactly 120 collapsed characters: not clipped. 121: clipped.
+        juce::String r120 ("checkpoint not found "), r121;
+        while (r120.length() < 120) r120 << "y";
+        r121 = r120 + "z";
+        const auto s120 = DawWorker::plainServerError ("heartmula", r120), s121 = DawWorker::plainServerError ("heartmula", r121);
+        std::printf ("  F2 edge: 120 chars -> shown %d chars, ends '...'=%d (want 247, 0); 121 chars -> shown %d chars, ends '...'=%d (want 250, 1)%c",
+                     s120.length(), s120.endsWith ("...") ? 1 : 0, s121.length(), s121.endsWith ("...") ? 1 : 0, 10);
+        check (s120 == want + " Server said: " + r120 && s120.length() == 247, "weightsmsg F2: a server text of exactly 120 characters is shown whole, no '...'");
+        check (s121 == want + " Server said: " + r120 + "..." && s121.length() == 250, "weightsmsg F2: 121 characters are cut to 120 + '...' (teeth: WEIGHTS_M6)");
+        // Short, with line ends and tabs.
+        const auto sShort = DawWorker::plainServerError ("heartmula", "  checkpoint\n\tnot found here\r\n");
+        const juce::String wantShort ("HeartMuLa is not installed on the server (model weights missing). Pick another backend or install it in HOT-Step. Server said: checkpoint not found here");
+        std::printf ("  F3 short text with line ends: shown %d chars (want %d) '%s'%c", sShort.length(), wantShort.length(), sShort.toRawUTF8(), 10);
+        check (sShort == wantShort && sShort.length() == 152 && ! sShort.contains ("..."), "weightsmsg F3: a short text is shown whole on one line (152 characters, no '...', line ends and tabs become single spaces)");
+    }
+
+    // J. Call site: a job status body with an error (applyJobJson).
+    {
+        DawJob j, jLong, jOther;
+        j.request.expectedBackend = "heartmula";
+        jLong.request.expectedBackend = "heartmula";
+        jOther.request.expectedBackend = "ace";
+        const bool ok = DawWorker::applyJobJson (R"({"id":"hm1","state":"failed","error":"HeartMuLa checkpoint not found"})", j);
+        const bool okL = DawWorker::applyJobJson (R"({"id":"hm2","state":"failed","error":"FileNotFoundError:\n\tcheckpoint heartmula_v1.safetensors not found in /srv/hot-step/models/heartmula\n\tplease run the HOT-Step installer or copy the weights into that folder, then start the server again"})", jLong);
+        const bool okO = DawWorker::applyJobJson (R"({"id":"a1","state":"failed","error":"Model weights not found"})", jOther);
+        const juce::String wantJ (want + " Server said: HeartMuLa checkpoint not found");
+        const juce::String flatL ("FileNotFoundError: checkpoint heartmula_v1.safetensors not found in /srv/hot-step/models/heartmula please run the HOT-Step installer or copy the weights into that folder, then start the server again");
+        const juce::String wantL (want + " Server said: " + flatL.substring (0, 120) + "...");
+        std::printf ("  J job status body: parsed=%d state=%s error (%d chars, want %d)='%s'%c", ok ? 1 : 0, DawJob::stateName (j.state), j.error.length(), wantJ.length(), j.error.toRawUTF8(), 10);
+        std::printf ("    long, 3 lines: parsed=%d error %d chars (want %d) equal=%d '%s'%c", okL ? 1 : 0, jLong.error.length(), wantL.length(), jLong.error == wantL ? 1 : 0, jLong.error.toRawUTF8(), 10);
+        std::printf ("    ACE job, same wording: parsed=%d error='%s' (want the server text)%c", okO ? 1 : 0, jOther.error.toRawUTF8(), 10);
+        check (ok && j.state == DawJob::State::failed && j.error == wantJ && j.error.length() == 157,
+               "weightsmsg J1: a failed HeartMuLa job's error is the plain message + ' Server said: ' + the server text (157 characters) (teeth: WEIGHTS_M3)");
+        check (okL && jLong.error == wantL && jLong.error.length() == 250 && flatL.length() > 120,
+               "weightsmsg J2: a long 3-line error from the job body is shown on one line, cut to 120 + '...' (250 characters) (teeth: WEIGHTS_M3)");
+        check (okO && jOther.error == "Model weights not found", "weightsmsg J3: an ACE job keeps the server text as sent");
+    }
+
+    // S. Call site: the switch to HeartMuLa fails (seam, no server). The hint sentence that
+    // the clip cuts off is put back at the end.
+    {
+        const char* body = "{\"error\":\"checkpoint heartmula_v1.safetensors not found in /srv/hot-step/models/heartmula; run the installer or copy the weights into that folder first\"}";
+        bs.reset ("ace", 500, body);
+        DawWorker::testBackendCall = &bsCall;
+        DawWorker w;
+        w.switchBackend = true;
+        w.setEndpoint ("http://127.0.0.1:3931", "test-key");
+        w.setTakesFolder (tmp.getChildFile ("wm_takes"));
+        w.start();
+        const int id = w.submitGenerate (bsReq ("weights switch", "heartmula"));
+        DawJob j;
+        const bool fin = waitFinished (w, id, 30.0, j);
+        w.stop();
+        DawWorker::testBackendCall = nullptr;
+        const auto fail = DawWorker::switchFailText ("HeartMuLa", 500, body);
+        const juce::String hint ("Switch the backend in HOT-Step or pick Auto, then press Generate again.");
+        const juce::String wantHead ("Could not switch to HeartMuLa: HOT-Step refused (HTTP 500: checkpoint heartmula_v1.safetensors not found in /srv/hot-step/models/heartmula; run the installer or copy the weights into that folder first). ");
+        const juce::String wantS (want + " Server said: " + (wantHead + hint).substring (0, 120) + "... " + hint);
+        std::printf ("  S switch failure: finished=%d state=%s GETs=%d POSTs=%d serverId='%s'; switch text %d chars; error %d chars (want %d = 113 + 14 + 120 + 3 + 1 + 71) equal=%d%c    error='%s'%c",
+                     fin ? 1 : 0, DawJob::stateName (j.state), bs.gets.load(), bs.posts.load(), j.serverId.toRawUTF8(), fail.length(),
+                     j.error.length(), wantS.length(), j.error == wantS ? 1 : 0, 10, j.error.toRawUTF8(), 10);
+        check (fin && j.state == DawJob::State::failed && j.serverId.isEmpty() && bs.posts.load() == 1 && fail == wantHead + hint && fail.length() > 120,
+               "weightsmsg S1: the HeartMuLa job fails at the switch (1 POST, never submitted) with a switch text over 120 characters");
+        check (j.error.startsWith (want + " Server said: Could not switch to HeartMuLa: HOT-Step refused (HTTP 500: checkpoint heartmula_v1.safetensors not found"),
+               "weightsmsg S2: the failed job's text starts with the plain message and the server's own words");
+        check (j.error == wantS && j.error.length() == 322 && j.error.endsWith ("... " + hint),
+               "weightsmsg S3: the text is plain message + ' Server said: ' + 120 characters + '... ' + the hint sentence (322 characters) (teeth: WEIGHTS_M4)");
+    }
+
+    // L. The debug log remembers at most 64 distinct server texts (counted, no file written).
+    {
+        DawWorker::setLogCountOnlyForTest (true);
+        const int cap0 = DawWorker::logSeenForTest (true), free0 = DawWorker::logSeenForTest (false);
+        int maxCapped = 0, mapped = 0;
+        for (int i = 0; i < 200; ++i)
+        {
+            const auto shown = DawWorker::plainServerError ("heartmula", "checkpoint not found, attempt " + juce::String (i));
+            if (shown.startsWith (want))
+                ++mapped;
+            maxCapped = juce::jmax (maxCapped, DawWorker::logSeenForTest (true));
+        }
+        const int capEnd = DawWorker::logSeenForTest (true), freeEnd = DawWorker::logSeenForTest (false);
+        DawWorker::plainServerError ("heartmula", "checkpoint not found, attempt 199"); // seen already: no new entry
+        const int capAgain = DawWorker::logSeenForTest (true);
+        DawWorker::setLogCountOnlyForTest (false);
+        std::printf ("  L log once-set: 200 distinct texts, %d mapped; capped set: %d at start, largest %d (want 64), %d at the end (want <= 64), %d after a repeat; unlimited set grew by %d (want 0); cap constant %d%c",
+                     mapped, cap0, maxCapped, capEnd, capAgain, freeEnd - free0, DawWorker::kServerSaidLogCap, 10);
+        check (mapped == 200 && maxCapped == 64 && DawWorker::kServerSaidLogCap == 64 && capEnd >= 1 && capEnd <= 64 && freeEnd - free0 == 0,
+               "weightsmsg L1: 200 distinct server texts leave the log's once-set at or under 64 entries, largest 64 (teeth: WEIGHTS_M7)");
+        check (capAgain == capEnd && capEnd >= 1, "weightsmsg L2: a text seen already adds no entry (teeth: WEIGHTS_M7)");
+    }
+
+    // C. Control characters and odd spaces count as spaces, by code point; letters past ASCII stay.
+    {
+        const juce::String said (want + " Server said: ");
+        // ESC, form feed, no-break space (C2 A0) and U+2028 (E2 80 A8), one between each word.
+        // (The match reads the text as sent, so the absent word is one word here.)
+        const auto rawC1 = juce::String::fromUTF8 ("checkpoint\x1b" "missing\x0c" "on\xc2\xa0" "this\xe2\x80\xa8" "server");
+        juce::String fullC1 ("unset");
+        const auto sC1 = DawWorker::plainServerError ("heartmula", rawC1, {}, &fullC1);
+        const juce::String wantC1 (said + "checkpoint missing on this server");
+        std::printf ("  C1 ESC, FF, NBSP, U+2028 between words: raw %d chars; shown %d chars (want %d) equal=%d '%s'; full %d chars (want 0)%c",
+                     rawC1.length(), sC1.length(), wantC1.length(), sC1 == wantC1 ? 1 : 0,
+                     sC1.replaceCharacter ((juce::juce_wchar) 0x1b, '?').replaceCharacter ((juce::juce_wchar) 0x0c, '?').toRawUTF8(), fullC1.length(), 10);
+        check (rawC1.length() == 33 && sC1 == wantC1 && sC1.length() == 160 && fullC1.isEmpty(),
+               "weightsmsg C1: ESC, form feed, no-break space and U+2028 between words each become one space (160 characters) (teeth: WEIGHTS_M8)");
+        // Long text: every separator is a run of two or three of them (also VT, DEL, a C1
+        // control, U+2029, 0x01), with runs at both ends.
+        const char* sepsC[] = { "\x1b\x0c", "\xc2\xa0\xe2\x80\xa8", "\x0b\x7f\x1b", "\xc2\x85 \xe2\x80\xa9", "\x01\t\xc2\xa0", "\x0c\r\n\xc2\x9f" };
+        juce::String rawC2 (juce::String::fromUTF8 ("\x1b\xc2\xa0") + "checkpoint not found"), flatC2 ("checkpoint not found");
+        for (int i = 0; i < 24; ++i)
+        {
+            const juce::String word ("w" + juce::String (i) + ":step_" + juce::String (i * 13));
+            rawC2 << juce::String::fromUTF8 (sepsC[i % 6]) << word;
+            flatC2 << " " << word;
+        }
+        rawC2 << juce::String::fromUTF8 ("\xe2\x80\xa8\x0c");
+        juce::String fullC2;
+        const auto sC2 = DawWorker::plainServerError ("heartmula", rawC2, {}, &fullC2);
+        const juce::String wantC2 (said + flatC2.substring (0, 120) + "..."), wantFullC2 (said + flatC2);
+        const auto oddIn = [] (const juce::String& s)
+        {
+            int n = 0;
+            for (auto p = s.getCharPointer(); ! p.isEmpty();)
+            {
+                const auto c = p.getAndAdvance();
+                if (c < 0x20 || (c >= 0x7f && c <= 0xa0) || c == 0x2028 || c == 0x2029)
+                    ++n;
+            }
+            return n;
+        };
+        const int oddRaw = oddIn (rawC2), oddShown = oddIn (sC2), oddFull = oddIn (fullC2);
+        std::printf ("  C2 long, runs of control characters: raw %d chars (%d control or odd-space), collapsed %d; shown %d chars (want %d) equal=%d, odd left %d; full %d chars (want %d) equal=%d, odd left %d, double spaces=%d%c",
+                     rawC2.length(), oddRaw, flatC2.length(), sC2.length(), wantC2.length(), sC2 == wantC2 ? 1 : 0, oddShown,
+                     fullC2.length(), wantFullC2.length(), fullC2 == wantFullC2 ? 1 : 0, oddFull, fullC2.contains ("  ") ? 1 : 0, 10);
+        check (flatC2.length() == 313 && oddRaw >= 48 && sC2 == wantC2 && sC2.length() == 250 && oddShown == 0,
+               "weightsmsg C2: a long text with runs of control characters is shown on one line with single spaces, cut to 120 + '...' (250 characters) (teeth: WEIGHTS_M8)");
+        check (fullC2 == wantFullC2 && fullC2.length() == 127 + 313 && oddFull == 0 && ! fullC2.contains ("  "),
+               "weightsmsg C3: the full text of the same error has single spaces only and no control character (teeth: WEIGHTS_M8)");
+        // Letters past ASCII stay as sent: e-grave, e-acute, a-grave (C3 A0: its second byte
+        // is not a no-break space), Cyrillic, CJK, U+00A1 (just past the no-break space) and a
+        // 4-byte character.
+        const char* utf = "checkpoint not found: mod\xc3\xa8le caf\xc3\xa9 voil\xc3\xa0 \xd0\xbc\xd0\xbe\xd0\xb4\xd0\xb5\xd0\xbb\xd1\x8c \xe6\xa8\xa1\xe5\x9e\x8b \xc2\xa1ya! \xf0\x9f\x8e\xb5";
+        const auto rawC4 = juce::String::fromUTF8 (utf);
+        const auto sC4 = DawWorker::plainServerError ("heartmula", rawC4);
+        const auto wantC4 = said + rawC4;
+        const bool bytesSame = sC4.getNumBytesAsUTF8() == 127 + std::strlen (utf) && std::strcmp (sC4.toRawUTF8() + 127, utf) == 0;
+        std::printf ("  C4 letters past ASCII: raw %d chars, %d bytes; shown %d chars (want %d), %d bytes (want %d), server part byte for byte=%d%c",
+                     rawC4.length(), (int) std::strlen (utf), sC4.length(), wantC4.length(), (int) sC4.getNumBytesAsUTF8(), 127 + (int) std::strlen (utf), bytesSame ? 1 : 0, 10);
+        check (rawC4.length() == 56 && sC4 == wantC4 && sC4.length() == 127 + 56 && bytesSame,
+               "weightsmsg C4: accented, Cyrillic, CJK and 4-byte characters pass through unchanged, same bytes (teeth: WEIGHTS_M10)");
+    }
+
+    // B. A huge body: the line is built from a bounded prefix (counted, not timed).
+    {
+        const juce::String said (want + " Server said: ");
+        const auto rawB1 = juce::String ("checkpoint not found ") + juce::String::repeatedString ("abcdefghi ", 200000); // single spaces only
+        // Character 4001 of this body is a space, kept back until the next character: 4002 read.
+        juce::String fullB1;
+        DawWorker::testServerSaidExamined.store (-1);
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        const auto sB1 = DawWorker::plainServerError ("heartmula", rawB1, {}, &fullB1);
+        const auto ms1 = juce::Time::getMillisecondCounterHiRes() - t0;
+        const int exB1 = DawWorker::testServerSaidExamined.load();
+        const auto flatB1 = rawB1.substring (0, 4000);
+        std::printf ("  B1 body of %d chars, single spaces: examined %d (want 4002, limit %d); shown %d chars (want 250); full %d chars (want 4130); %.1f ms for the whole call (informational)%c",
+                     (int) rawB1.getNumBytesAsUTF8(), exB1, DawWorker::kServerSaidScanMaxChars, sB1.length(), fullB1.length(), ms1, 10);
+        check (rawB1.getNumBytesAsUTF8() == 2000021 && exB1 == 4002 && exB1 <= 8192 && DawWorker::kServerSaidScanMaxChars == 8192,
+               "weightsmsg B1: of a 2,000,021 character body exactly 4002 characters are examined for the line (limit 8192) (teeth: WEIGHTS_M9)");
+        check (sB1 == said + flatB1.substring (0, 120) + "..." && sB1.length() == 250 && fullB1 == said + flatB1 + "..." && fullB1.length() == 4130,
+               "weightsmsg B2: the huge body is shown cut to 120 + '...' (250 characters), its full text to 4000 + '...' (4130 characters)");
+        // Three words, then 2,000,000 spaces, then a tail: the scan stops at its limit.
+        const auto rawB3 = juce::String ("checkpoint not found") + juce::String::repeatedString (" ", 2000000) + "tail";
+        juce::String fullB3;
+        DawWorker::testServerSaidExamined.store (-1);
+        const auto t1 = juce::Time::getMillisecondCounterHiRes();
+        const auto sB3 = DawWorker::plainServerError ("heartmula", rawB3, {}, &fullB3);
+        const auto ms3 = juce::Time::getMillisecondCounterHiRes() - t1;
+        const int exB3 = DawWorker::testServerSaidExamined.load();
+        std::printf ("  B3 body of %d chars, 2,000,000 spaces in a row: examined %d (want 8192); shown %d chars (want 150) '%s'; full %d chars (want 150); %.1f ms (informational)%c",
+                     (int) rawB3.getNumBytesAsUTF8(), exB3, sB3.length(), sB3.toRawUTF8(), fullB3.length(), ms3, 10);
+        check (exB3 == 8192 && sB3 == said + "checkpoint not found..." && sB3.length() == 150 && fullB3 == sB3,
+               "weightsmsg B3: a 2,000,000 character run of spaces stops the scan at 8192 characters; the line read so far is shown with '...' (150 characters) (teeth: WEIGHTS_M9)");
+    }
+
+    // U. A text that does not match: on one line and cut like the matched text, without the
+    // plain message; short texts with plain spaces only come back as sent.
+    {
+        const juce::String tail ("END-OF-SERVER-TEXT-300");
+        const juce::String headU ("RuntimeError: queue worker crashed while rendering take 1 of 1 ");
+        const juce::String rawU1 (headU + juce::String::repeatedString ("0123456789", 30).substring (0, 300 - headU.length() - tail.length()) + tail);
+        juce::String fullU1 ("unset");
+        const auto sU1 = DawWorker::plainServerError ("heartmula", rawU1, {}, &fullU1);
+        std::printf ("  U1 unrelated text of %d chars: shown %d chars (want 123), ends '%s'; full %d chars (want 300), ends '%s'%c",
+                     rawU1.length(), sU1.length(), sU1.substring (juce::jmax (0, sU1.length() - 8)).toRawUTF8(), fullU1.length(),
+                     fullU1.substring (juce::jmax (0, fullU1.length() - 22)).toRawUTF8(), 10);
+        check (rawU1.length() == 300 && sU1 == rawU1.substring (0, 120) + "..." && sU1.length() == 123 && ! sU1.contains (tail),
+               "weightsmsg U1: a 300 character text that does not match is cut to 120 + '...' (123 characters) (teeth: WEIGHTS_M16)");
+        check (fullU1 == rawU1 && fullU1.length() == 300 && fullU1.endsWith (tail),
+               "weightsmsg U1: its full text is all 300 characters, ending 'END-OF-SERVER-TEXT-300' (teeth: WEIGHTS_M16)");
+        // Short, with line ends, a tab and an ESC: one line.
+        juce::String fullU2 ("unset");
+        const auto sU2 = DawWorker::plainServerError ("heartmula", juce::String::fromUTF8 ("  queue\n\tworker\x1b" "crashed \r\n"), {}, &fullU2);
+        std::printf ("  U2 short text with line ends: shown %d chars (want 20) '%s'; full %d chars (want 0)%c", sU2.length(), sU2.toRawUTF8(), fullU2.length(), 10);
+        check (sU2 == "queue worker crashed" && sU2.length() == 20 && fullU2.isEmpty(),
+               "weightsmsg U2: a short text with line ends, a tab and ESC that does not match is shown on one line (20 characters) (teeth: WEIGHTS_M16)");
+        // Short, plain spaces only (two in a row, one in front): as sent. Exactly 120: as sent. 121: cut.
+        const char* u3 = " queue  worker crashed: caf\xc3\xa9 ";
+        const auto sU3 = DawWorker::plainServerError ("heartmula", juce::String::fromUTF8 (u3));
+        const bool sameU3 = sU3.getNumBytesAsUTF8() == std::strlen (u3) && std::strcmp (sU3.toRawUTF8(), u3) == 0;
+        juce::String r120 ("queue worker crashed "), full120 ("unset"), full121 ("unset");
+        while (r120.length() < 120) r120 << "y";
+        const auto r121 = r120 + "z";
+        const auto s120 = DawWorker::plainServerError ("heartmula", r120, {}, &full120), s121 = DawWorker::plainServerError ("heartmula", r121, {}, &full121);
+        std::printf ("  U3 short text, plain spaces: %d bytes shown (want %d), byte for byte=%d; 120 chars -> shown %d, full %d (want 120, 0); 121 chars -> shown %d, full %d (want 123, 121)%c",
+                     (int) sU3.getNumBytesAsUTF8(), (int) std::strlen (u3), sameU3 ? 1 : 0, s120.length(), full120.length(), s121.length(), full121.length(), 10);
+        guardCheck (sameU3 && sU3.getNumBytesAsUTF8() == 30, "weightsmsg U3 [guard]: a short text with plain spaces only is returned byte for byte (30 bytes)");
+        guardCheck (s120 == r120 && s120.length() == 120 && full120.isEmpty(), "weightsmsg U3 [guard]: a text of exactly 120 characters that does not match is returned whole, no full text");
+        check (s121 == r120 + "..." && s121.length() == 123 && full121 == r121 && full121.length() == 121,
+               "weightsmsg U3: 121 characters that do not match are cut to 120 + '...' (123), full text 121 (teeth: WEIGHTS_M16)");
+        // A huge body that does not match: bounded scan, bounded line, bounded full text.
+        const auto rawU4 = juce::String ("queue worker crashed ") + juce::String::repeatedString ("abcdefghi ", 200000);
+        juce::String fullU4;
+        DawWorker::testServerSaidExamined.store (-1);
+        const auto sU4 = DawWorker::plainServerError ("heartmula", rawU4, {}, &fullU4);
+        const int exU4 = DawWorker::testServerSaidExamined.load();
+        std::printf ("  U4 body of %d chars that does not match: examined %d (want 4002); shown %d chars (want 123); full %d chars (want 4003)%c",
+                     (int) rawU4.getNumBytesAsUTF8(), exU4, sU4.length(), fullU4.length(), 10);
+        check (rawU4.getNumBytesAsUTF8() == 2000021 && exU4 == 4002 && sU4 == rawU4.substring (0, 120) + "..." && sU4.length() == 123,
+               "weightsmsg U4: of a 2,000,021 character body that does not match 4002 characters are examined and 120 + '...' shown (123 characters) (teeth: WEIGHTS_M16)");
+        check (fullU4 == rawU4.substring (0, 4000) + "..." && fullU4.length() == 4003,
+               "weightsmsg U4: its full text is the first 4000 characters + '...' (4003 characters) (teeth: WEIGHTS_M16)");
+        // A switch failure that does not match: the hint sentence at the end is not counted,
+        // so a short refusal stays whole; a long one is cut in front of the hint.
+        const juce::String hint ("Switch the backend in HOT-Step or pick Auto, then press Generate again.");
+        const auto failShort = DawWorker::switchFailText ("SA3", 400, "{\"error\":\"backend sa3 is not installed\"}");
+        const auto failLong = DawWorker::switchFailText ("SA3", 400, "{\"error\":\"" + juce::String::repeatedString ("out of memory on the render node; ", 6) + "\"}");
+        juce::String fullU5 ("unset"), fullU6 ("unset");
+        const auto sU5 = DawWorker::plainServerError ("sa3", failShort, hint, &fullU5);
+        const auto sU6 = DawWorker::plainServerError ("sa3", failLong, hint, &fullU6);
+        std::printf ("  U5 switch text of %d chars with the hint: shown %d chars (want 155), full %d (want 0); U6 switch text of %d chars: shown %d chars (want 195 = 120 + 3 + 1 + 71), full %d chars (want %d)%c    U6 shown='%s'%c",
+                     failShort.length(), sU5.length(), fullU5.length(), failLong.length(), sU6.length(), fullU6.length(), failLong.length(), 10, sU6.toRawUTF8(), 10);
+        guardCheck (failShort.length() == 155 && failShort.endsWith (hint) && sU5 == failShort && fullU5.isEmpty(),
+                    "weightsmsg U5 [guard]: a 155 character switch failure whose text before the hint is under 120 characters is shown whole");
+        check (failLong.length() > 250 && failLong.endsWith (hint) && sU6 == failLong.substring (0, 120) + "... " + hint && sU6.length() == 195
+                   && fullU6 == failLong && fullU6.endsWith (hint),
+               "weightsmsg U6: a long switch failure that does not match is cut to 120 + '... ' + the hint sentence (195 characters), full text whole (teeth: WEIGHTS_M16)");
+    }
+
+    // X. Call sites through the real worker and request(), against a listener in this
+    // process: a refused submit (HTTP 400), a refused status (HTTP 404) and a lost job (five
+    // polls answered HTTP 500). Each with a missing-weights text of 141 characters and a
+    // 300 character text that does not match.
+    {
+        const juce::String said (want + " Server said: ");
+        const juce::String msgW ("checkpoint heartmula_v1.safetensors not found in /srv/hot-step/models/heartmula; run the installer or copy the weights into that folder first");
+        const juce::String tail ("END-OF-SERVER-TEXT-300");
+        const juce::String headX ("RuntimeError: queue worker crashed while rendering take 1 of 1 ");
+        const juce::String msgL (headX + juce::String::repeatedString ("0123456789", 30).substring (0, 300 - headX.length() - tail.length()) + tail);
+        check (msgW.length() == 141 && msgL.length() == 300, "weightsmsg X0: the two server messages are 141 and 300 characters");
+        struct Site { const char* id; const char* what; int submitCode, pollCode; const char* prefix; int wantSubmits, wantPolls; bool hasId; const char* teeth; };
+        const Site sites[] = {
+            { "X1", "refused submit (HTTP 400)", 400, 200, "HTTP 400: ", 1, 0, false, "WEIGHTS_M13" },
+            { "X2", "refused status (HTTP 404)", 200, 404, "HTTP 404: ", 1, 1, true, "WEIGHTS_M14" },
+            { "X3", "lost job (5 polls, HTTP 500)", 200, 500, "lost the job: HTTP 500: ", 1, 5, true, "WEIGHTS_M15" },
+        };
+        for (const auto& st : sites)
+        {
+            const juce::String pre (st.prefix);
+            // a. The missing-weights text.
+            {
+                const auto r = wmSiteRun (tmp, (juce::String (st.id) + "a").toRawUTF8(), st.submitCode, msgW, st.pollCode, msgW);
+                const juce::String raw (pre + msgW);
+                const juce::String wantErr (said + raw.substring (0, 120) + "..."), wantFull (said + raw);
+                const int fullLen = 127 + pre.length() + 141;
+                std::printf ("  %sa %s, weights text: stub=%d finished=%d state=%s serverId='%s' submits=%d polls=%d (want %d, %d); error %d chars (want 250) equal=%d ends '%s'; full %d chars (want %d) equal=%d ends '%s'%c",
+                             st.id, st.what, r.started ? 1 : 0, r.finished ? 1 : 0, DawJob::stateName (r.job.state), r.job.serverId.toRawUTF8(), r.submits, r.polls, st.wantSubmits, st.wantPolls,
+                             r.job.error.length(), r.job.error == wantErr ? 1 : 0, r.job.error.substring (juce::jmax (0, r.job.error.length() - 12)).toRawUTF8(),
+                             r.job.errorFull.length(), fullLen, r.job.errorFull == wantFull ? 1 : 0, r.job.errorFull.substring (juce::jmax (0, r.job.errorFull.length() - 12)).toRawUTF8(), 10);
+                const auto name = juce::String ("weightsmsg ") + st.id + "a " + st.what + ", missing-weights text: ";
+                check (r.started && r.finished && r.job.state == DawJob::State::failed && r.submits == st.wantSubmits && r.polls == st.wantPolls
+                           && (st.hasId ? r.job.serverId == "wm1" : r.job.serverId.isEmpty()),
+                       (name + "the job ends failed after the expected requests").toRawUTF8());
+                check (r.job.error == wantErr && r.job.error.length() == 250 && r.job.error.startsWith (said + pre + "checkpoint heartmula_v1.safetensors not found") && r.job.error.endsWith ("..."),
+                       (name + "the job line is the plain message + ' Server said: ' + 120 characters + '...' (250 characters) (teeth: " + st.teeth + ")").toRawUTF8());
+                check (r.job.errorFull == wantFull && r.job.errorFull.length() == fullLen && r.job.errorFull.endsWith ("into that folder first"),
+                       (name + "the full text is the plain message + ' Server said: ' + the whole server text, ending 'into that folder first' (teeth: " + st.teeth + ")").toRawUTF8());
+            }
+            // b. The long text that does not match.
+            {
+                const auto r = wmSiteRun (tmp, (juce::String (st.id) + "b").toRawUTF8(), st.submitCode, msgL, st.pollCode, msgL);
+                const juce::String raw (pre + msgL);
+                const juce::String wantErr (raw.substring (0, 120) + "...");
+                const int fullLen = pre.length() + 300;
+                std::printf ("  %sb %s, 300 character text: stub=%d finished=%d state=%s serverId='%s' submits=%d polls=%d (want %d, %d); error %d chars (want 123) equal=%d ends '%s'; full %d chars (want %d) equal=%d ends '%s'%c",
+                             st.id, st.what, r.started ? 1 : 0, r.finished ? 1 : 0, DawJob::stateName (r.job.state), r.job.serverId.toRawUTF8(), r.submits, r.polls, st.wantSubmits, st.wantPolls,
+                             r.job.error.length(), r.job.error == wantErr ? 1 : 0, r.job.error.substring (juce::jmax (0, r.job.error.length() - 12)).toRawUTF8(),
+                             r.job.errorFull.length(), fullLen, r.job.errorFull == raw ? 1 : 0, r.job.errorFull.substring (juce::jmax (0, r.job.errorFull.length() - 22)).toRawUTF8(), 10);
+                const auto name = juce::String ("weightsmsg ") + st.id + "b " + st.what + ", 300 character text that does not match: ";
+                check (r.started && r.finished && r.job.state == DawJob::State::failed && r.submits == st.wantSubmits && r.polls == st.wantPolls
+                           && (st.hasId ? r.job.serverId == "wm1" : r.job.serverId.isEmpty()),
+                       (name + "the job ends failed after the expected requests").toRawUTF8());
+                check (r.job.error == wantErr && r.job.error.length() == 123 && r.job.error.startsWith (pre + "RuntimeError: queue worker crashed") && ! r.job.error.contains ("not installed on the server"),
+                       (name + "the job line is the server text cut to 120 + '...' (123 characters), no plain message (teeth: " + st.teeth + ", WEIGHTS_M16)").toRawUTF8());
+                check (r.job.errorFull == raw && r.job.errorFull.length() == fullLen && r.job.errorFull.endsWith (tail),
+                       (name + "the full text is the whole server text, ending 'END-OF-SERVER-TEXT-300' (teeth: " + st.teeth + ", WEIGHTS_M16)").toRawUTF8());
+            }
+        }
+    }
+    DawWorker::testWeightsMutant.store (0);
+}
+
+static void testConfPct (const juce::File& tmp)
+{
+    std::printf ("CONF bar percentage (R6b)%c", 10);
+    const double sr = 48000.0;
+    auto f = pgWriteWav (tmp.getChildFile ("conf.wav"), sr, 24, false, pgSine (sr, 440.0, 0.0, 0.3f, (int) (sr * 4)), "conf");
+    const double confs[] = { 0.734, 0.0, 1.0 };
+    for (const double c : confs)
+    {
+        TakeEditorPanel panel;
+        panel.setSize (490, 566);
+        TakeEditorPanel::Take take;
+        take.temp = f;
+        take.name = "conf";
+        take.tempo.bpm = 120.0;
+        take.tempo.confidence = c;
+        take.grid.bpm = 120.0;
+        take.grid.downbeatSec = 0.0;
+        take.grid.measured = true;
+        take.takeBpm = 120.0;
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        const auto txt = panel.confTextForTest();
+        const auto want = juce::String (juce::roundToInt (c * 100.0)) + "%";
+        std::printf ("  CP confidence %.3f -> bar text '%s' (want '%s')%c", c, txt.toRawUTF8(), want.toRawUTF8(), 10);
+        check (txt == want, ("CONF bar shows " + want + " for confidence " + juce::String (c, 3)).toRawUTF8());
+    }
+    {
+        TakeEditorPanel panel;
+        TakeEditorPanel::Take take;
+        take.temp = f;
+        take.tempo.confidence = 0.9;
+        take.grid.bpm = 120.0;
+        take.grid.measured = false;
+        take.grid.fallback = true;
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        const auto txt = panel.confTextForTest();
+        std::printf ("  CP fallback grid -> bar text '%s' (want empty)%c", txt.toRawUTF8(), 10);
+        check (txt.isEmpty(), "CONF bar shows no number for a fallback grid");
+    }
 }
 
 static void testPeakGuard (const juce::File& tmp)
@@ -30292,6 +36226,86 @@ static void testParamTextRoundTrip()
 }
 
 // clap-validator state-invalid-random: malformed state must be rejected, change nothing, not throw.
+static void testTakesClampBackend()
+{
+    std::printf ("Takes clamp per backend (HeartMuLa = one take per request)\n");
+    using R = DawJobRequest;
+    for (auto id : { "", "sa3", "yue2", "ace", "minimax-m3" })
+    {
+        std::printf ("  maxTakesForBackend('%s') = %d\n", id, R::maxTakesForBackend (id));
+        check (R::maxTakesForBackend (id) == 0, "no take limit for non-heartmula backend");
+    }
+    std::printf ("  maxTakesForBackend('heartmula') = %d\n", R::maxTakesForBackend ("heartmula"));
+    check (R::maxTakesForBackend ("heartmula") == 1, "heartmula max takes is 1");
+    const int c4h = R::clampTakesForBackend (4, "heartmula"), c1h = R::clampTakesForBackend (1, "heartmula");
+    const int c4s = R::clampTakesForBackend (4, "sa3"), c4m = R::clampTakesForBackend (4, "minimax-m3");
+    std::printf ("  clamp(4,heartmula)=%d clamp(1,heartmula)=%d clamp(4,sa3)=%d clamp(4,minimax-m3)=%d\n", c4h, c1h, c4s, c4m);
+    check (c4h == 1, "clamp 4 takes on heartmula -> 1");
+    check (c1h == 1, "clamp 1 take on heartmula -> 1");
+    check (c4s == 4, "clamp 4 takes on sa3 -> 4");
+    check (c4m == 4, "clamp 4 takes on minimax-m3 -> 4");
+    const auto n4h = R::takesClampNote (4, "heartmula");
+    std::printf ("  note(4,heartmula)='%s' note(1,heartmula)='%s' note(4,sa3)='%s'\n", n4h.toRawUTF8(),
+                 R::takesClampNote (1, "heartmula").toRawUTF8(), R::takesClampNote (4, "sa3").toRawUTF8());
+    check (n4h.isNotEmpty() && n4h.contains ("one take"), "heartmula 4-take note says one take");
+    check (R::takesClampNote (1, "heartmula").isEmpty(), "no note for 1 take on heartmula");
+    check (R::takesClampNote (4, "sa3").isEmpty(), "no note for sa3");
+
+    // Integration: makeRequest with backend heartmula and Takes param 4.
+    HotStepLinkProcessor p;
+    auto setPlain = [&p] (const char* pid, float plain)
+    {
+        if (auto* rp = dynamic_cast<juce::RangedAudioParameter*> (p.apvts.getParameter (pid)))
+            rp->setValueNotifyingHost (rp->convertTo0to1 (plain));
+    };
+    setPlain ("takes", 4.0f);
+    setPlain ("backend", 5.0f); // index 5 = heartmula
+    const auto req = p.makeRequest ("clamp");
+    const auto js = req.toJson();
+    const auto v = juce::JSON::parse (js);
+    const int wire = (int) v["takes"];
+    std::printf ("  heartmula request: backend='%s' takes=%d JSON takes=%d\n", req.expectedBackend.toRawUTF8(), req.takes, wire);
+    check (req.expectedBackend == "heartmula", "backend param 5 selects heartmula");
+    check (req.takes == 1 && wire == 1, "heartmula request sends 1 take with Takes=4");
+    setPlain ("backend", 1.0f); // sa3
+    const auto req2 = p.makeRequest ("noclamp");
+    const int wire2 = (int) juce::JSON::parse (req2.toJson())["takes"];
+    std::printf ("  sa3 request: takes=%d JSON takes=%d\n", req2.takes, wire2);
+    check (req2.takes == 4 && wire2 == 4, "sa3 request keeps 4 takes");
+}
+
+// Card 96f2fb35: the downbeat gate and the edit render's grid start.
+static void testDownbeatGate()
+{
+    std::printf ("downbeat gate (96f2fb35)\n");
+    using namespace TempoResolve;
+    const double hi = (double) TempoMeasure::Level::high, md = (double) TempoMeasure::Level::medium;
+    const double lo = (double) TempoMeasure::Level::low, no = (double) TempoMeasure::Level::none;
+    const double inf = std::numeric_limits<double>::infinity(), nan = std::numeric_limits<double>::quiet_NaN();
+    struct Case { const char* name; double off, conf, want; };
+    const Case cases[] = {
+        { "0.120 at low -> 0", 0.120, lo, 0.0 },
+        { "0.120 at none -> 0", 0.120, no, 0.0 },
+        { "NaN at high -> 0", nan, hi, 0.0 },
+        { "inf at high -> 0", inf, hi, 0.0 },
+        { "0.0005 at high -> 0", 0.0005, hi, 0.0 },
+        { "beyond kMaxGridDownbeatSec at high -> 0", TakeEdit::kMaxGridDownbeatSec + 1.0, hi, 0.0 },
+        { "0.120 at high -> 0.120", 0.120, hi, 0.120 },
+        { "0.120 at medium -> 0.120", 0.120, md, 0.120 },
+    };
+    for (const auto& c : cases)
+    {
+        const double got = downbeatOffsetToApply (c.off, c.conf, kDownbeatConfidence);
+        std::printf ("    offset %g conf %g -> %g (want %g)\n", c.off, c.conf, got, c.want);
+        check (std::abs (got - c.want) < 1.0e-12, c.name);
+    }
+    const double rLow = HostSyncState::renderGridDownbeat (true, false, 0.0, 0.120, lo);
+    const double rHigh = HostSyncState::renderGridDownbeat (true, false, 0.0, 0.120, hi);
+    std::printf ("    render start: low %g, high %g\n", rLow, rHigh);
+    check (rLow == 0.0, "render: low confidence downbeat 0.120 leaves start at 0");
+    check (std::abs (rHigh - 0.120) < 1.0e-12, "render: high confidence snaps to 0.120");
+}
+
 static void testMoreLikeFits()
 {
     const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
@@ -30319,6 +36333,55 @@ static void testMoreLikeFits()
     const auto wide = HotStepLinkEditor::moreLikeTextFor ("T1", 400.0f);
     std::printf ("  at 400 px: '%s' (ids kept at min window: %d)\n", wide.toRawUTF8(), idKept);
     check (wide == "+4 LIKE T1", "a wide button keeps the take id");
+}
+
+static void testFitCurveC()
+{
+    std::printf ("FIT option C: length vs requested duration, folded tempo, len/tempo tag\n");
+    using namespace TakeGrid;
+    const int saL = fitLengthScore (15.0, 15.0, 88.0, 4), saT = fitTempoScore (132.0, 88.0);
+    const int yuL = fitLengthScore (15.0, 15.0, 88.0, 4), yuT = fitTempoScore (0.0, 88.0);
+    const int acL = fitLengthScore (15.0, 15.0, 88.0, 4), acT = fitTempoScore (176.0, 88.0);
+    const int mmL = fitLengthScore (20.1, 15.0, 88.0, 4), mmT = fitTempoScore (0.0, 88.0);
+    std::printf ("  SA3     len(15,15,88,4)=%d tempo(132,88)=%d\n", saL, saT);
+    std::printf ("  YuE2    len(15,15,88,4)=%d tempo(none,88)=%d\n", yuL, yuT);
+    std::printf ("  ACE     len(15,15,88,4)=%d tempo(176,88)=%d\n", acL, acT);
+    std::printf ("  MiniMax len(20.1,15,88,4)=%d tempo(none,88)=%d\n", mmL, mmT);
+    check (saL == 100 && saT == 0, "SA3: length 100, tempo 132 vs 88 scores 0");
+    check (yuL == 100 && yuT == -1, "YuE2: length 100, no measured tempo is -1");
+    check (acL == 100 && acT == 100, "ACE: length 100, 176 vs 88 folds to x2 = 100");
+    check (mmL == 0 && mmT == -1, "MiniMax: 20.1 s vs 15 s is 0 at sigma 10%, tempo -1");
+    const int half = fitTempoScore (44.0, 88.0), nearT = fitTempoScore (90.6, 88.0);
+    const int zeroLen = fitLengthScore (0.0, 15.0, 88.0, 4);
+    const int grid = fitLengthScore (15.0, 0.0, 88.0, 4), oldGrid = fitToBarsScore (15.0, 0.0, 88.0, 4);
+    std::printf ("  tempo(44,88)=%d tempo(90.6,88)=%d len(0,15)=%d len(15,0,88,4)=%d old grid=%d\n", half, nearT, zeroLen, grid, oldGrid);
+    check (half == 100, "44 vs 88 folds to x0.5 = 100");
+    check (nearT >= 40 && nearT <= 60, "90.6 vs 88 (about 3% off) scores 40..60");
+    check (zeroLen == -1, "length 0 is -1");
+    check (grid == -1, "no requested length gives no length part (-1)");
+    const auto tHand = fitTagOf (grid, fitTempoScore (88.0, 88.0)), tT100 = fitTagOf (-1, 100), tT0 = fitTagOf (-1, 0);
+    std::printf ("  hand-added 15s 88bpm tag '%s' c%d | (-1,100) '%s' c%d | (-1,0) '%s' c%d\n", tHand.text.toRawUTF8(), tHand.colour,
+                 tT100.text.toRawUTF8(), tT100.colour, tT0.text.toRawUTF8(), tT0.colour);
+    check (tHand.text == "tempo 100" && tHand.colour == TempoTag::green, "hand-added take: tempo 100, green");
+    check (tT100.text == "tempo 100" && tT100.colour == TempoTag::green, "fitTagOf(-1,100) green");
+    check (tT0.text == "tempo 0" && tT0.colour == TempoTag::red, "fitTagOf(-1,0) red");
+    const auto tNone = fitTagOf (-1, -1), tLen = fitTagOf (100, -1), tRed = fitTagOf (100, 0), tMix = fitTagOf (90, 60);
+    std::printf ("  min(-1,-1)=%d tag '%s' c%d | min(100,-1)=%d tag '%s' c%d | min(100,0)=%d tag '%s' c%d | min(90,60)=%d tag '%s' c%d\n",
+                 fitMinScore (-1, -1), tNone.text.toRawUTF8(), tNone.colour, fitMinScore (100, -1), tLen.text.toRawUTF8(), tLen.colour,
+                 fitMinScore (100, 0), tRed.text.toRawUTF8(), tRed.colour, fitMinScore (90, 60), tMix.text.toRawUTF8(), tMix.colour);
+    check (fitMinScore (-1, -1) == -1 && tNone.text == "-" && tNone.colour != TempoTag::red, "both missing: dash, not red");
+    check (fitMinScore (100, -1) == 100 && tLen.colour == TempoTag::green, "missing tempo uses length 100, green");
+    check (fitMinScore (100, 0) == 0 && tRed.colour == TempoTag::red, "tempo 0 makes the tag red");
+    check (fitMinScore (90, 60) == 60 && tMix.colour == TempoTag::amber, "colour follows the minimum (60 amber)");
+    {   // teeth row: an unknown part is hidden, not printed as "len -"
+        const auto a = fitTagOf (-1, 100), b = fitTagOf (80, 100), c = fitTagOf (80, -1), d = fitTagOf (-1, -1);
+        std::printf ("  hide-unknown: (-1,100) '%s' | (80,100) '%s' | (80,-1) '%s' | (-1,-1) '%s'\n",
+                     a.text.toRawUTF8(), b.text.toRawUTF8(), c.text.toRawUTF8(), d.text.toRawUTF8());
+        check (a.text == "tempo 100", "hide-unknown: (-1,100) reads tempo 100");
+        check (b.text == "len 80 / tempo 100", "hide-unknown: (80,100) reads len 80 / tempo 100");
+        check (c.text == "len 80", "hide-unknown: (80,-1) reads len 80");
+        check (d.text == "-", "hide-unknown: (-1,-1) reads -");
+    }
 }
 
 static void testStateRejectsGarbage()
@@ -30400,6 +36463,219 @@ static LONG WINAPI hslinkCrashFilter (EXCEPTION_POINTERS* ep)
     }
     std::fflush (stderr);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// autogrid drums (Card D second proof): a 48 kHz synthetic drum pattern drifting
+// linearly from 120 to 122.4 BPM over 16 bars. Kick (decaying sine sweep to about
+// 60 Hz) on beats 1 and 3, snare (noise burst plus 190 Hz tone) on 2 and 4, closed
+// hats (short highpassed noise) on 8ths with the off-8ths swung to 58 percent, ghost
+// snares at -18 dB on a few 16ths. Fixed XorShift seed. Same on-load path as the
+// click case; each true quarter-note beat frame is mapped through the markers onto
+// the 120 BPM host grid. Asserts median <= 4 ms and worst <= 10 ms. Teeth: the
+// caller's HSLINK_AUTOGRID_TEETH=1 mutant (identity warp) must fail it.
+static void testAutoGridDrums()
+{
+    const double sr = 48000.0, bpm0 = 120.0, bpm1 = 122.4, hostBpm = 120.0;
+    const int beatsPerBar = 4, nBeats = 16 * beatsPerBar;
+    const double kPi = 3.14159265358979;
+    std::vector<double> beatSec; // nBeats + 1 entries, the last closes the final beat
+    double t = 0.0;
+    for (int k = 0; k <= nBeats; ++k)
+    {
+        beatSec.push_back (t);
+        const double bpm = bpm0 + (bpm1 - bpm0) * (double) std::min (k, nBeats - 1) / (double) (nBeats - 1);
+        t += 60.0 / bpm;
+    }
+    const auto length = (std::int64_t) std::llround ((t + 0.5) * sr);
+    std::vector<float> mono ((std::size_t) length, 0.0f);
+    std::uint32_t rng = 0x2545f491u;
+    auto noise = [&rng]() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return (double) rng / 2147483648.0 - 1.0; };
+    auto at = [&] (int beat, double frac) { return (std::int64_t) std::llround ((beatSec[(std::size_t) beat] + frac * (beatSec[(std::size_t) beat + 1] - beatSec[(std::size_t) beat])) * sr); };
+    auto add = [&] (std::int64_t f, std::size_t n, float v) { if (f + (std::int64_t) n < length) mono[(std::size_t) (f + (std::int64_t) n)] += v; };
+    auto kick = [&] (std::int64_t f)
+    {
+        double ph = 0.0;
+        for (int n = 0; n < (int) (0.25 * sr); ++n)
+        {
+            const double ts = (double) n / sr;
+            ph += 2.0 * kPi * (60.0 + 90.0 * std::exp (-ts / 0.03)) / sr;
+            add (f, (std::size_t) n, (float) (0.8 * std::exp (-ts / 0.09) * std::sin (ph)));
+        }
+    };
+    auto snare = [&] (std::int64_t f, double g)
+    {
+        for (int n = 0; n < (int) (0.18 * sr); ++n)
+        {
+            const double ts = (double) n / sr;
+            add (f, (std::size_t) n, (float) (g * (0.45 * std::exp (-ts / 0.05) * noise()
+                                                  + 0.35 * std::exp (-ts / 0.04) * std::sin (2.0 * kPi * 190.0 * ts))));
+        }
+    };
+    auto hat = [&] (std::int64_t f)
+    {
+        double prev = 0.0;
+        for (int n = 0; n < (int) (0.04 * sr); ++n)
+        {
+            const double w = noise(), hp = w - prev; // first difference: a gentle highpass
+            prev = w;
+            add (f, (std::size_t) n, (float) (0.12 * std::exp (-(double) n / sr / 0.012) * hp));
+        }
+    };
+    const double ghost = std::pow (10.0, -18.0 / 20.0);
+    for (int b = 0; b < nBeats; ++b)
+    {
+        const int inBar = b % beatsPerBar, bar = b / beatsPerBar;
+        if (inBar == 0 || inBar == 2)
+            kick (at (b, 0.0));
+        else
+            snare (at (b, 0.0), 1.0);
+        hat (at (b, 0.0));
+        hat (at (b, 0.58));
+        if (inBar == 1 && bar % 2 == 1)
+            snare (at (b, 0.75), ghost);
+        if (inBar == 3 && bar % 4 == 2)
+            snare (at (b, 0.25), ghost);
+        if (inBar == 2 && bar % 3 == 0)
+            snare (at (b, 0.75), ghost);
+    }
+    const auto r = TempoMeasure::analyse (mono.data(), mono.size(), sr, hostBpm);
+    std::printf ("autogrid drums: analyse bpm %.3f level %s downbeat %.4f s driftMs %.2f%c",
+                 r.bpm, TempoMeasure::levelName (r.level), r.downbeatSec, r.driftMs, 10);
+    std::vector<double> onSecs;
+    for (const auto& o : TempoMeasure::onsets (mono.data(), mono.size(), sr))
+        onSecs.push_back (o.sec);
+    const auto beats = WarpMarkers::trackBeats (onSecs, r.bpm > 0.0 ? r.bpm : hostBpm, r.downbeatSnappedSec, (double) length / sr);
+    const auto markers = WarpMarkers::autoPlaceFromBeats (length, sr, beats, hostBpm, (double) r.level, TempoResolve::kDownbeatConfidence);
+    {
+        double barMs = 1.0e9;
+        for (int b = 0; b < nBeats; b += beatsPerBar)
+            barMs = std::min (barMs, std::abs (r.downbeatSnappedSec - beatSec[(std::size_t) b]) * 1000.0);
+        std::printf ("autogrid drums: downbeat to nearest true bar start %.3f ms (want <= 10)%c", barMs, 10);
+        check (barMs <= 10.0, "autogrid drums: detected downbeat lies within 10 ms of a true bar start");
+    }
+    std::printf ("autogrid drums: onsets %d beats %d markers %d moved %d%c", (int) onSecs.size(), (int) beats.size(),
+                 (int) markers.size(), WarpMarkers::movedCount (markers), 10);
+    const double gridFrames = 60.0 / hostBpm * sr;
+    std::vector<double> errMs;
+    for (int b = 0; b < nBeats; ++b)
+    {
+        const auto f = (std::int64_t) std::llround (beatSec[(std::size_t) b] * sr);
+        const auto w = (double) WarpMarkers::mapFrame (markers, f, true);
+        const double nearest = std::round (w / gridFrames) * gridFrames;
+        errMs.push_back (std::abs (w - nearest) / sr * 1000.0);
+    }
+    std::sort (errMs.begin(), errMs.end());
+    const std::size_t n = errMs.size();
+    const double median = n == 0 ? 0.0 : (n % 2 ? errMs[n / 2] : 0.5 * (errMs[n / 2 - 1] + errMs[n / 2]));
+    const double worst = n == 0 ? 0.0 : errMs.back();
+    std::printf ("autogrid drums: beats %d median %.3f ms worst %.3f ms%c", (int) n, median, worst, 10);
+    check (n == (std::size_t) nBeats, "autogrid drums: every beat measured");
+    check (median <= 4.0, "autogrid drums: median beat-to-grid error <= 4 ms after warp on load");
+    check (worst <= 10.0, "autogrid drums: worst beat-to-grid error <= 10 ms after warp on load");
+}
+
+// autogrid (Card D slice 1): a 48 kHz click track drifting linearly from 120 to
+// 122.4 BPM (2 percent) over 16 bars of 4/4 goes through the on-load path:
+// TempoMeasure::analyse, then TempoMeasure::onsets, WarpMarkers::trackBeats from the
+// detected downbeat, then WarpMarkers::autoPlaceFromBeats (src = detected beat, dst =
+// host grid line, gated at medium confidence). Each click is mapped through the
+// markers onto a fixed 120 BPM host grid (bar 1 at frame 0). Asserts median
+// onset-to-grid error <= 4 ms and worst <= 10 ms. Guard: sparse random clicks
+// (low confidence) give no markers. Teeth: HSLINK_AUTOGRID_TEETH=1 sets the
+// mutNoBeatSeed mutant (dst = src, the old identity warp), which must fail.
+static void testAutoGrid()
+{
+    const char* teeth = std::getenv ("HSLINK_AUTOGRID_TEETH");
+    if (teeth != nullptr && teeth[0] == '1')
+    {
+        WarpMarkers::testMutant.store (WarpMarkers::mutNoBeatSeed);
+        std::printf ("autogrid: TEETH mutNoBeatSeed on%c", 10);
+    }
+    const double sr = 48000.0, bpm0 = 120.0, bpm1 = 122.4, hostBpm = 120.0;
+    const int beatsPerBar = 4, nBeats = 16 * beatsPerBar;
+    // Linear tempo ramp over beat index: beat k lasts 60 / bpm(k) seconds.
+    std::vector<std::int64_t> onsets;
+    double t = 0.0;
+    for (int k = 0; k < nBeats; ++k)
+    {
+        onsets.push_back ((std::int64_t) std::llround (t * sr));
+        const double bpm = bpm0 + (bpm1 - bpm0) * (double) k / (double) (nBeats - 1);
+        t += 60.0 / bpm;
+    }
+    const auto length = (std::int64_t) std::llround ((t + 0.5) * sr);
+    std::vector<float> mono ((std::size_t) length, 0.0f);
+    const int clickLen = 96; // 2 ms decaying 2 kHz burst, louder on bar starts
+    for (std::size_t i = 0; i < onsets.size(); ++i)
+    {
+        const float amp = (i % (std::size_t) beatsPerBar) == 0 ? 0.9f : 0.6f;
+        for (int n = 0; n < clickLen && onsets[i] + n < length; ++n)
+            mono[(std::size_t) (onsets[i] + n)] = amp * (float) std::exp (-(double) n / 24.0)
+                                                  * (float) std::sin (2.0 * 3.14159265358979 * 2000.0 * (double) n / sr);
+    }
+    const auto r = TempoMeasure::analyse (mono.data(), mono.size(), sr, hostBpm);
+    std::printf ("autogrid: analyse bpm %.3f level %s downbeat %.4f s driftMs %.2f%c",
+                 r.bpm, TempoMeasure::levelName (r.level), r.downbeatSec, r.driftMs, 10);
+    std::vector<double> onSecs;
+    for (const auto& o : TempoMeasure::onsets (mono.data(), mono.size(), sr))
+        onSecs.push_back (o.sec);
+    const auto beats = WarpMarkers::trackBeats (onSecs, r.bpm > 0.0 ? r.bpm : hostBpm, r.downbeatSnappedSec, (double) length / sr);
+    const auto markers = WarpMarkers::autoPlaceFromBeats (length, sr, beats, hostBpm, (double) r.level, TempoResolve::kDownbeatConfidence);
+    for (std::size_t q = 0; q < 3 && q < onSecs.size(); ++q) std::printf ("autogrid: onset %.4f%c", onSecs[q], 10);
+    {
+        // Frame-0 onset: the first click starts at sample 0 and must be found within 2 ms.
+        double nearMs = 1.0e9;
+        for (double s : onSecs)
+            nearMs = std::min (nearMs, std::abs (s) * 1000.0);
+        std::printf ("autogrid: frame-0 click nearest onset %.3f ms (want <= 2)%c", nearMs, 10);
+        check (nearMs <= 2.0, "autogrid: a click at frame 0 is detected as an onset within 2 ms");
+    }
+    std::printf ("autogrid: onsets %d beats %d markers %d moved %d first src %lld%c", (int) onSecs.size(), (int) beats.size(),
+                 (int) markers.size(), WarpMarkers::movedCount (markers), markers.size() > 1 ? (long long) markers[1].srcFrame : -1LL, 10);
+    const double gridFrames = 60.0 / hostBpm * sr;
+    std::vector<double> errMs;
+    for (auto f : onsets)
+    {
+        const auto w = (double) WarpMarkers::mapFrame (markers, f, true);
+        const double nearest = std::round (w / gridFrames) * gridFrames;
+        errMs.push_back (std::abs (w - nearest) / sr * 1000.0);
+    }
+    std::sort (errMs.begin(), errMs.end());
+    const std::size_t n = errMs.size();
+    const double median = n == 0 ? 0.0 : (n % 2 ? errMs[n / 2] : 0.5 * (errMs[n / 2 - 1] + errMs[n / 2]));
+    const double worst = n == 0 ? 0.0 : errMs.back();
+    std::printf ("autogrid: clicks %d median %.3f ms worst %.3f ms%c", (int) n, median, worst, 10);
+    check (n == (std::size_t) nBeats, "autogrid: every click measured");
+    check (median <= 4.0, "autogrid: median onset-to-grid error <= 4 ms after warp on load");
+    check (worst <= 10.0, "autogrid: worst onset-to-grid error <= 10 ms after warp on load");
+
+    // Guard: 20 s of sparse random clicks (fixed seed) must stay Raw (no markers).
+    {
+        std::vector<float> rnd ((std::size_t) (20.0 * sr), 0.0f);
+        std::uint32_t x = 0x9e3779b9u;
+        double tt = 0.1;
+        while (true)
+        {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            tt += 0.15 + 1.6 * (double) (x % 10000u) / 10000.0;
+            const auto at = (std::int64_t) (tt * sr);
+            if (at + clickLen >= (std::int64_t) rnd.size())
+                break;
+            for (int k = 0; k < clickLen; ++k)
+                rnd[(std::size_t) (at + k)] = 0.7f * (float) std::exp (-(double) k / 24.0)
+                                              * (float) std::sin (2.0 * 3.14159265358979 * 2000.0 * (double) k / sr);
+        }
+        const auto rr = TempoMeasure::analyse (rnd.data(), rnd.size(), sr, hostBpm);
+        std::vector<double> rs;
+        for (const auto& o : TempoMeasure::onsets (rnd.data(), rnd.size(), sr))
+            rs.push_back (o.sec);
+        const auto rb = WarpMarkers::trackBeats (rs, rr.bpm > 0.0 ? rr.bpm : hostBpm, rr.downbeatSnappedSec, 20.0);
+        const auto rm = WarpMarkers::autoPlaceFromBeats ((std::int64_t) rnd.size(), sr, rb, hostBpm, (double) rr.level, TempoResolve::kDownbeatConfidence);
+        std::printf ("autogrid: guard random clicks level %s bpm %.3f onsets %d markers %d%c",
+                     TempoMeasure::levelName (rr.level), rr.bpm, (int) rs.size(), (int) rm.size(), 10);
+        check (rm.empty(), "autogrid: low-confidence input places no auto markers (Raw)");
+    }
+    testAutoGridDrums();
+    WarpMarkers::testMutant.store (WarpMarkers::mutNone);
 }
 
 // takestate (C1): the take list, its edits, grid, warp and stars survive a plugin
@@ -30770,7 +37046,9 @@ static void testFocusSelect (const juce::File& tmp)
     juce::AudioBuffer<float> buf (2, 384000);
     for (int i = 0; i < buf.getNumSamples(); ++i)
     {
-        const float v = 0.3f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 110.0 * i / sr);
+        // 0.25 (-12.04 dBFS): at or under P::kImportInPlaceDbfs, so Add as take lists it at
+        // once (was 0.3 = -10.46 dBFS, which now goes through the true-peak scan first).
+        const float v = 0.25f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 110.0 * i / sr);
         buf.setSample (0, i, v);
         buf.setSample (1, i, v);
     }
@@ -31088,10 +37366,761 @@ static void testOfflineLocal (const juce::File& tmp)
     dir.deleteRecursively();
 }
 
+// ---- S2 security tests: loopback table, exposure warning, key never in log, sidecar
+// or URL. Only the fixed fake key below is used; no real DAW key is read or printed.
+static const char* const kS2FakeKey = "TESTKEY-9f3a7c";
+
+static bool s2TreeContains (const juce::File& dir, const juce::String& needle, int& filesScanned)
+{
+    bool found = false;
+    for (const auto& f : dir.findChildFiles (juce::File::findFiles, true, "*"))
+    {
+        ++filesScanned;
+        juce::MemoryBlock mb;
+        if (f.loadFileAsData (mb) && blockContains (mb, needle))
+        {
+            std::printf ("    key found in %s\n", f.getFileName().toRawUTF8());
+            found = true;
+        }
+    }
+    return found;
+}
+
+void testS2Loopback()
+{
+    std::printf ("S2: isLoopbackServerUrl table and exposure warning\n");
+    const char* yes[] = { "http://localhost:3011", "http://127.0.0.1:3011", "http://127.5.5.5", "http://[::1]:3011" };
+    const char* no[] = { "http://192.0.2.10:3011", "http://127.example.com", "http://0.0.0.0:3011",
+                         "http://198.51.100.1", "http://localhost.evil.com" };
+    int bad = 0;
+    for (auto* u : yes)
+    {
+        const bool r = HotStepLinkProcessor::isLoopbackServerUrl (u);
+        std::printf ("    %-28s -> %d (want 1)\n", u, (int) r);
+        bad += r ? 0 : 1;
+    }
+    for (auto* u : no)
+    {
+        const bool r = HotStepLinkProcessor::isLoopbackServerUrl (u);
+        std::printf ("    %-28s -> %d (want 0)\n", u, (int) r);
+        bad += r ? 1 : 0;
+    }
+    std::printf ("    loopback table mismatches: %d of 9\n", bad);
+    check (bad == 0, "isLoopbackServerUrl table: 4 loopback true, 5 non-loopback false");
+    const bool lanNoKey = HotStepLinkProcessor::shouldWarnExposure ("http://192.0.2.10:3011", false);
+    const bool lanKey = HotStepLinkProcessor::shouldWarnExposure ("http://192.0.2.10:3011", true);
+    const bool loopNoKey = HotStepLinkProcessor::shouldWarnExposure ("http://127.0.0.1:3011", false);
+    std::printf ("    warn: LAN no key=%d, LAN with key=%d, loopback no key=%d (want 1 0 0)\n",
+                 (int) lanNoKey, (int) lanKey, (int) loopNoKey);
+    check (lanNoKey, "LAN URL with no key warns");
+    check (! lanKey, "adding a key clears the warning");
+    check (! loopNoKey, "loopback URL with no key does not warn");
+}
+
+// Child mode "s2keylog": run with HSLINK_DEBUG_LOG=1 and TMP/TEMP pointed at a scratch
+// folder by the parent. Heartbeat + job submit against the stub with the fake key, then
+// a take added to the collection. Checks (d) and (e) here; the parent checks the log (c).
+int runS2KeyLogChild (const juce::File& tmp)
+{
+    const juce::String key (kS2FakeKey);
+    auto stub = juce::File (juce::SystemStats::getEnvironmentVariable ("HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
+    if (! stub.existsAsFile())
+    {
+        std::printf ("  [INFO] stub not found, s2keylog skipped\n");
+        return 2;
+    }
+    juce::ChildProcess server;
+    check (server.start ("node \"" + stub.getFullPathName() + "\" --ok --port 3947", 0), "stub started (port 3947)");
+    {
+        std::lock_guard<std::mutex> g (DawWorker::testCaptureLock);
+        DawWorker::testCapturedUrls.clear();
+        DawWorker::testCapturedHeaders.clear();
+        DawWorker::testCapturedRedirects.clear();
+    }
+    DawWorker::testCaptureRequests = true;
+    DawJob j;
+    {
+        DawWorker w;
+        w.setEndpoint ("http://127.0.0.1:3947", key);
+        w.setTakesFolder (tmp.getChildFile ("s2_takes"));
+        w.start();
+        DawJobRequest r;
+        r.caption = "s2 key probe";
+        r.takes = 1;
+        const int id = w.submitGenerate (r);
+        const bool fin = waitFinished (w, id, 20.0, j);
+        std::printf ("    job finished=%d state=%s takes=%d\n", (int) fin, DawJob::stateName (j.state), j.takeFiles.size());
+        check (fin && j.state == DawJob::State::done, "s2 job against the stub reaches done");
+        w.stop();
+    }
+    DawWorker::testCaptureRequests = false;
+    // (e) URL never carries the key; the header does; no redirects.
+    int n = 0, urlHits = 0, headerHits = 0, keyedReqs = 0, redirNonZero = 0;
+    {
+        std::lock_guard<std::mutex> g (DawWorker::testCaptureLock);
+        n = DawWorker::testCapturedUrls.size();
+        for (int i = 0; i < n; ++i)
+        {
+            urlHits += DawWorker::testCapturedUrls[i].contains (key) ? 1 : 0;
+            const auto& h = DawWorker::testCapturedHeaders[i];
+            keyedReqs += h.contains ("X-DAW-Key: " + key) ? 1 : 0;
+            headerHits += h.replace ("X-DAW-Key: " + key, {}).contains (key) ? 1 : 0;
+            redirNonZero += DawWorker::testCapturedRedirects[i] != 0 ? 1 : 0;
+        }
+    }
+    std::printf ("    requests captured=%d, key in URL=%d, sent as X-DAW-Key=%d, key elsewhere in headers=%d, redirects>0=%d\n",
+                 n, urlHits, keyedReqs, headerHits, redirNonZero);
+    check (n >= 2, "heartbeat and job requests were captured");
+    check (urlHits == 0, "no request URL contains the key");
+    check (keyedReqs == n && headerHits == 0, "every request carries the key only as the X-DAW-Key header");
+    check (redirNonZero == 0, "every keyed request follows 0 redirects");
+    // (d) collection and sidecars never hold the key.
+    const auto collRoot = tmp.getChildFile ("s2_coll"), stable = tmp.getChildFile ("s2_stable");
+    {
+        HotStepLinkProcessor p;
+        p.setDawKey (key);
+        p.setStableRoot (stable);
+        p.setCollectionRoot (collRoot);
+        DawJob cj = j;
+        cj.localId = 901;
+        cj.request.caption = "s2 key probe";
+        if (cj.takeFiles.isEmpty())
+        {
+            const auto f = tmp.getChildFile ("s2_dl").getChildFile ("take0.wav");
+            collWriteWav (f, 1.0);
+            cj.takeFiles.add (f);
+        }
+        p.registerTakeAndWait (cj, 0);
+        const auto takes = p.getTakes();
+        int added = 0;
+        for (const auto& t : takes)
+        {
+            const auto cr = p.addTakeToCollection (t.stable);
+            added += cr.ok ? 1 : 0;
+            if (cr.ok)
+                std::printf ("    collection sidecar: %s%c", cr.item.sidecar().getFullPathName().toRawUTF8(), 10);
+        }
+        std::printf ("    takes registered=%d, added to collection=%d%c", (int) takes.size(), added, 10);
+        check (added >= 1, "the registered take was added to the collection");
+        p.setDawKey ({});
+    }
+    // Every file under the collection, stable and session (temp root, takes) folders,
+    // and every JSON among them, counted separately so a vacuous scan shows.
+    const auto tempRootDir = juce::File (juce::SystemStats::getEnvironmentVariable ("HSLINK_TEMP_ROOT", {}));
+    const juce::File roots[] = { collRoot, stable, tempRootDir, tmp.getChildFile ("s2_takes") };
+    int scanned = 0, jsonScanned = 0, jsonHits = 0;
+    bool anyHit = false;
+    for (const auto& r : roots)
+    {
+        if (! r.isDirectory())
+            continue;
+        anyHit = s2TreeContains (r, key, scanned) || anyHit;
+        for (const auto& f : r.findChildFiles (juce::File::findFiles, true, "*.json"))
+        {
+            ++jsonScanned;
+            jsonHits += f.loadFileAsString().contains (key) ? 1 : 0;
+        }
+    }
+    std::printf ("    collection/session files scanned=%d, JSON scanned=%d, JSON with key=%d, any file with key=%d\n",
+                 scanned, jsonScanned, jsonHits, (int) anyHit);
+    check (jsonScanned >= 1, "the take left collection/session JSON to scan");
+    check (jsonHits == 0 && ! anyHit, "no sidecar, collection or session JSON contains the key");
+    server.kill();
+    return failures == 0 ? 0 : 1;
+}
+
+// S2 (a): the amber warning must stay while a non-loopback, keyless server is online.
+// The editor reads proc.getServerUrl() (set to a LAN-looking URL); the worker endpoint is
+// then pointed at the loopback stub so heartbeats really succeed. No LAN stub on this box.
+void testS2WarnWhileOnline()
+{
+    std::printf ("S2: exposure warning stays on while a remote keyless server is online\n");
+    auto stub = juce::File (juce::SystemStats::getEnvironmentVariable ("HSLINK_STUB", HSLINK_STUB_DEFAULT_PATH));
+    if (! stub.existsAsFile())
+    {
+        std::printf ("  [INFO] stub not found, skipped\n");
+        return;
+    }
+    juce::ChildProcess server;
+    check (server.start ("node \"" + stub.getFullPathName() + "\" --ok --port 3948", 0), "stub started (port 3948)");
+    {
+        HotStepLinkProcessor p;
+        p.setDawKey ({});
+        const bool set = p.setServerUrl ("http://192.0.2.50:3011");
+        auto ed = std::make_unique<HotStepLinkEditor> (p);
+        ed->setSettingsOpenForTest (true);
+        ed->runRefreshForTest();
+        const bool before = ed->exposureShownForTest();
+        p.daw.setEndpoint ("http://127.0.0.1:3948", {});
+        int hb = 0, ticks = 0, onlineTicks = 0, hiddenTicks = 0, notAmberTicks = 0;
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        while (juce::Time::getMillisecondCounterHiRes() - t0 < 8000.0)
+        {
+            juce::Thread::sleep (20);
+            ed->runRefreshForTest();
+            ++ticks;
+            const auto st = p.daw.getSnapshot();
+            hb = st.heartbeatsOk;
+            if (st.online)
+            {
+                ++onlineTicks;
+                hiddenTicks += ed->exposureShownForTest() ? 0 : 1;
+                notAmberTicks += (ed->urlOutlineForTest() == juce::Colour (0xfff59e0b)) ? 0 : 1;
+            }
+            if (onlineTicks >= 50 && hb >= 2)
+                break;
+        }
+        const bool tipOk = ed->urlTooltipForTest().contains ("Remote server with no Key");
+        std::printf ("    url set=%d, shown before=%d, ticks=%d, heartbeats ok=%d, online ticks=%d, hidden while online=%d, outline not amber=%d, tooltip ok=%d (want 1 1 _ >=2 >=50 0 0 1)\n",
+                     (int) set, (int) before, ticks, hb, onlineTicks, hiddenTicks, notAmberTicks, (int) tipOk);
+        check (set && before, "LAN URL with no key shows the warning before connecting");
+        check (hb >= 2 && onlineTicks >= 50, "the server went online and stayed online (not vacuous)");
+        check (hiddenTicks == 0 && notAmberTicks == 0 && tipOk, "warning, amber outline and tooltip stay on through connect and heartbeats");
+        ed.reset();
+    }
+    server.kill();
+}
+
+void testS2KeyNeverLeaks (const juce::File& tmp)
+{
+    std::printf ("S2: key never in debug log, collection, or URL (child process, HSLINK_DEBUG_LOG=1)\n");
+    const auto scratch = tmp.getChildFile ("s2_child_tmp");
+    scratch.deleteRecursively();
+    scratch.createDirectory();
+    const auto oldTmp = juce::SystemStats::getEnvironmentVariable ("TMP", {});
+    const auto oldTemp = juce::SystemStats::getEnvironmentVariable ("TEMP", {});
+    _putenv_s ("TMP", scratch.getFullPathName().toRawUTF8());
+    _putenv_s ("TEMP", scratch.getFullPathName().toRawUTF8());
+    _putenv_s ("HSLINK_DEBUG_LOG", "1");
+    juce::ChildProcess child;
+    const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile);
+    const bool started = child.start (juce::StringArray { exe.getFullPathName(), "s2keylog" });
+    _putenv_s ("TMP", oldTmp.toRawUTF8());
+    _putenv_s ("TEMP", oldTemp.toRawUTF8());
+    _putenv_s ("HSLINK_DEBUG_LOG", "");
+    check (started, "s2keylog child started");
+    const auto out = child.readAllProcessOutput();
+    child.waitForProcessToFinish (60000);
+    const int rc = (int) child.getExitCode();
+    std::printf ("%s", out.toRawUTF8());
+    if (rc == 2)
+    {
+        std::printf ("  [INFO] stub not found, skipped\n");
+        return;
+    }
+    check (rc == 0, "s2keylog child checks pass (URL, header, redirects, collection)");
+    juce::File log;
+    for (const auto& f : scratch.findChildFiles (juce::File::findFiles, true, "link_debug.log"))
+        log = f;
+    const auto text = log.existsAsFile() ? log.loadFileAsString() : juce::String();
+    std::printf ("    debug log %s, %d chars, lines=%d, key found=%d\n", log.existsAsFile() ? "written" : "MISSING",
+                 text.length(), juce::StringArray::fromLines (text).size(), (int) text.contains (kS2FakeKey));
+    check (text.isNotEmpty(), "the debug log was written (the check is not vacuous)");
+    check (! text.contains (kS2FakeKey), "the debug log does not contain the key");
+    scratch.deleteRecursively();
+}
+
+// effectiveTakeCount (4b2732b): server take_count never inflates a job's take total above the request
+// (MiniMax-M3 reported take_count 4 for a 1-take job and the row read 1/4).
+void testEffectiveTakeCount()
+{
+    struct C { int req, srv, want; };
+    const C cs[] = { { 1, 4, 1 }, { 4, 1, 1 }, { 4, 4, 4 }, { 0, 3, 3 }, { 2, 0, 2 } };
+    for (const auto& c : cs)
+    {
+        const int got = DawJob::effectiveTakeCount (c.req, c.srv);
+        std::printf ("  effectiveTakeCount(%d,%d) = %d (want %d)%c", c.req, c.srv, got, c.want, 10);
+        check (got == c.want, "effectiveTakeCount is min of requested and server, non-positive side ignored");
+    }
+    DawJob j;
+    j.request.takes = 1;
+    const bool ok = DawWorker::applyJobJson (R"({"id":"mm3","state":"running","take_count":4})", j);
+    std::printf ("  applyJobJson 1-take job, server take_count 4: ok=%d takeCount=%d (want 1)%c", ok ? 1 : 0, j.takeCount, 10);
+    check (ok && j.takeCount == 1, "1-take job with server take_count 4 shows 1 take total");
+}
+
+void testExportSe()
+{
+    // Export loop xN is enabled by an S/E framed section as well as by the loop bar, and
+    // renders that section. Teeth: HSLINK_TEETH=EXPORT_LOOP_ONLY (the old loop-bar-only rule).
+    using namespace TakeEditorMath;
+    const auto teethVar = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    testMutant = teethVar == "EXPORT_LOOP_ONLY" ? mutExportLoopOnly : mutNone;
+    const juce::int64 len = 384000; // 8.000 s at 48 kHz
+    struct C { juce::int64 cs, ce, ls, le; bool want; juce::int64 ws, we; const char* what; };
+    const C cs[] = { { 0, 216000, -1, -1, true, 0, 216000, "S/E 0.000-4.500 s, no loop" },
+                     { 48000, 96000, -1, -1, true, 48000, 96000, "S/E 1.000-2.000 s, no loop" },
+                     { 0, len, -1, -1, false, -1, -1, "whole take, no loop" },
+                     { 96000, 96000, -1, -1, false, -1, -1, "E == S" },
+                     { 0, len, 24000, 48000, true, 24000, 48000, "loop bar only" },
+                     { 0, 216000, 24000, 48000, true, 24000, 48000, "S/E and loop bar: the loop wins" } };
+    bool all = true;
+    for (const auto& c : cs)
+    {
+        juce::int64 s = -1, e = -1;
+        const bool got = exportLoopRange (c.cs, c.ce, c.ls, c.le, len, s, e);
+        const bool ok = got == c.want && s == c.ws && e == c.we;
+        std::printf ("  exportse %s: enabled=%d range=%lld..%lld (want %d %lld..%lld) %s%c", c.what, (int) got, (long long) s, (long long) e,
+                     (int) c.want, (long long) c.ws, (long long) c.we, ok ? "ok" : "BAD", 10);
+        all = all && ok;
+    }
+    testMutant = mutNone;
+    check (all, "exportse: S/E framing a section enables Export loop and gives its range; the loop bar wins when set");
+}
+
+// livewarp-dump <dir>: opt-in Observer renders of the live warp path on the kick/hat
+// 120 music fixture (8 s stereo). Writes preview_nowarp, preview_warp_static (markers
+// set before play), preview_warp_live (same move posted at 2.0 s), and
+// preview_warp_live_double (a second move posted during the first swap fade). Prints
+// the frame each swap was posted at. Not part of any test run.
+static int liveWarpDump (const juce::File& outDir)
+{
+    using P = HotStepLinkProcessor;
+    P::tempoMeasureEnabled = false;
+    outDir.createDirectory();
+    const double sr = 48000.0;
+    const int n = (int) (8.0 * sr);
+    juce::AudioBuffer<float> mu (2, n);
+    std::uint32_t rng = 0x12345678u;
+    auto rnd = [&rng]() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return (float) ((double) rng / 4294967295.0 * 2.0 - 1.0); };
+    const double twoPi = 6.283185307179586;
+    const double chord[3] = { 220.0, 277.18, 329.63 };
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = (double) i / sr;
+        double v = 0.0;
+        for (double f : chord)
+            for (int h = 1; h <= 4; ++h)
+                v += 0.06 / h * std::sin (twoPi * f * h * t);
+        const double beat = std::fmod (t, 0.5);
+        const double kick = beat < 0.25 ? 0.6 * std::exp (-beat * 18.0) * std::sin (twoPi * (50.0 + 90.0 * std::exp (-beat * 30.0)) * beat) : 0.0;
+        const double eighth = std::fmod (t + 0.25, 0.5);
+        const float hatN = rnd();
+        const double hat = eighth < 0.05 ? 0.15 * std::exp (-eighth * 90.0) * hatN : 0.0;
+        const float nL = rnd() * 0.001f, nR = rnd() * 0.001f;
+        mu.setSample (0, i, (float) (v + kick + hat) + nL);
+        mu.setSample (1, i, (float) (v * 0.95 + kick + hat * 0.8) + nR);
+    }
+    const auto tmpDir = outDir.getChildFile ("_work");
+    tmpDir.createDirectory();
+    const auto src = writeWav (tmpDir.getChildFile ("kick_hat_120.wav"), mu, sr);
+    const std::vector<WarpMarkers::Marker> warp { { 0, 0 }, { 4 * 48000, 4 * 48000 + 12000 }, { n, n } };  // marker at 4 s to 4.25 s
+    const std::vector<WarpMarkers::Marker> warp2 { { 0, 0 }, { 4 * 48000, 4 * 48000 + 24000 }, { n, n } }; // then to 4.5 s
+    const int block = 256;
+    auto render = [&] (const char* name, int mode) -> int
+    {
+        FakePlayHead ph;
+        auto p = std::make_unique<P>();
+        p->setStableRoot (tmpDir.getChildFile (juce::String (name) + "_stable"));
+        p->setCollectionRoot (tmpDir.getChildFile (juce::String (name) + "_coll"));
+        p->setPlayHead (&ph);
+        p->prepareToPlay (sr, block);
+        if (mode == 1)
+            p->editorAudition.setWarp (warp);
+        p->editorAudition.play (src, 0, n, n, false);
+        for (int i = 0; i < 2000 && p->editorAudition.getState() == EditorAudition::loading; ++i)
+            juce::Thread::sleep (5);
+        juce::AudioBuffer<float> out (2, n + block);
+        out.clear();
+        juce::AudioBuffer<float> buf (2, block);
+        juce::MidiBuffer midi;
+        const int editAt = (int) (2.0 * sr);
+        int done = 0, post1 = -1, post2 = -1;
+        auto waitPub = [&p] (int before) { for (int i = 0; i < 500 && p->editorAudition.ownedCountForTest() <= before; ++i) juce::Thread::sleep (10); };
+        while (done < n)
+        {
+            if (mode >= 2 && post1 < 0 && done >= editAt)
+            {
+                const int ob = p->editorAudition.ownedCountForTest();
+                p->editorAudition.setWarp (warp);
+                waitPub (ob);
+                post1 = done;
+            }
+            if (mode == 3 && post1 >= 0 && post2 < 0 && done >= post1 + 128)
+            {
+                const int ob = p->editorAudition.ownedCountForTest();
+                p->editorAudition.setWarp (warp2);
+                waitPub (ob);
+                post2 = done;
+            }
+            ph.info = juce::AudioPlayHead::PositionInfo();
+            ph.info.setBpm (120.0);
+            ph.info.setIsPlaying (false);
+            buf.clear();
+            p->processBlock (buf, midi);
+            for (int c = 0; c < 2; ++c)
+                out.copyFrom (c, done, buf, c, 0, block);
+            done += block;
+        }
+        p->editorAudition.stop();
+        p->releaseResources();
+        out.setSize (2, n, true);
+        writeWav (outDir.getChildFile (juce::String (name) + ".wav"), out, sr);
+        std::printf ("livewarp-dump: %s swap1 posted at frame %d, swap2 at frame %d%c", name, post1, post2, 10);
+        return 0;
+    };
+    render ("preview_nowarp", 0);
+    render ("preview_warp_static", 1);
+    render ("preview_warp_live", 2);
+    render ("preview_warp_live_double", 3);
+    tmpDir.deleteRecursively();
+    return 0;
+}
+
+// Live warp (7f02ed4): a warp edit while the preview plays re-renders on the pool and
+// swaps in at the play position; the panel sends once per gesture. Teeth (temporary
+// source edits, restored): LW1 setWarp stores the markers only (no re-render); LW2 the
+// panel sends on every mouseDrag; LW3 the hazardPrev release after the swap fade removed.
+static void testLiveWarp (const juce::File& tmp)
+{
+    using P = HotStepLinkProcessor;
+    std::printf ("Live warp: onset shift after a swap, pos continuity, swap step, panel sends, swap racing stop/play%c", 10);
+    const int failuresBefore = failures;
+    int checks = 0;
+    auto ck = [&checks] (bool ok, const char* what) { ++checks; check (ok, what); };
+    const bool savedMeasure = P::tempoMeasureEnabled.load();
+    P::tempoMeasureEnabled = false;
+    const auto d = tmp.getChildFile ("livewarp_test");
+    d.createDirectory();
+    const double sr = 48000.0;
+    const int kFrames = 8 * 48000;
+    // Click train: a 1 ms click (0.9) on every whole second over a 220 Hz bed (0.15).
+    juce::AudioBuffer<float> audio (2, kFrames);
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < kFrames; ++i)
+        {
+            float v = 0.15f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / sr);
+            if (i >= 48000 && i % 48000 < 48)
+                v = 0.9f;
+            audio.setSample (c, i, v);
+        }
+    const auto file = writeWav (d.getChildFile ("clicks.wav"), audio, sr);
+
+    struct LwRig
+    {
+        FakePlayHead ph;
+        std::unique_ptr<P> p;
+        int block = 256;
+        std::vector<float> out;
+        std::vector<double> fracs;
+        LwRig (const juce::File& dir, const char* tag, int blockSize) : block (blockSize)
+        {
+            p = std::make_unique<P>();
+            p->setStableRoot (dir.getChildFile (juce::String (tag) + "_stable"));
+            p->setCollectionRoot (dir.getChildFile (juce::String (tag) + "_coll"));
+            p->setPlayHead (&ph);
+            p->prepareToPlay (48000.0, block);
+        }
+        ~LwRig() { p->editorAudition.stop(); p->releaseResources(); }
+        void run (int n)
+        {
+            juce::AudioBuffer<float> buf (2, block);
+            juce::MidiBuffer midi;
+            for (int done = 0; done < n; done += block)
+            {
+                ph.info = juce::AudioPlayHead::PositionInfo();
+                ph.info.setBpm (120.0);
+                ph.info.setIsPlaying (false);
+                buf.clear();
+                p->processBlock (buf, midi);
+                out.insert (out.end(), buf.getReadPointer (0), buf.getReadPointer (0) + block);
+                fracs.push_back (p->editorAudition.getPlayFraction());
+            }
+        }
+        bool start (const juce::File& f, juce::int64 len)
+        {
+            p->editorAudition.play (f, 0, len, len, false);
+            for (int i = 0; i < 2000 && p->editorAudition.getState() == EditorAudition::loading; ++i)
+                juce::Thread::sleep (5);
+            return p->editorAudition.getState() == EditorAudition::playing;
+        }
+        // Waits (up to 5 s) for the pool to publish: a published clip adds an owned entry.
+        bool waitPublish (int ownedBefore)
+        {
+            for (int i = 0; i < 500; ++i)
+            {
+                if (p->editorAudition.ownedCountForTest() > ownedBefore)
+                    return true;
+                juce::Thread::sleep (10);
+            }
+            return false;
+        }
+    };
+    const std::vector<WarpMarkers::Marker> warp { { 0, 0 }, { 4 * 48000, 4 * 48000 + 24000 }, { kFrames, kFrames } }; // the marker at 4 s moved +0.5 s
+    auto onsetFrom = [] (const std::vector<float>& x, int from)
+    {
+        for (int i = juce::jmax (0, from); i < (int) x.size(); ++i)
+            if (std::abs (x[(size_t) i]) > 0.45f)
+                return i;
+        return -1;
+    };
+    auto maxStep = [] (const std::vector<float>& x, int a, int b)
+    {
+        float m = 0.0f;
+        for (int i = juce::jmax (1, a); i < juce::jmin ((int) x.size(), b); ++i)
+            m = juce::jmax (m, std::abs (x[(size_t) i] - x[(size_t) i - 1]));
+        return m;
+    };
+
+    // 1. Onset shift, pos continuity, swap step.
+    {
+        const int nPre = 282 * 256, nPost = 282 * 256; // about 1.5 s each side of the edit
+        LwRig a (d, "ref", 256), b (d, "swap", 256);
+        const bool okA = a.start (file, kFrames), okB = b.start (file, kFrames);
+        a.run (nPre);
+        b.run (nPre);
+        const int ownedBefore = b.p->editorAudition.ownedCountForTest();
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        b.p->editorAudition.setWarp (warp);
+        const bool published = b.waitPublish (ownedBefore);
+        const double waitMs = juce::Time::getMillisecondCounterHiRes() - t0;
+        const size_t blkSwap = b.fracs.size();
+        a.run (nPost);
+        b.run (nPost);
+        const int onA = onsetFrom (a.out, nPre), onB = onsetFrom (b.out, nPre);
+        const double shiftMs = onA >= 0 && onB >= 0 ? (double) (onB - onA) * 1000.0 / sr : -1.0;
+        bool mono = true;
+        for (size_t i = blkSwap; i < b.fracs.size(); ++i)
+            if (! (b.fracs[i] > b.fracs[i - 1] && b.fracs[i - 1] > 0.0))
+                mono = false;
+        const double adv = (b.fracs.back() - b.fracs[blkSwap - 1]) * (double) kFrames;
+        const float normal = maxStep (b.out, nPre - (int) (0.25 * sr), nPre - 480);
+        const float swapStep = maxStep (b.out, nPre - 48, nPre + 960);
+        const double ratio = normal > 0.0f ? (double) swapStep / (double) normal : 1.0e9;
+        const bool held = b.p->editorAudition.hazardPrevHeldForTest();
+        std::printf ("  1: play ok %d %d, published=%d after %.1f ms; onset pre-edit %d (%.1f ms) post-swap %d (%.1f ms): shift %.1f ms (want >= 20, expect ~250)%c",
+                     (int) okA, (int) okB, (int) published, waitMs, onA, onA * 1000.0 / sr, onB, onB * 1000.0 / sr, shiftMs, 10);
+        std::printf ("  1: pos monotonic=%d advance %.0f frames (ran %d, want >= %d) state=%d; step normal %.5f swap %.5f ratio %.2f (want <= 2.0); hazardPrev held=%d%c",
+                     (int) mono, adv, nPost, (int) (0.95 * nPost), (int) b.p->editorAudition.getState(), (double) normal, (double) swapStep, ratio, (int) held, 10);
+        ck (okA && okB && published, "livewarp 1: both previews play and the warp edit publishes a re-render");
+        ck (shiftMs >= 20.0, "livewarp 1: the onset after the swap moves by at least 20 ms against the pre-edit onset");
+        ck (mono && adv >= 0.95 * nPost && b.p->editorAudition.getState() == EditorAudition::playing, "livewarp 1: pos keeps advancing across the swap, no restart");
+        ck (ratio <= 2.0, "livewarp 1: the max sample step across the swap window is at most 2x the normal step");
+        ck (! held, "livewarp 1: hazardPrev is released after the swap fade");
+    }
+
+    // 2. Swap racing stop() then play(): no crash, the hazard released, poll clean.
+    {
+        LwRig c (d, "race", 64);
+        const bool ok = c.start (file, kFrames);
+        c.run (64 * 400);
+        const int ownedBefore = c.p->editorAudition.ownedCountForTest();
+        c.p->editorAudition.setWarp (warp);
+        const bool published = c.waitPublish (ownedBefore);
+        c.run (64); // the swap starts: its fade (240 samples) spans 4 blocks
+        const bool midSwap = c.p->editorAudition.hazardPrevHeldForTest();
+        c.p->editorAudition.stop();
+        c.run (64 * 8);
+        const bool replay = c.start (file, kFrames);
+        c.run (64 * 200);
+        c.p->editorAudition.poll();
+        const bool held = c.p->editorAudition.hazardPrevHeldForTest();
+        const int owned = c.p->editorAudition.ownedCountForTest();
+        float peak = 0.0f;
+        bool finite = true;
+        for (size_t i = c.out.size() - 64 * 200; i < c.out.size(); ++i)
+        {
+            finite = finite && std::isfinite (c.out[i]);
+            peak = juce::jmax (peak, std::abs (c.out[i]));
+        }
+        std::printf ("  2: play ok %d published %d mid-swap hazardPrev=%d; after stop+play: playing=%d hazardPrev held=%d owned after poll=%d (want 1) peak %.3f finite=%d%c",
+                     (int) ok, (int) published, (int) midSwap, (int) replay, (int) held, owned, (double) peak, (int) finite, 10);
+        ck (ok && published && midSwap, "livewarp 2: the swap is in flight when stop() lands");
+        ck (replay && finite && peak > 0.1f, "livewarp 2: play() after the raced stop plays again");
+        ck (! held && owned == 1, "livewarp 2: the swapped-out clip is released and poll frees it (one clip owned)");
+    }
+
+    // 4. W1: a non-looping preview plays to its end, then a live swap is posted before
+    // poll() runs. It must not start: silence, the clip freed, nothing owned.
+    {
+        LwRig e (d, "ended", 256);
+        e.p->editorAudition.play (file, 0, 24000, kFrames, false); // 0.5 s, no loop
+        for (int i = 0; i < 2000 && e.p->editorAudition.getState() == EditorAudition::loading; ++i)
+            juce::Thread::sleep (5);
+        const bool played = e.p->editorAudition.getState() == EditorAudition::playing;
+        e.run (256 * 120); // 0.64 s: past the end
+        float tailPeak = 0.0f;
+        for (size_t i = e.out.size() - 256 * 8; i < e.out.size(); ++i)
+            tailPeak = juce::jmax (tailPeak, std::abs (e.out[i]));
+        const int ownedBefore = e.p->editorAudition.ownedCountForTest();
+        e.p->editorAudition.setWarp (warp);
+        const bool published = e.waitPublish (ownedBefore);
+        const size_t from = e.out.size();
+        e.run (256 * 40);
+        float peak = 0.0f;
+        for (size_t i = from; i < e.out.size(); ++i)
+            peak = juce::jmax (peak, std::abs (e.out[i]));
+        const double peakDb = 20.0 * std::log10 (juce::jmax (1.0e-12, (double) peak));
+        for (int i = 0; i < 4; ++i)
+        {
+            e.p->editorAudition.poll();
+            e.run (256);
+        }
+        const int owned = e.p->editorAudition.ownedCountForTest();
+        std::printf ("  4: played %d tail peak before %.5f published %d; peak after swap post %.1f dBFS (want < -90); owned after poll %d (want 0)%c",
+                     (int) played, (double) tailPeak, (int) published, peakDb, owned, 10);
+        ck (played && published && tailPeak < 1.0e-4f, "livewarp 4: the preview ended and the live swap was published after the end");
+        ck (peakDb < -90.0, "livewarp 4: a live swap for an ended preview outputs no audio (peak < -90 dBFS)");
+        ck (owned == 0, "livewarp 4: poll frees the unstarted swap clip (owned count back to 0)");
+    }
+
+    // 5. A second warp edit while the first swap fade is in flight: no click, and the
+    // output follows the second warp (+1.0 s at 4 s: next click at ~2.5 s, not ~2.25 s).
+    {
+        const std::vector<WarpMarkers::Marker> warp2 { { 0, 0 }, { 4 * 48000, 5 * 48000 }, { kFrames, kFrames } };
+        const int nPre = 1125 * 64; // 1.5 s
+        LwRig a (d, "ref2", 64), m (d, "mid2", 64);
+        const bool okA = a.start (file, kFrames), okM = m.start (file, kFrames);
+        a.run (nPre);
+        m.run (nPre);
+        int ob = m.p->editorAudition.ownedCountForTest();
+        m.p->editorAudition.setWarp (warp);
+        const bool pub1 = m.waitPublish (ob);
+        m.run (64 * 2); // the first fade (240 samples) is about half way
+        const bool midFade = m.p->editorAudition.hazardPrevHeldForTest();
+        ob = m.p->editorAudition.ownedCountForTest();
+        m.p->editorAudition.setWarp (warp2);
+        const bool pub2 = m.waitPublish (ob);
+        const int swap2At = (int) m.out.size();
+        a.run (nPre);
+        m.run (nPre - 128);
+        const float normal = maxStep (m.out, nPre - (int) (0.25 * sr), nPre - 480);
+        const float editStep = maxStep (m.out, nPre - 48, swap2At + 960);
+        const double ratio = normal > 0.0f ? (double) editStep / (double) normal : 1.0e9;
+        const int onA = onsetFrom (a.out, nPre), onM = onsetFrom (m.out, nPre);
+        const double shiftMs = onA >= 0 && onM >= 0 ? (double) (onM - onA) * 1000.0 / sr : -1.0;
+        std::printf ("  5: play ok %d %d pub1 %d mid-fade %d pub2 %d; step normal %.5f edit window %.5f ratio %.2f (want <= 2.0); onset shift %.1f ms (want >= 400, expect ~500; first warp alone ~250)%c",
+                     (int) okA, (int) okM, (int) pub1, (int) midFade, (int) pub2, (double) normal, (double) editStep, ratio, shiftMs, 10);
+        ck (okA && okM && pub1 && midFade && pub2, "livewarp 5: the second warp is posted while the first swap fade is in flight");
+        ck (ratio <= 2.0, "livewarp 5: no click: the max sample step across both swaps is at most 2x the normal step");
+        ck (shiftMs >= 400.0, "livewarp 5: the output follows the second warp's onset");
+    }
+
+    // 6. Equal-power swap fade: at the midpoint, two uncorrelated unit-power signals sum
+    // to unit power (linear would give 0.5, -3 dB). Tolerance 0.05 (about 0.2 dB).
+    {
+        juce::uint32 st = 0x9E3779B9u;
+        auto rnd = [&st]() { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return (float) ((double) st / 4294967295.0 * 2.0 - 1.0); };
+        float gIn = 0.0f, gOut = 0.0f;
+        EditorAudition::swapFadeGains (0.5f, gIn, gOut);
+        const int nS = 200000;
+        double pa = 0.0, pb = 0.0, pm = 0.0;
+        for (int i = 0; i < nS; ++i)
+        {
+            const float x = rnd(), y = rnd();
+            const float mix = x * gIn + y * gOut;
+            pa += (double) x * x; pb += (double) y * y; pm += (double) mix * mix;
+        }
+        const double rel = pm / (0.5 * (pa + pb));
+        float gIn0, gOut0, gIn1, gOut1;
+        EditorAudition::swapFadeGains (1.0f, gIn0, gOut0);
+        EditorAudition::swapFadeGains (0.0f, gIn1, gOut1);
+        std::printf ("  6: mid gains in %.4f out %.4f; summed power / unit %.4f (want 1 +- 0.05; linear 0.5); ends: start in %.4f out %.4f, end in %.4f out %.4f%c",
+                     (double) gIn, (double) gOut, rel, (double) gIn0, (double) gOut0, (double) gIn1, (double) gOut1, 10);
+        ck (std::abs (rel - 1.0) < 0.05, "livewarp 6: equal-power swap fade keeps unit power at the midpoint");
+        ck (std::abs (gIn0) < 1.0e-6f && std::abs (gOut0 - 1.0f) < 1.0e-6f && std::abs (gIn1 - 1.0f) < 1.0e-6f && std::abs (gOut1) < 1.0e-6f,
+            "livewarp 6: the swap fade gains are exact at both ends");
+    }
+
+    // 3. Panel sends: once per drag, once per add and remove (real mouse events).
+    {
+        const int kLen = 16 * 48000;
+        juce::AudioBuffer<float> sine (2, kLen);
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < kLen; ++i)
+                sine.setSample (ch, i, 0.25f * (float) std::sin (2.0 * juce::MathConstants<double>::pi * 220.0 * i / 48000.0));
+        const auto pf = writeWav (d.getChildFile ("panel.wav"), sine, 48000.0);
+        TakeEditorPanel panel;
+        juce::uint32 clock = 1000;
+        panel.setSize (490, 566);
+        panel.clockForTest = [&clock] { return clock; };
+        panel.onSetEdit = [] (const juce::File&, const TakeEdit::EditData&) { return true; };
+        TakeEditorPanel::Take take;
+        take.temp = pf;
+        take.name = "panel.wav";
+        take.grid.bpm = 120.0;
+        take.grid.downbeatSec = 0.0;
+        take.grid.measured = true;
+        panel.open (take);
+        for (int i = 0; i < 500 && ! panel.headerReadyForTest() && ! panel.peaksFailedForTest(); ++i)
+        {
+            juce::Thread::sleep (10);
+            panel.tick();
+        }
+        panel.setWarpForTest (true);
+        panel.setSnapGridForTest (false);
+        panel.resized();
+        int sends = 0;
+        panel.onAuditionWarp = [&sends] (const std::vector<WarpMarkers::Marker>&) { ++sends; };
+        panel.onAuditionState = [] { return 2; }; // the preview plays
+        const auto lane = panel.warpLaneForTest();
+        const auto wa = panel.waveAreaForTest();
+        auto mev = [&panel] (juce::Point<int> pos, juce::ModifierKeys mods, int clicks)
+        {
+            const auto t = juce::Time::getCurrentTime();
+            return juce::MouseEvent (juce::Desktop::getInstance().getMainMouseSource(), pos.toFloat(), mods, juce::MouseInputSource::defaultPressure,
+                                     juce::MouseInputSource::defaultOrientation, juce::MouseInputSource::defaultRotation, juce::MouseInputSource::defaultTiltX,
+                                     juce::MouseInputSource::defaultTiltY, &panel, &panel, t, pos.toFloat(), t, clicks, false);
+        };
+        const auto L = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier);
+        const auto altL = juce::ModifierKeys (juce::ModifierKeys::leftButtonModifier | juce::ModifierKeys::altModifier);
+        auto& comp = static_cast<juce::Component&> (panel);
+        auto laneX = [&panel, &lane] (std::size_t i) { return lane.getX() + (int) std::floor (TakeEditorMath::xOfFrame (panel.viewForTest(), panel.warpMarkersForTest()[i].dstFrame)); };
+        const int n0 = (int) panel.warpMarkersForTest().size();
+        const auto dst0 = n0 > 2 ? panel.warpMarkersForTest()[2].dstFrame : 0;
+        const int x0 = n0 > 2 ? laneX (2) : 0, y = lane.getCentreY();
+        comp.mouseDown (mev ({ x0, y }, L, 1));
+        for (int k = 1; k <= 20; ++k)
+            comp.mouseDrag (mev ({ x0 + k, y }, L, 1));
+        const int duringDrag = sends;
+        comp.mouseUp (mev ({ x0 + 20, y }, L, 1));
+        const int dragSends = sends;
+        const auto dst1 = n0 > 2 ? panel.warpMarkersForTest()[2].dstFrame : 0;
+        std::printf ("  3: markers=%d drag 20 x mouseDrag + mouseUp: marker 2 dst %lld -> %lld, sends during drag %d, after mouseUp %d (want 1)%c",
+                     n0, (long long) dst0, (long long) dst1, duringDrag, dragSends, 10);
+        ck (n0 > 4 && dst1 != dst0, "livewarp 3: the drag moved marker 2");
+        ck (dragSends == 1, "livewarp 3: a drag of 20 mouseDrag events and one mouseUp sends the warp exactly once");
+
+        sends = 0;
+        const int n1 = (int) panel.warpMarkersForTest().size();
+        const int xa = (laneX (3) + laneX (4)) / 2;
+        comp.mouseDoubleClick (mev ({ xa, wa.getCentreY() }, L, 2));
+        const int addSends = sends;
+        const int n2 = (int) panel.warpMarkersForTest().size();
+        sends = 0;
+        const int xr = laneX (4);
+        comp.mouseDown (mev ({ xr, y }, altL, 1));
+        comp.mouseUp (mev ({ xr, y }, altL, 1));
+        const int removeSends = sends;
+        const int n3 = (int) panel.warpMarkersForTest().size();
+        std::printf ("  3: add (double-click) markers %d -> %d sends %d (want 1); remove (Alt+click) %d -> %d sends %d (want 1)%c",
+                     n1, n2, addSends, n2, n3, removeSends, 10);
+        ck (n2 == n1 + 1 && addSends == 1, "livewarp 3: adding a marker sends the warp once");
+        ck (n3 == n2 - 1 && removeSends == 1, "livewarp 3: removing a marker sends the warp once");
+        panel.onAuditionWarp = nullptr;
+        panel.onAuditionState = nullptr;
+    }
+    P::tempoMeasureEnabled = savedMeasure;
+    std::printf ("  livewarp: %d checks, %d failed%c", checks, failures - failuresBefore, 10);
+}
+
 int main (int argc, char** argv)
 {
     std::setvbuf (stdout, nullptr, _IONBF, 0); // a crash must not hide the last lines
     SetUnhandledExceptionFilter (hslinkCrashFilter);
+    // Never the real user settings: the redirect is in place before anything can read the
+    // key store. A path the caller set is kept; one this exe made up itself (marked with
+    // HSLINK_SETTINGS_FILE_AUTO, also seen by its child modes) is replaced by the run's own
+    // scratch path further down, as before.
+    const bool settingsFromCaller = juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {}).isNotEmpty()
+                                    && juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE_AUTO", {}) != "1";
+    if (juce::SystemStats::getEnvironmentVariable ("HSLINK_SETTINGS_FILE", {}).isEmpty())
+    {
+        _putenv_s ("HSLINK_SETTINGS_FILE", juce::File::getSpecialLocation (juce::File::tempDirectory)
+                                               .getChildFile ("hslink_tests_" + juce::String ((int) GetCurrentProcessId()))
+                                               .getChildFile ("key_store").getChildFile ("LINK.settings").getFullPathName().toRawUTF8());
+        _putenv_s ("HSLINK_SETTINGS_FILE_AUTO", "1");
+    }
     // Offline switch (o131): nothing in this exe talks to a real HOT-Step server on
     // port 3001 unless a live mode is asked for by name. Set before any processor exists.
     DawWorker::testNoLiveServer = ! (argc > 1 && (juce::String (argv[1]) == "live" || juce::String (argv[1]) == "liveswitch" || juce::String (argv[1]) == "r4"));
@@ -31127,22 +38156,42 @@ int main (int argc, char** argv)
         juce::Thread::sleep (30000);
         return 0;
     }
+    if (argc > 4 && juce::String (argv[1]) == "--settings-helper")
+    {
+        juce::ScopedJuceInitialiser_GUI helperInit;
+        return runSettingsHelper (juce::String (argv[2]), juce::String::fromUTF8 (argv[3]), juce::String (argv[4]).getIntValue());
+    }
     juce::ScopedJuceInitialiser_GUI init;
-    // liveswitch only: the key the plugin would send, read before the settings file is
-    // redirected below. Never printed.
+    // liveswitch only: the key the plugin would send. Read through the redirect set at the
+    // top of main, so it is empty unless the caller set HSLINK_SETTINGS_FILE. Never printed.
     const bool liveSwitch = argc > 1 && juce::String (argv[1]) == "liveswitch";
     const juce::String liveStoredKey = liveSwitch ? HotStepLinkProcessor::loadStoredKey() : juce::String();
     r2ApplyGlobalTeeth();
     auto tmp = juce::File::getSpecialLocation (juce::File::tempDirectory)
                    .getChildFile ("hslink_tests_" + juce::String ((int) GetCurrentProcessId())); // C: temp, removed at exit
+    // D0 proof shots: HSLINK_SHOT_SCRATCH (absolute) moves the whole scratch state (settings,
+    // collection, temp, stable roots) into a folder the caller owns, e.g. a scratch folder of its own.
+    {
+        const auto shotScratch = juce::SystemStats::getEnvironmentVariable ("HSLINK_SHOT_SCRATCH", {});
+        if (argc > 1 && (juce::String (argv[1]) == "editor-shot" || juce::String (argv[1]) == "keynote") && shotScratch.isNotEmpty() && juce::File::isAbsolutePath (shotScratch))
+            tmp = juce::File (shotScratch).getChildFile ("hslink_shot_" + juce::String ((int) GetCurrentProcessId()));
+    }
     tmp.createDirectory();
     auto tempRoot = tmp.getChildFile ("temp_root");
     tempRoot.createDirectory();
     _putenv_s ("HSLINK_TEMP_ROOT", tempRoot.getFullPathName().toRawUTF8()); // never touch the real temp
-    _putenv_s ("HSLINK_STABLE_ROOT", tmp.getChildFile ("stable_env").getFullPathName().toRawUTF8()); // never the real Documents folder
-    _putenv_s ("HSLINK_SETTINGS_FILE", tmp.getChildFile ("key_store").getChildFile ("LINK.settings").getFullPathName().toRawUTF8()); // never the real user settings
+    _putenv_s ("HSLINK_TAKES_ROOT", tmp.getChildFile ("stable_env").getFullPathName().toRawUTF8()); // never the real Documents folder
+    if (! settingsFromCaller)
+    {
+        _putenv_s ("HSLINK_SETTINGS_FILE", tmp.getChildFile ("key_store").getChildFile ("LINK.settings").getFullPathName().toRawUTF8()); // never the real user settings
+        _putenv_s ("HSLINK_SETTINGS_FILE_AUTO", "1");
+    }
+    std::printf ("settings file in use: %s%c", HotStepLinkProcessor::keyStoreFile().getFullPathName().toRawUTF8(), 10);
     if (argc > 2 && juce::String (argv[1]) == "editor-shot")
     {
+        // D0: the Collection never reads or writes the real Documents folder in a shot.
+        _putenv_s ("HSLINK_COLLECTION_ROOT", tmp.getChildFile ("collection").getFullPathName().toRawUTF8());
+        std::printf ("editor-shot: scratch %s%c", tmp.getFullPathName().toRawUTF8(), 10);
         const int rc = runEditorShot (argc, argv, tmp);
         tmp.deleteRecursively();
         return rc;
@@ -31152,6 +38201,21 @@ int main (int argc, char** argv)
         const int rc = runAuditionDump (argc, argv, tmp);
         tmp.deleteRecursively();
         return rc;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "s2keylog")
+    {
+        const int rc = runS2KeyLogChild (tmp);
+        tmp.deleteRecursively();
+        return rc;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "s2")
+    {
+        testS2Loopback();
+        testS2WarnWhileOnline();
+        testS2KeyNeverLeaks (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
     }
     if (argc > 1 && juce::String (argv[1]) == "uid")
     {
@@ -31242,6 +38306,95 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && juce::String (argv[1]) == "confpct")
+    {
+        testConfPct (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "refhintview")
+    {
+        testRefHintView (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "srclabel")
+    {
+        testSourceLabel (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "settingslock")
+    {
+        testSettingsLock (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "keynote")
+    {
+        testKeyNote (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && (juce::String (argv[1]) == "keyreveal" || juce::String (argv[1]) == "weightsmsg"))
+    {
+        const int c0 = checksRun;
+        if (juce::String (argv[1]) == "keyreveal")
+            testKeyReveal (tmp);
+        else
+            testWeightsMsg (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s: %d checks, %d failed%c", argv[1], checksRun - c0, failures, 10);
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "keysave")
+    {
+        testKeySave (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "refhint")
+    {
+        testRefHintSettings (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "reflock")
+    {
+        testRefLock (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 3 && juce::String (argv[1]) == "guardcopy")
+    {
+        // Test-side only: writes a hot source (997 Hz, -0.1 dBFS, 24 bit) to argv[2] and
+        // its PeakGuard::guardCopy to argv[3], for a cross-check with an outside meter.
+        const juce::File src { juce::String (argv[2]) }, dest { juce::String (argv[3]) };
+        juce::WavAudioFormat wf;
+        igWrite (wf, src, 48000.0, 24, false, pgSine (48000.0, 997.0, 0.3, juce::Decibels::decibelsToGain (-0.1f), 48000 * 5));
+        dest.deleteFile();
+        const auto res = PeakGuard::guardCopy (src, dest);
+        std::printf ("guardcopy ok=%d reason='%s' source %.4f dBTP gain %.4f dB; reread: source %.4f dBTP, copy %.4f dBTP (target %.3f)%c",
+                     (int) res.ok, res.reason.toRawUTF8(), res.truePeakDb, res.gainDb, igAnyTp (src), igAnyTp (dest), PeakGuard::kImportTargetDbtp, 10);
+        tmp.deleteRecursively();
+        return res.ok ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "importguard")
+    {
+        testImportGuard (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "peakguard")
     {
         testPeakGuard (tmp);
@@ -31276,6 +38429,13 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && juce::String (argv[1]) == "dawlive") // DAW worker vs stub only (checks 29/30)
+    {
+        testDawWorkerLive();
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "longreq")
     {
         testLongRequests (tmp);
@@ -31286,6 +38446,13 @@ int main (int argc, char** argv)
     if (argc > 1 && juce::String (argv[1]) == "backend")
     {
         testBackendSwitch (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && juce::String (argv[1]) == "backendcaps")
+    {
+        testBackendCaps();
         tmp.deleteRecursively();
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
@@ -31367,6 +38534,13 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
+    if (argc > 1 && juce::String (argv[1]) == "tempofix")
+    {
+        testTempoFix();
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
     if (argc > 1 && juce::String (argv[1]) == "temporestore")
     {
         testTempoRestore (tmp);
@@ -31414,14 +38588,22 @@ int main (int argc, char** argv)
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
-    if (argc > 1 && juce::String (argv[1]) == "edit")
+    if (argc > 1 && juce::String (argv[1]) == "warpcutpin")
     {
-        testEdit (tmp);
+        testWarpCutPin (tmp);
         tmp.deleteRecursively();
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
     }
-    if (argc > 1 && (juce::String (argv[1]) == "offline" || juce::String (argv[1]) == "editticket" || juce::String (argv[1]) == "takeeditor" || juce::String (argv[1]) == "takezoom" || juce::String (argv[1]) == "takemarkers" || juce::String (argv[1]) == "takeexport" || juce::String (argv[1]) == "midiexport" || juce::String (argv[1]) == "takeloop" || juce::String (argv[1]) == "readouts1" || juce::String (argv[1]) == "readouts2" || juce::String (argv[1]) == "takesnap" || juce::String (argv[1]) == "takegrid" || juce::String (argv[1]) == "takebody" || juce::String (argv[1]) == "takequant" || juce::String (argv[1]) == "takeundo" || juce::String (argv[1]) == "takefit" || juce::String (argv[1]) == "loopexport" || juce::String (argv[1]) == "editoraudition" || juce::String (argv[1]) == "levelrow" || juce::String (argv[1]) == "levelfit" || juce::String (argv[1]) == "reverse" || juce::String (argv[1]) == "morelikefit" || juce::String (argv[1]) == "focusselect" || juce::String (argv[1]) == "takestate"))
+    if (argc > 1 && juce::String (argv[1]) == "edit")
+    {
+        testEdit (tmp);
+        testWarpCropLength (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 1 && (juce::String (argv[1]) == "offline" || juce::String (argv[1]) == "editticket" || juce::String (argv[1]) == "takeeditor" || juce::String (argv[1]) == "takezoom" || juce::String (argv[1]) == "takemarkers" || juce::String (argv[1]) == "takeexport" || juce::String (argv[1]) == "midiexport" || juce::String (argv[1]) == "takeloop" || juce::String (argv[1]) == "exportse" || juce::String (argv[1]) == "readouts1" || juce::String (argv[1]) == "readouts2" || juce::String (argv[1]) == "takesnap" || juce::String (argv[1]) == "takegrid" || juce::String (argv[1]) == "takebody" || juce::String (argv[1]) == "takequant" || juce::String (argv[1]) == "takeundo" || juce::String (argv[1]) == "takefit" || juce::String (argv[1]) == "loopexport" || juce::String (argv[1]) == "editoraudition" || juce::String (argv[1]) == "levelrow" || juce::String (argv[1]) == "levelfit" || juce::String (argv[1]) == "reverse" || juce::String (argv[1]) == "morelikefit" || juce::String (argv[1]) == "focusselect" || juce::String (argv[1]) == "takestate" || juce::String (argv[1]) == "autogrid"))
     {
         if (juce::String (argv[1]) == "offline")
             testOfflineSwitch();
@@ -31450,6 +38632,8 @@ int main (int argc, char** argv)
             testTakeEditor (tmp);
         else if (juce::String (argv[1]) == "takeloop")
             testTakeLoop (tmp);
+        else if (juce::String (argv[1]) == "exportse")
+            testExportSe();
         else if (juce::String (argv[1]) == "readouts1")
             testReadouts1();
         else if (juce::String (argv[1]) == "readouts2")
@@ -31470,12 +38654,25 @@ int main (int argc, char** argv)
             testLoopExport (tmp);
         else if (juce::String (argv[1]) == "morelikefit")
             testMoreLikeFits();
+        else if (juce::String (argv[1]) == "takesclamp")
+            testTakesClampBackend();
         else if (juce::String (argv[1]) == "focusselect")
             testFocusSelect (tmp);
         else if (juce::String (argv[1]) == "takestate")
             testTakeState (tmp);
+        else if (juce::String (argv[1]) == "autogrid")
+            testAutoGrid();
         else
             testEditTicket (tmp);
+        tmp.deleteRecursively();
+        std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc > 2 && juce::String (argv[1]) == "livewarp-dump")
+        return liveWarpDump (juce::File (juce::String (argv[2])));
+    if (argc > 1 && juce::String (argv[1]) == "livewarp")
+    {
+        testLiveWarp (tmp);
         tmp.deleteRecursively();
         std::printf ("%s (%d failures)%c", failures == 0 ? "ALL PASS" : "FAILED", failures, 10);
         return failures == 0 ? 0 : 1;
@@ -31583,7 +38780,7 @@ int main (int argc, char** argv)
     if (argc > 1 && juce::String (argv[1]) != "r6" && juce::String (argv[1]) != "shutdown")
     {
         // Every other group or tool name has returned above: this one is not known (before o138 the whole suite ran).
-        std::fprintf (stderr, "HSLINK_Tests: unknown group or tool '%s' (or too few arguments for it). Valid: ab acemodel backend collection deletedfolder edit editoraudition levelrow editticket key labels liveness longreq loopexport nopoll offline peaks pill queue r6 roles seed shutdown split stretch submitrace takedelete takeeditor takefit takebody takequant takeundo takeloop readouts1 readouts2 takes focusselect takestate takesnap tempo tempofallback uid; offlinelocal; live, liveswitch; tools crop-file, loop-check, stretch-gen, stretch-file, tempo-scan, editor-shot. No argument runs everything.%c", argv[1], 10);
+        std::fprintf (stderr, "HSLINK_Tests: unknown group or tool '%s' (or too few arguments for it). Valid: ab acemodel autogrid backend collection deletedfolder edit editoraudition levelrow editticket key keynote keyreveal labels liveness longreq loopexport nopoll offline peaks pill queue r6 refhint refhintview roles seed shutdown split stretch submitrace takedelete takeeditor takefit takebody takequant takeundo takeloop exportse readouts1 readouts2 takes focusselect takestate takesnap tempo tempofallback uid weightsmsg; offlinelocal; live, liveswitch; tools crop-file, loop-check, stretch-gen, stretch-file, tempo-scan, editor-shot. No argument runs everything.%c", argv[1], 10);
         tmp.deleteRecursively();
         return 2;
     }
@@ -31639,8 +38836,12 @@ int main (int argc, char** argv)
     }
     testPreviewPeaks();
     testWarpMarkers();
+    testIgnoredSettings();
     testStableTakes (tmp);
     testKeyStorage (tmp);
+    testS2Loopback();
+    testS2WarnWhileOnline();
+    testS2KeyNeverLeaks (tmp);
     testSeedKeyRequest();
     testSeedLimit();
     testDragFileUsable (tmp);
@@ -31661,15 +38862,19 @@ int main (int argc, char** argv)
     testUnderstandTagsAndMeter();
     testTempo (tmp);
     testTempoRestore (tmp);
+    testTempoFix();
     testDerivedTempo (tmp);
     testTempoFallback (tmp);
     // testRephase(); // off: rephase is off by design, see W2 in docs/KNOWN_ISSUES.md
     testTempoHostAndStretchToken (tmp);
     testStretch (tmp);
     testEdit (tmp);
+    testWarpCropLength (tmp);
+    testWarpCutPin (tmp);
     testEditTicket (tmp);
     testTakeEditor (tmp);
     testTakeLoop (tmp);
+    testExportSe();
     testReadouts1();
     testReadouts2 (tmp);
     testTakeSnap (tmp);
@@ -31681,25 +38886,38 @@ int main (int argc, char** argv)
     testTakeZoom (tmp);
     testTakeWarpDraw (tmp);
     testLoopExport (tmp);
+    testTakeExport (tmp); // in the default run since 2026-11-16: it failed unseen as a subset only
     testEditorAudition (tmp);
     testLevelRow (tmp);
     testReverse (tmp);
     testLevelFit();
     testL1PreviewStopped();
     testServerUrlOverride();
+    testServerUrlValidation();
     testVersionFooter();
     testGuidanceStepsPure();
     testGuidanceStepsState();
     testParamTextRoundTrip();
     testStateRejectsGarbage();
     testMoreLikeFits();
+    testFitCurveC();
+    testDownbeatGate();
+    testTakesClampBackend();
     testPeakGuard (tmp);
     testPeakNormalise (tmp);
     testOfflineSwitch();
     testOfflineLocal (tmp);
     testFocusSelect (tmp);
     testTakeState (tmp);
+    testAutoGrid();
+    testRefHintSettings (tmp);
+    testRefHintView (tmp);
+    testSourceLabel (tmp);
+    testKeySave (tmp);
+    testKeyReveal (tmp);
+    testWeightsMsg (tmp);
     testItDefaultOutDir();
+    testEffectiveTakeCount();
     testIntegration (tmp); // skipped unless HSLINK_IT_URL is set
     tmp.deleteRecursively();
     std::printf ("%s (%d failures)\n", failures == 0 ? "ALL PASS" : "FAILED", failures);

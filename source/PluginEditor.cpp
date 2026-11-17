@@ -5,6 +5,7 @@
 #include "WavTempoTag.h"
 #include "TakeStretch.h"
 #include "MidiExport.h"
+#include "ChordExport.h"
 #include "TempoMeasure.h"
 
 namespace
@@ -13,6 +14,13 @@ namespace
     const juce::Colour kBright (0xfff3f5fa), kDim (0xff7c859d), kField (0xff0a0d16), kEdge (0x38a0aac8);
     const juce::Colour kAmberA (0xfffbbf24), kAmberB (0xfff59e0b), kOk (0xff86efac), kBad (0xfffca5a5);
     const juce::Colour kLav (0xffc4b5fd);
+    // Text alpha of a Backend menu entry the server does not list. The entry stays an
+    // active choice, so it has to stay readable: WCAG contrast 5.40:1 on the menu
+    // background (0.4 gave 3.09:1; a listed entry has 13.15:1). On the highlight bar
+    // the same 0.6 gives only 4.20:1, so the highlighted row uses 0.7: 5.13:1, against
+    // 11.05:1 for a listed entry there. The role cards keep their own dimming.
+    const float kUnlistedItemAlpha = 0.6f;
+    const float kUnlistedItemAlphaOnBar = 0.7f;
 }
 
 //==============================================================================
@@ -73,6 +81,24 @@ void HslinkLook::drawButtonBackground (juce::Graphics& g, juce::Button& b, const
     auto fill = on ? kAccent.withAlpha (0.14f) : kField;
     if (over) fill = fill.brighter (0.15f);
     if (down) fill = fill.brighter (0.25f);
+    if (b.getComponentID() == "zoomglyph")
+    {
+        // R40: the body carries the state, the glyph never dims. Enabled: lifted fill and a
+        // brighter border; disabled: flat fill and a faint border.
+        // C5: one body for both glyphs whatever the state (no lit pill on +).
+        g.setColour (b.isEnabled() ? fill : kField);
+        g.fillRoundedRectangle (r, 5.0f);
+        g.setColour (kEdge.withMultipliedAlpha (0.4f));
+        g.drawRoundedRectangle (r, 5.0f, 1.0f);
+        return;
+    }
+    // D1a: a pink action marked "solid" (Send to takes with a framed region) is a filled accent pill.
+    if (b.getComponentID() == "pink" && b.isEnabled() && (bool) b.getProperties().getWithDefault ("solid", false))
+    {
+        g.setColour (over ? kAccent.brighter (down ? 0.25f : 0.12f) : kAccent);
+        g.fillRoundedRectangle (r, 5.0f);
+        return;
+    }
     g.setColour (fill);
     g.fillRoundedRectangle (r, 5.0f);
     const bool pink = on || b.getComponentID() == "pink";
@@ -85,7 +111,9 @@ void HslinkLook::drawButtonText (juce::Graphics& g, juce::TextButton& b, bool, b
     const bool gen = b.getComponentID() == "generate";
     juce::Colour c = gen ? juce::Colour (0xff1a1205)
                          : (b.getToggleState() || b.getComponentID() == "pink" ? kAccent : kText);
-    if (! b.isEnabled())
+    if (b.getComponentID() == "pink" && b.isEnabled() && (bool) b.getProperties().getWithDefault ("solid", false))
+        c = kBg; // D1a: dark text on the solid accent pill
+    if (! b.isEnabled() && b.getComponentID() != "zoomglyph") // R40: the zoom - and + glyphs stay kText at full alpha
         c = gen ? c.withAlpha (0.5f) : kDim.withAlpha (0.6f);
     g.setColour (c);
     g.setFont (juce::FontOptions (gen ? 17.0f : 12.0f, juce::Font::bold));
@@ -109,7 +137,9 @@ void HslinkLook::drawButtonText (juce::Graphics& g, juce::TextButton& b, bool, b
         return;
     }
     // Fitted, not ellipsed: a long label in a narrow button shrinks instead of clipping.
-    g.drawFittedText (t, b.getLocalBounds().reduced (4, 0), juce::Justification::centred, 1, 0.75f);
+    // Numbox step buttons are 16 wide (inventory "Cards"): a 4 px pad left 8 px and ellipsed "+".
+    const int padX = b.getWidth() < 24 ? 0 : 4;
+    g.drawFittedText (t, b.getLocalBounds().reduced (padX, 0), juce::Justification::centred, 1, 0.75f);
 }
 
 float HotStepLinkEditor::moreLikeLabelWidth (const juce::String& text)
@@ -122,18 +152,24 @@ float HotStepLinkEditor::moreLikeLabelWidth (const juce::String& text)
 
 juce::String HotStepLinkEditor::moreLikeTextFor (const juce::String& takeLabel, float availWidth)
 {
+#if defined (HSLINK_TEST_HOOKS)
     const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
     // Teeth only (HSLINK_TEETH=OLD_MORE_LIKE): the old long label that clipped in the button.
     if (teeth == "OLD_MORE_LIKE")
         return takeLabel.isEmpty() ? juce::String ("+4 MORE LIKE TAKE") : "+4 MORE LIKE " + takeLabel.toUpperCase();
+#endif
     if (takeLabel.isEmpty())
         return moreLikeLabelWidth ("+4 MORE LIKE") <= availWidth ? juce::String ("+4 MORE LIKE") : juce::String ("+4 LIKE");
     auto t = takeLabel.toUpperCase();
     if (t.startsWith ("TAKE"))
         t = "T" + t.substring (4).trimStart();
     const juce::String withId = "+4 LIKE " + t;
+#if defined (HSLINK_TEST_HOOKS)
     // Teeth only (HSLINK_TEETH=MORELIKE_NO_FIT): always keep the id, whatever the width.
-    if (teeth == "MORELIKE_NO_FIT" || moreLikeLabelWidth (withId) <= availWidth)
+    if (teeth == "MORELIKE_NO_FIT")
+        return withId;
+#endif
+    if (moreLikeLabelWidth (withId) <= availWidth)
         return withId;
     // The id does not fit at the button's real width: drop it rather than clip.
     return moreLikeLabelWidth ("+4 MORE LIKE") <= availWidth ? juce::String ("+4 MORE LIKE") : juce::String ("+4 LIKE");
@@ -153,6 +189,15 @@ void HslinkLook::drawComboBox (juce::Graphics& g, int w, int h, bool, int, int, 
     g.fillPath (p);
 }
 
+void HslinkLook::positionComboBoxText (juce::ComboBox& box, juce::Label& label)
+{
+    // C2: the text runs up to the arrow (the default margin cut short values to '...').
+    label.setBounds (1, 1, juce::jmax (0, box.getWidth() - 17), box.getHeight() - 2); // C3d: arrow spans w-16..w-8
+    label.setBorderSize (juce::BorderSize<int> (0, 4, 0, 0));
+    label.setFont (getComboBoxFont (box));
+    label.setMinimumHorizontalScale (1.0f);
+}
+
 void HslinkLook::fillTextEditorBackground (juce::Graphics& g, int w, int h, juce::TextEditor&)
 {
     g.setColour (kField);
@@ -161,13 +206,25 @@ void HslinkLook::fillTextEditorBackground (juce::Graphics& g, int w, int h, juce
 
 void HslinkLook::drawTextEditorOutline (juce::Graphics& g, int w, int h, juce::TextEditor& e)
 {
+    if (e.isColourSpecified (juce::TextEditor::outlineColourId))
+    {
+        const auto c = e.findColour (juce::TextEditor::outlineColourId);
+        if (c != kEdge)
+        {
+            g.setColour (c);
+            g.drawRoundedRectangle (1.0f, 1.0f, (float) w - 2.0f, (float) h - 2.0f, 4.0f, 2.0f);
+            return;
+        }
+    }
     g.setColour (e.hasKeyboardFocus (true) ? kAccent.withAlpha (0.7f) : kEdge);
     g.drawRoundedRectangle (0.5f, 0.5f, (float) w - 1.0f, (float) h - 1.0f, 4.0f, 1.0f);
 }
 
 void HslinkLook::drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h, float pos, float, float,
-                                   juce::Slider::SliderStyle, juce::Slider&)
+                                   juce::Slider::SliderStyle style, juce::Slider&)
 {
+    if (style == juce::Slider::LinearBar || style == juce::Slider::LinearBarVertical)
+        return; // C2: bar sliders are LCD value boxes, the text alone shows the value
     const float cy = (float) y + (float) h * 0.5f;
     auto track = juce::Rectangle<float> ((float) x, cy - 2.0f, (float) w, 4.0f);
     g.setColour (kField.brighter (0.25f));
@@ -210,6 +267,38 @@ void HslinkLook::drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h
     g.drawLine ({ base, tip }, 2.0f);
 }
 
+void HslinkLook::drawPopupMenuItem (juce::Graphics& g, const juce::Rectangle<int>& area, bool isSeparator, bool isActive,
+                                    bool isHighlighted, bool isTicked, bool hasSubMenu, const juce::String& text,
+                                    const juce::String& shortcut, const juce::Drawable* icon, const juce::Colour* textColour)
+{
+    juce::Colour onBar;
+    if (textColour != nullptr && isHighlighted && isActive && ! isSeparator)
+    {
+        // Same highlight bar as the base class, but the item's own colour stays. A
+        // marked Backend entry gets its highlight-bar alpha (the bar is brighter than
+        // the menu background, so the same alpha would read below 4.5:1 there).
+        g.setColour (findColour (juce::PopupMenu::highlightedBackgroundColourId));
+        g.fillRect (area.reduced (1));
+        isHighlighted = false;
+        bool lift = *textColour == unlistedItemColour (false);
+#if defined (HSLINK_TEST_HOOKS)
+        lift = lift && ! testNoHighlightLift; // teeth: the code before
+#endif
+        if (lift)
+        {
+            onBar = unlistedItemColour (true);
+            textColour = &onBar;
+        }
+    }
+    juce::LookAndFeel_V4::drawPopupMenuItem (g, area, isSeparator, isActive, isHighlighted, isTicked, hasSubMenu,
+                                             text, shortcut, icon, textColour);
+}
+
+juce::Colour HslinkLook::unlistedItemColour (bool onHighlightBar)
+{
+    return kText.withAlpha (onHighlightBar ? kUnlistedItemAlphaOnBar : kUnlistedItemAlpha);
+}
+
 juce::Font HslinkLook::getLabelFont (juce::Label& l)
 {
     return l.getFont();
@@ -240,6 +329,10 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     syncLabel.setFont (juce::FontOptions (11.0f));
     syncLabel.setColour (juce::Label::textColourId, kDim.brighter (0.2f));
     addAndMakeVisible (syncLabel);
+    exposureLabel.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+    exposureLabel.setColour (juce::Label::textColourId, kAmberA);
+    exposureLabel.setJustificationType (juce::Justification::centredRight);
+    addChildComponent (exposureLabel);
 
     auto caption = [this] (juce::Label& l, const char* t)
     {
@@ -258,22 +351,22 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     caption (guidanceCaption, "Guidance");
     caption (stepsCaption, "Steps");
     caption (bpmCaption, "BPM");
-    caption (modeCaption, "Mode");
+    caption (modeCaption, "Mode / strength");
     caption (captionCaption, "Caption");
 
     captionEditor.setTextToShowWhenEmpty ("describe the music", kText.withAlpha (0.4f));
-    captionEditor.setText (proc.getCaption(), false);
     captionEditor.onTextChange = [this] { proc.setCaption (captionEditor.getText()); };
     addAndMakeVisible (captionEditor);
+    captionEditor.setText (proc.getCaption(), false); // after parenting: the text takes the theme colour, not the default look's
 
     caption (lyricsCaption, "Lyrics");
     lyricsEditor.setMultiLine (true, true);
     lyricsEditor.setReturnKeyStartsNewLine (true);
     lyricsEditor.setScrollbarsShown (true);
     lyricsEditor.setTextToShowWhenEmpty ("optional, e.g. [verse] ... (empty = instrumental)", kText.withAlpha (0.4f));
-    lyricsEditor.setText (proc.getLyrics(), false);
     lyricsEditor.onTextChange = [this] { proc.setLyrics (lyricsEditor.getText()); };
     addAndMakeVisible (lyricsEditor);
+    lyricsEditor.setText (proc.getLyrics(), false); // after parenting (theme text colour)
     instrumentalButton.setToggleState (proc.getInstrumental(), juce::dontSendNotification);
     lyricsEditor.setEnabled (! proc.getInstrumental());
     instrumentalButton.onClick = [this]
@@ -310,6 +403,36 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     modeBox.addItem ("lego", 3);
     modeBox.setSelectedId (1, juce::dontSendNotification);
     addAndMakeVisible (modeBox);
+    strengthEditor.setInputRestrictions (4, "0123456789.");
+    strengthEditor.setJustification (juce::Justification::centred);
+    strengthEditor.setText (juce::String (proc.getCoverStrength(), 2), false);
+    strengthEditor.setTooltip ("Reference strength (cover_strength), 0.0 to 1.0. ACE-Step only.");
+    {
+        auto commit = [this]
+        {
+            const double v = juce::jlimit (0.0, 1.0, strengthEditor.getText().getDoubleValue());
+            proc.setCoverStrength (v);
+            strengthEditor.setText (juce::String (v, 2), false);
+        };
+        strengthEditor.onReturnKey = commit;
+        strengthEditor.onFocusLost = commit;
+    }
+    addAndMakeVisible (strengthEditor);
+    refLockNote.setText ("pick a backend to use reference audio", juce::dontSendNotification);
+    refLockNote.setFont (juce::FontOptions (10.0f));
+    refLockNote.setJustificationType (juce::Justification::centredRight);
+    refLockNote.setMinimumHorizontalScale (0.6f);
+    // kDim measured 4.19:1 from pixels at this size on the popover plate; 15 % toward kText reads 4.5:1 or better.
+    refLockNote.setColour (juce::Label::textColourId, kDim.interpolatedWith (kText, 0.15f));
+    addChildComponent (refLockNote);
+    // Same pattern as the Mode-row note: right-aligned in the "DAW key" caption row, warning colour.
+    keySaveNote.setFont (juce::FontOptions (10.0f));
+    keySaveNote.setJustificationType (juce::Justification::centredRight);
+    keySaveNote.setMinimumHorizontalScale (1.0f); // never squeezed: the text is chosen to fit (keySaveNoteTextFor)
+    keySaveNote.setBorderSize (juce::BorderSize<int> (1, 0, 1, 5));
+    keySaveNote.setColour (juce::Label::textColourId, kAmberA);
+    keySaveNote.setInterceptsMouseClicks (false, false);
+    addChildComponent (keySaveNote);
 
     serverLabel.setColour (juce::Label::textColourId, kBright);
     serverLabel.setFont (juce::FontOptions (11.5f, juce::Font::bold));
@@ -339,7 +462,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     // Warp to host: the real host tempo only (B4). The manual tempo is not a host tempo.
     takeEditor.onWarpHostBpm = [this]
     {
-        if (TakeEditorMath::testMutant.load() == TakeEditorMath::mutWarpResetsNoHost)
+        if (TakeEditorMath::teMutant (TakeEditorMath::mutWarpResetsNoHost))
             return fitHostBpm (standalone, proc.hostSync, proc.getManualBpm()); // teeth: the B3 bug
         return (standalone || ! proc.hostSync.hostSyncActive.load (std::memory_order_relaxed)) ? 0.0 : proc.hostSync.tempoForCascade();
     };
@@ -373,8 +496,9 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     editTakeButton.setEnabled (false);
     addAndMakeVisible (editTakeButton);
 
-    urlEditor.setText (proc.getServerUrl(), false);
-    urlEditor.onTextChange = [this] { proc.setServerUrl (urlEditor.getText().trim()); };
+    // Check and save on Return or focus loss only; a bad value keeps the saved URL.
+    urlEditor.onReturnKey = [this] { commitServerUrl(); };
+    urlEditor.onFocusLost = [this] { commitServerUrl(); };
     if (HotStepLinkProcessor::serverUrlOverride().isNotEmpty())
     {
         // HSLINK_SERVER_URL is set: show the override read-only so typing cannot change state.
@@ -383,11 +507,28 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
         urlEditor.setTooltip ("Server URL set by HSLINK_SERVER_URL (launch override, not saved)");
     }
     addAndMakeVisible (urlEditor);
+    // Text is set after parenting: a TextEditor colours text when it is inserted, and before
+    // it has a parent it only sees the default look and feel (white), not the theme's kBright.
+    urlEditor.setText (proc.getServerUrl(), false);
 
     keyEditor.setPasswordCharacter ((juce::juce_wchar) '*');
-    keyEditor.setText (proc.getDawKey(), false);
-    keyEditor.onTextChange = [this] { proc.setDawKey (keyEditor.getText().trim()); };
+    keyEditor.onTextChange = [this]
+    {
+        bool saveTried = false;
+        const bool stored = proc.setDawKey (keyEditor.getText().trim(), &saveTried);
+        noteKeySave (saveTried, stored);
+        updateExposureWarning();
+    };
+#if defined (HSLINK_TEST_HOOKS)
+    if (testKeyRevealMutant == 4) // teeth 4: the old order, text before the field has a parent
+        keyEditor.setText (proc.getDawKey(), false);
+#endif
     addAndMakeVisible (keyEditor);
+    keyEditor.setText (proc.getDawKey(), false); // after parenting (theme text colour), no notification, no save
+    keyRevealButton.onClick = [this] { setKeyRevealed (! keyRevealed); };
+    addAndMakeVisible (keyRevealButton);
+    setKeyRevealed (false);
+    updateExposureWarning();
 
     if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("backend")))
         backendBox.addItemList (choice->choices, 1);
@@ -406,6 +547,11 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     }
     durationAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "duration", durationSlider);
     takesAtt = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "takes", takesSlider);
+    // Every backend change (combo, role tile, preset, automation) re-applies the Takes limit.
+    proc.apvts.addParameterListener ("backend", this);
+    applyTakesLimit (false);
+    applyIgnoredSettings();
+    applyBackendRefLock();
     // Knob row (Mockup A): GUIDANCE, STEPS, VARIATION as rotaries, value readout below.
     for (auto* s : { &variationKnob, &guidanceKnob, &stepsKnob })
     {
@@ -541,8 +687,15 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     exportWavButton.onClick = [this] { exportWav(); };
     addAndMakeVisible (exportWavButton);
     exportMidiButton.setEnabled (false);
-    exportMidiButton.setTooltip ("Write a tempo map (bar markers) and a hits file (one GM drum note per detected hit: kick, snare, hats or perc) "
-                                 "as MIDI beside the selected take");
+    exportMidiButton.setTooltip ("Write the parts picked in the MIDI picker (v) beside the selected take: drums (one GM drum note per "
+                                 "detected hit), melody (tonal takes), chords (with the key), a tempo map (bar markers), "
+                                 "or all of them as one multitrack file");
+    exportMidiMenuButton.setTooltip ("Pick what Export MIDI and the MIDI drag chip write");
+    exportMidiMenuButton.setClickingTogglesState (false);
+    exportMidiMenuButton.onClick = [this] { setMidiPickerOpen (! midiPicker.isVisible()); };
+    addAndMakeVisible (exportMidiMenuButton);
+    midiPicker.closeButton.onClick = [this] { setMidiPickerOpen (false); };
+    addChildComponent (midiPicker);
     exportMidiButton.onClick = [this] { exportMidi(); };
     quantizeBox.addItem ("Q Off", 1);
     quantizeBox.addItem ("Q 1/16", 2);
@@ -562,7 +715,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     showExportButton.onClick = [this] { if (lastExportFile.exists()) lastExportFile.revealToUser(); };
     addChildComponent (showExportButton);
     addAndMakeVisible (exportMidiButton);
-    midiDrag.setTooltip ("Drag the selected take's MIDI files (hits + tempo map) into the DAW. "
+    midiDrag.setTooltip ("Drag the selected take's MIDI files (the parts picked in the MIDI picker) into the DAW. "
                          "Built on the fly when Export MIDI has not been run.");
     midiDrag.filesFor = [this] { return midiFilesForSelection(); };
     midiDrag.requestBuild = [this] { return buildMidiForDrag(); };
@@ -619,7 +772,11 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     };
     addAndMakeVisible (captureNowButton);
     sourceCaption.setVisible (false); // the SOURCE panel header is painted
-    sourceWave.setTooltip ("Captured source clip (repaint / lego)");
+    refHintSeen = HotStepLinkProcessor::loadRefHintSeen();
+    sourceWave.setRefHint (! refHintSeen, standalone);
+    sourceWave.onRefHintDismiss = [this] { dismissRefHint(); };
+    sourceWave.setTooltip (refHintSeen ? "Captured source clip (repaint / lego)"
+                                       : "Captured source clip (repaint / lego). Click the hint to hide it");
     addAndMakeVisible (sourceWave);
     dropButton.setTooltip ("Pick a WAV as the repaint / lego source, or drop one on the window");
     dropButton.onClick = [this]
@@ -671,7 +828,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
                                    : "repaint region = host loop, relative to the capture start",
                         juce::dontSendNotification);
     addAndMakeVisible (regionInfo);
-    modeBox.onChange = [this] { proc.setModeId (modeBox.getSelectedId()); refreshJob(); };
+    modeBox.onChange = [this] { proc.setModeId (modeBox.getSelectedId()); if (proc.getSelectedBackendId() == "ace") proc.setAceModeId (modeBox.getSelectedId()); refreshJob(); };
     manualBpm.onValueChange = [this] { proc.setManualBpm (manualBpm.getValue()); };
 
     // Presets + A/B
@@ -694,7 +851,8 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
         if (name.isNotEmpty() && proc.savePreset (name))
             refreshPresetList (name);
     };
-    reanalyzeButton.setTooltip ("Run the understand job on the current source (capture or dropped WAV)");
+    reanalyzeButton.setTooltip ("Run the understand job on the current source (capture or dropped WAV). "
+                                "Fills KEY, TEMPO EST. and tags only; Generate does not use them");
     reanalyzeButton.onClick = [this]
     {
         const auto f = proc.getSourceFile();
@@ -747,6 +905,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
         collectionPanel.setSelectedFile (proc.audition.getSelected());
     };
     addAndMakeVisible (collectionPanel);
+#if defined (HSLINK_TEST_HOOKS)
     if (standalone)
     {
         // Test hook (standalone): HSLINK_COLLECTION_FILTER = sa3 / yue2 / ace / starred / text:<words>.
@@ -763,6 +922,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
         if (hook.isNotEmpty())
             collectionPanel.setChips (c);
     }
+#endif
     if (proc.getCollectionGeneration() != 0)
         refreshCollectionPanel(); // reopened editor: show the cached list at once
     proc.requestCollectionRefresh();
@@ -774,6 +934,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
     setResizable (true, true);
     setResizeLimits (kMinWindowW, kMinWindowH, 1920, 1300);
     // Test hook (standalone): HSLINK_PREVIEW_WAV preselects a local WAV for the preview.
+#if defined (HSLINK_TEST_HOOKS)
     if (standalone)
     {
         const auto hook = juce::SystemStats::getEnvironmentVariable ("HSLINK_PREVIEW_WAV", {});
@@ -784,11 +945,15 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
         if (juce::SystemStats::getEnvironmentVariable ("HSLINK_DEBUG_SEED_TAKES", {}) == "1")
             seedDebugTakes();
     }
+#endif
     // SETTINGS popover: move the SETUP form into it. addChildComponent keeps each
     // control's own visibility (standalone-only fields stay hidden in the plugin).
     for (juce::Component* c : { (juce::Component*) &urlCaption, (juce::Component*) &urlEditor,
                                 (juce::Component*) &keyCaption, (juce::Component*) &keyEditor,
+                                (juce::Component*) &keyRevealButton,
+                                (juce::Component*) &keySaveNote,
                                 (juce::Component*) &modeCaption, (juce::Component*) &modeBox,
+                                (juce::Component*) &strengthEditor, (juce::Component*) &refLockNote,
                                 (juce::Component*) &backendCaption, (juce::Component*) &backendBox,
                                 (juce::Component*) &aceModelCaption, (juce::Component*) &aceModelBox,
                                 (juce::Component*) &regionCaption, (juce::Component*) &regionStartEditor,
@@ -804,7 +969,7 @@ HotStepLinkEditor::HotStepLinkEditor (HotStepLinkProcessor& p)
 
     if (standalone)
         parseShotArgs (juce::JUCEApplicationBase::getCommandLineParameters());
-    setSize (1180, 760);
+    setSize (kMinWindowW, kMinWindowH);
 }
 
 void SettingsPopover::paint (juce::Graphics& g)
@@ -819,9 +984,175 @@ void SettingsPopover::paint (juce::Graphics& g)
     g.drawText ("SETTINGS", getLocalBounds().reduced (12, 8).removeFromTop (20), juce::Justification::centredLeft);
 }
 
+MidiExportPopover::MidiExportPopover()
+{
+    struct Tip { juce::TextButton* b; bool on; const char* tip; };
+    for (const auto& t : { Tip { &drumsButton, true, "Drums: one GM drum note per detected hit (_hits.mid)" },
+                           Tip { &melodyButton, true, "Melody (auto): pitched notes, skipped with a reason when the take is not tonal (_melody.mid)" },
+                           Tip { &chordsButton, true, "Chords (auto): chords and the key, skipped with a reason when none is found (_chords.mid)" },
+                           Tip { &perBeatButton, false, "Chords per bar (off) or per beat (on); the label shows the current choice" },
+                           Tip { &tempoButton, true, "Tempo map with bar markers (_tempo.mid; takes with a tempo only)" },
+                           Tip { &oneFileButton, false, "A file per part (off) or one multitrack file, _multitrack.mid (on); the label shows the current choice" } })
+    {
+        t.b->setClickingTogglesState (true);
+        t.b->setToggleState (t.on, juce::dontSendNotification);
+        t.b->setTooltip (t.tip);
+        addAndMakeVisible (*t.b);
+    }
+    // Two-way choices say their current state in words (an unlit "One file" read as nothing).
+    auto words = [this]
+    {
+        oneFileButton.setButtonText (oneFileButton.getToggleState() ? "One file" : "Separate files");
+        perBeatButton.setButtonText (perBeatButton.getToggleState() ? "Per beat" : "Per bar");
+    };
+    oneFileButton.onClick = words;
+    perBeatButton.onClick = words;
+    words();
+    addAndMakeVisible (closeButton);
+}
+
+void MidiExportPopover::paint (juce::Graphics& g)
+{
+    // Same hardware card as the SETTINGS popover.
+    auto b = getLocalBounds().toFloat();
+    g.setColour (juce::Colour (0xff141826));
+    g.fillRoundedRectangle (b, 6.0f);
+    g.setColour (juce::Colour (0xffe0559a).withAlpha (0.6f));
+    g.drawRoundedRectangle (b.reduced (0.5f), 6.0f, 1.0f);
+    g.setColour (juce::Colour (0xffd8dbe6));
+    g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+    g.drawText ("MIDI EXPORT", getLocalBounds().reduced (12, 10).removeFromTop (24), juce::Justification::centredLeft);
+}
+
+void MidiExportPopover::resized()
+{
+    // 2 columns x 3 rows of 24 px lit buttons, 6 px gaps; Close in the header row.
+    auto a = getLocalBounds().reduced (12, 10);
+    closeButton.setBounds (a.removeFromTop (24).removeFromRight (64));
+    a.removeFromTop (8);
+    const int gap = 6, colW = (a.getWidth() - gap) / 2;
+    juce::TextButton* rows[3][2] = { { &drumsButton, &tempoButton }, { &melodyButton, &chordsButton },
+                                     { &oneFileButton, &perBeatButton } };
+    for (int r = 0; r < 3; ++r)
+    {
+        auto row = a.removeFromTop (24);
+        rows[r][0]->setBounds (row.removeFromLeft (colW));
+        rows[r][1]->setBounds (row.removeFromRight (colW));
+        a.removeFromTop (gap);
+    }
+}
+
+void HotStepLinkEditor::setMidiPickerOpen (bool open)
+{
+    midiPicker.setVisible (open);
+    exportMidiMenuButton.setToggleState (open, juce::dontSendNotification);
+    if (open)
+        midiPicker.toFront (false);
+}
+
+void HotStepLinkEditor::applyMidiPicker (MidiBuildInputs& in) const
+{
+    in.drums = midiPicker.drumsButton.getToggleState();
+    in.melody = midiPicker.melodyButton.getToggleState();
+    in.chords = midiPicker.chordsButton.getToggleState();
+    in.chordMode = midiPicker.perBeatButton.getToggleState() ? 1 : 0;
+    in.tempo = midiPicker.tempoButton.getToggleState();
+    in.combined = midiPicker.oneFileButton.getToggleState();
+}
+
+void HotStepLinkEditor::setKeyRevealed (bool revealed)
+{
+    // Display only: the stored key and the field text are not touched, nothing is saved.
+    keyRevealed = revealed;
+#if defined (HSLINK_TEST_HOOKS)
+    if (testKeyRevealMutant == 3)
+        HotStepLinkProcessor::saveStoredKey (proc.getDawKey() + "-M3"); // teeth: the toggle writes the settings file
+    if (testKeyRevealMutant != 1) // teeth 1: the field stays as it was
+#endif
+    keyEditor.setPasswordCharacter (revealed ? (juce::juce_wchar) 0 : (juce::juce_wchar) '*');
+    keyRevealButton.setButtonText (revealed ? "Hide" : "Show");
+    keyRevealButton.setTooltip (revealed ? "Hide the DAW key again (shown as stars)"
+                                         : "Show the DAW key as plain text. This does not change or save it");
+    keyRevealButton.setTitle (revealed ? "Hide DAW key" : "Show DAW key");
+}
+
+void HotStepLinkEditor::JobLabel::setStatus (const juce::String& shown, const juce::String& full)
+{
+    inSetStatus = true;
+    setText (shown, juce::dontSendNotification);
+    inSetStatus = false;
+    fullText = full;
+    updateTip();
+}
+
+void HotStepLinkEditor::JobLabel::textWasChanged()
+{
+    if (inSetStatus)
+        return; // setStatus sets the tooltip once the full text is stored
+    fullText.clear(); // a plain setText: the line is all the text there is
+    updateTip();
+}
+
+void HotStepLinkEditor::JobLabel::resized()
+{
+    juce::Label::resized();
+    updateTip(); // whether the line fits depends on the box
+}
+
+bool HotStepLinkEditor::JobLabel::lineIsCut() const
+{
+    const auto box = getBorderSize().subtractedFrom (getLocalBounds());
+    if (box.getWidth() <= 2 || box.getHeight() <= 0 || getText().isEmpty())
+        return false;
+    const auto font = getFont();
+    juce::AttributedString as;
+    as.append (getText(), font);
+    juce::TextLayout tl;
+    tl.createLayout (as, (float) box.getWidth() - 2.0f);
+    const int maxLines = juce::jmax (1, (int) ((float) box.getHeight() / font.getHeight()));
+    return tl.getNumLines() > maxLines || tl.getWidth() > (float) box.getWidth();
+}
+
+void HotStepLinkEditor::JobLabel::updateTip()
+{
+    const auto shown = getText();
+    const bool fuller = fullText.isNotEmpty() && fullText != shown;
+#if defined (HSLINK_TEST_HOOKS)
+    if (testKeyRevealMutant == 8) // teeth 8: no tooltip
+        return;
+    if (testKeyRevealMutant == 9) // teeth 9: the full text is ignored
+    {
+        setTooltip (lineIsCut() ? shown : juce::String());
+        return;
+    }
+    if (testKeyRevealMutant == 10) // teeth 10: always a tooltip, the line's own text
+    {
+        setTooltip (fuller ? fullText : shown);
+        return;
+    }
+#endif
+    // Only when there is more to read than the line shows; a short line has no tooltip.
+    setTooltip (fuller ? fullText : lineIsCut() ? shown : juce::String());
+}
+
+void HotStepLinkEditor::visibilityChanged()
+{
+#if defined (HSLINK_TEST_HOOKS)
+    if (testKeyRevealMutant == 5) // teeth 5: a hidden editor keeps the shown key
+        return;
+#endif
+    // A host can hide the editor without destroying it: the key must not come back shown.
+    if (! isVisible() && keyRevealed)
+        setKeyRevealed (false); // display only, nothing is saved
+}
+
 void HotStepLinkEditor::setSettingsOpen (bool open)
 {
     settingsPopover.setVisible (open);
+#if defined (HSLINK_TEST_HOOKS)
+    if (testKeyRevealMutant != 2) // teeth 2: the panel keeps the shown state
+#endif
+    setKeyRevealed (false); // the key is masked again whenever the panel opens or closes
     settingsButton.setToggleState (open, juce::dontSendNotification);
     if (open)
         settingsPopover.toFront (false);
@@ -854,6 +1185,7 @@ void HotStepLinkEditor::refreshUnderstand()
 
 HotStepLinkEditor::~HotStepLinkEditor()
 {
+    proc.apvts.removeParameterListener ("backend", this);
     proc.previewPlay.store (false); // L1: preview stops when the editor closes
     proc.commitTakeDelete(); // no Undo button any more: the pending delete is moved to its Deleted folder (pool thread)
     if (keyHost != nullptr)
@@ -861,7 +1193,9 @@ HotStepLinkEditor::~HotStepLinkEditor()
     setLookAndFeel (nullptr);
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> HotStepLinkEditor::testNoTopLevelKeys { false };
+#endif
 
 void HotStepLinkEditor::parentHierarchyChanged()
 {
@@ -878,7 +1212,12 @@ void HotStepLinkEditor::parentHierarchyChanged()
 bool HotStepLinkEditor::keyPressed (const juce::KeyPress& k, juce::Component*)
 {
     auto* f = juce::Component::getCurrentlyFocusedComponent();
-    if (testNoTopLevelKeys.load() || ! takeEditor.isOpen() || ! takeEditor.isShowing())
+#if defined (HSLINK_TEST_HOOKS)
+    const bool noTopLevelKeys = testNoTopLevelKeys.load();
+#else
+    const bool noTopLevelKeys = false;
+#endif
+    if (noTopLevelKeys || ! takeEditor.isOpen() || ! takeEditor.isShowing())
         return false;
     for (auto* c = f; c != nullptr; c = c->getParentComponent())
         if (dynamic_cast<juce::TextEditor*> (c) != nullptr)
@@ -904,6 +1243,15 @@ void HotStepLinkEditor::refreshSyncReadout()
             repaint (syncPanel);
         }
     }
+    if (takesNote.isNotEmpty())
+    {
+        if (juce::Time::getMillisecondCounter() < takesNoteUntilMs)
+        {
+            syncLabel.setText (takesNote, juce::dontSendNotification);
+            return;
+        }
+        takesNote.clear();
+    }
     if (standalone || ! s.hostSyncActive.load (std::memory_order_relaxed))
     {
         syncLabel.setText (standalone ? "Host sync: off (standalone, manual BPM/key)"
@@ -913,6 +1261,56 @@ void HotStepLinkEditor::refreshSyncReadout()
     }
 
     syncLabel.setText (syncReadoutText (s), juce::dontSendNotification);
+}
+
+void HotStepLinkEditor::parameterChanged (const juce::String&, float)
+{
+    juce::Component::SafePointer<HotStepLinkEditor> safe (this);
+    juce::MessageManager::callAsync ([safe] { if (safe != nullptr) { safe->applyTakesLimit (true); safe->applyIgnoredSettings(); safe->applyBackendRefLock(); } });
+}
+
+// Takes range and value follow the selected backend's per-request limit. Message thread.
+void HotStepLinkEditor::applyTakesLimit (bool announce)
+{
+    const auto id = proc.getSelectedBackendId();
+    const int mx = DawJobRequest::maxTakesForBackend (id);
+    auto* p = proc.apvts.getParameter ("takes");
+    if (p == nullptr)
+        return;
+    const auto range = proc.apvts.getParameterRange ("takes");
+    const int cur = juce::roundToInt (range.convertFrom0to1 (p->getValue()));
+    const int top = mx > 0 ? juce::jmin (mx, (int) range.end) : (int) range.end;
+    if (top > (int) range.start)
+        takesSlider.setRange (range.start, (double) top, 1.0);
+    takesSlider.setEnabled (top > (int) range.start);
+    const auto note = DawJobRequest::takesClampNote (cur, id);
+    if (note.isNotEmpty())
+    {
+        p->setValueNotifyingHost (range.convertTo0to1 ((float) DawJobRequest::clampTakesForBackend (cur, id)));
+        if (announce)
+        {
+            takesNote = note;
+            takesNoteUntilMs = juce::Time::getMillisecondCounter() + 6000;
+            syncLabel.setText (note, juce::dontSendNotification);
+        }
+    }
+}
+
+// Controls the selected backend ignores are greyed with a tooltip; re-enabled on switch.
+void HotStepLinkEditor::applyIgnoredSettings()
+{
+    const auto id = proc.getSelectedBackendId();
+    const auto ign = DawJobRequest::ignoredFieldsForBackend (id);
+    auto apply = [&] (juce::Slider& s, juce::uint32 bit)
+    {
+        const bool off = (ign & bit) != 0;
+        s.setEnabled (! off);
+        s.setTooltip (off ? DawJobRequest::ignoredFieldsNote (bit, id) : juce::String());
+    };
+    apply (durationSlider, DawJobRequest::ignDuration);
+    apply (guidanceKnob, DawJobRequest::ignGuidance);
+    apply (stepsKnob, DawJobRequest::ignSteps);
+    apply (variationKnob, DawJobRequest::ignVariation);
 }
 
 juce::String HotStepLinkEditor::syncTempoCellText (bool isStandalone, const HostSyncState& s)
@@ -1024,7 +1422,12 @@ void HotStepLinkEditor::refreshServerStatus()
         lastServerOnline = ! offline; // "not known offline": Connecting... does not block
         refreshJob(); // re-run the Generate gate
     }
-    const bool showOverlay = offline && (! takeEditor.isVisible() || offlineMutantForTest == mutOverlayFullWindow);
+#if defined (HSLINK_TEST_HOOKS)
+    const bool overlayFullWindow = offlineMutantForTest == mutOverlayFullWindow;
+#else
+    const bool overlayFullWindow = false;
+#endif
+    const bool showOverlay = offline && (! takeEditor.isVisible() || overlayFullWindow);
     if (showOverlay)
         overlay.setMessage (url, st.lastError, st.recentAttempts);
     if (overlay.isVisible() != showOverlay)
@@ -1035,6 +1438,75 @@ void HotStepLinkEditor::refreshServerStatus()
     }
     applyModeGating (st);
     applyAceModelGating (st.online && st.baseAvailable);
+#if defined (HSLINK_TEST_HOOKS)
+    if (DawWorker::testCapsMutant.load() == DawWorker::capsMutSkipApply)
+        return;
+#endif
+    applyBackendAvailability (st);
+}
+
+void HotStepLinkEditor::applyBackendAvailability (const DawStatus& st)
+{
+    // The list counts only while its server is online; offline nothing is marked.
+    const bool known = st.online && st.backendsKnown;
+    const int n = juce::jmin (HotStepLinkProcessor::kBackendChoices, backendBox.getNumItems());
+    const int sel = backendBox.getSelectedItemIndex();
+    const auto key = (known ? "k|" : "u|") + st.backendIds.joinIntoString (",") + "|" + juce::String (sel);
+    if (key == lastBackendAvailKey)
+        return;
+    lastBackendAvailKey = key;
+    // Soft marking: every item stays enabled and can be picked. An unlisted entry only
+    // gets the dimmed text colour (kUnlistedItemAlpha) in the open menu. Item text and
+    // ids are not touched, so the parameter mapping is unchanged.
+    bool legacyDisable = false;
+#if defined (HSLINK_TEST_HOOKS)
+    legacyDisable = DawWorker::testCapsMutant.load() == DawWorker::capsMutItemsDisabled; // teeth: the hard gate
+#endif
+    if (auto* menu = backendBox.getRootMenu())
+        for (juce::PopupMenu::MenuItemIterator it (*menu, true); it.next();)
+        {
+            auto& item = it.getItem();
+            if (item.itemID < 1 || item.itemID > n)
+                continue;
+            const bool avail = HotStepLinkProcessor::backendAvailable (item.itemID - 1, known, st.backendIds);
+            item.colour = (avail || legacyDisable) ? juce::Colour() : HslinkLook::unlistedItemColour (false);
+            item.isEnabled = avail || ! legacyDisable;
+        }
+    unsigned dim = 0;
+    for (int c = 0; c < RoleCards::kCount; ++c) // card c sets backend choice c + 1
+        if (! HotStepLinkProcessor::backendAvailable (c + 1, known, st.backendIds))
+            dim |= 1u << c;
+    roleCards.setDimmed (dim);
+    auto tip = HotStepLinkProcessor::backendPickerTooltip (known, st.backendIds);
+    const auto note = HotStepLinkProcessor::backendUnlistedNote (sel, known, st.backendIds);
+#if defined (HSLINK_TEST_HOOKS)
+    if (note.isNotEmpty() && DawWorker::testCapsMutant.load() == DawWorker::capsMutAutoReset)
+        if (auto* bp = proc.apvts.getParameter ("backend"))
+            bp->setValueNotifyingHost (0.0f); // teeth: the unlisted choice is put back to Auto
+#endif
+    if (note.isNotEmpty())
+    {
+        // The selection is kept and Generate is not blocked; the status line says it once
+        // and the picker text stays amber while it holds.
+        tip = "Selected: " + note + "." + (tip.isEmpty() ? juce::String() : "\n" + tip);
+        takesNote = note;
+        takesNoteUntilMs = juce::Time::getMillisecondCounter() + 8000;
+        syncLabel.setText (note, juce::dontSendNotification);
+    }
+    backendBox.setTooltip (tip);
+    if (note.isNotEmpty())
+        backendBox.setColour (juce::ComboBox::textColourId, kAmberA);
+    else
+        backendBox.removeColour (juce::ComboBox::textColourId); // back to the look-and-feel colour
+}
+
+bool HotStepLinkEditor::backendItemMarked (int index)
+{
+    if (auto* menu = backendBox.getRootMenu())
+        for (juce::PopupMenu::MenuItemIterator it (*menu, true); it.next();)
+            if (it.getItem().itemID == index + 1)
+                return it.getItem().colour != juce::Colour();
+    return false;
 }
 
 void HotStepLinkEditor::applyAceModelGating (bool baseOk)
@@ -1261,6 +1733,7 @@ void HotStepLinkEditor::loadTakeIntoSlot (const juce::String& key, int slot)
     collectionPanel.showNote (c->label + " settings loaded into slot " + juce::String (slot == 0 ? "A" : "B"), false);
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 void HotStepLinkEditor::seedDebugTakes()
 {
     const auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("hslink_debug_takes");
@@ -1308,6 +1781,7 @@ void HotStepLinkEditor::seedDebugTakes()
     }
     refreshTakes();
 }
+#endif
 
 void HotStepLinkEditor::refreshSource()
 {
@@ -1315,6 +1789,8 @@ void HotStepLinkEditor::refreshSource()
     const bool armed = proc.isArmed();
     if (captureButton.getToggleState() != armed)
         captureButton.setToggleState (armed, juce::dontSendNotification);
+    if (! refHintSeen && proc.firstCaptureDone())
+        dismissRefHint(); // first capture: same as a click (the flag is already saved, no second write)
     sourceWave.setRecording (proc.isRecordingSource());
     sourceWave.setSource (proc.getSourceFile(), proc.getSourceLengthS(), proc.getSourceBpm());
     sourceWave.poll();
@@ -1406,10 +1882,18 @@ bool HotStepLinkEditor::addTakeFromFile (const juce::File& f)
             return false;
         }
     }
-    if (! proc.addShotTake (f))
+    const auto added = proc.addShotTakeChecked (f);
+    if (added == HotStepLinkProcessor::AddTake::duplicate || added == HotStepLinkProcessor::AddTake::refused)
     {
-        jobLabel.setText ("Already in the take list: " + f.getFileName(), juce::dontSendNotification);
+        jobLabel.setText ((added == HotStepLinkProcessor::AddTake::duplicate ? "Already in the take list: " : "Take not added: ")
+                              + f.getFileName(),
+                          juce::dontSendNotification);
         return false;
+    }
+    if (added == HotStepLinkProcessor::AddTake::pending)
+    {
+        jobLabel.setText ("Adding take (peak guard)...", juce::dontSendNotification); // the result line comes from takeImportMessage
+        return true;
     }
     jobLabel.setText ("Added take: " + f.getFileName(), juce::dontSendNotification);
     refreshTakes();
@@ -1464,6 +1948,8 @@ void HotStepLinkEditor::tick (bool periodic)
         const auto failed = proc.takeTakeDeleteMessage();
         if (failed.isNotEmpty())
             collectionPanel.showNote (failed, true, 8000);
+        if (const auto imported = proc.takeImportMessage(); imported.isNotEmpty())
+            jobLabel.setText (imported, juce::dontSendNotification); // a guarded import finished
         refreshTakes();
     }
 }
@@ -1491,6 +1977,7 @@ void HotStepLinkEditor::refreshJob()
     DawJob j;
     const bool have = currentJob != 0 && proc.daw.getJob (currentJob, j);
     juce::String t ("Idle");
+    juce::String tFull; // the same line with the uncut error, when there is one
     double prog = 0.0;
     if (have)
     {
@@ -1514,7 +2001,11 @@ void HotStepLinkEditor::refreshJob()
         if (const auto seedPart = DawJob::seedText (j.takeSeeds); seedPart.isNotEmpty())
             t << "  " << seedPart;
         if (j.error.isNotEmpty())
+        {
+            if (const auto whole = DawJob::fullErrorText (j); whole != j.error)
+                tFull = t + "  " + whole;
             t << "  " << j.error;
+        }
     }
     const bool active = have && ! j.isFinished();
     const bool needSrc = HotStepLinkProcessor::modeNeedsSource (modeBox.getText());
@@ -1526,10 +2017,11 @@ void HotStepLinkEditor::refreshJob()
                                      : modeBox.getText() + " needs a source clip first: "
                                            + (standalone ? "drop a WAV" : "arm Capture and play the host"));
     cancelButton.setEnabled (active && ! j.cancelRequested);
-    if (t != lastJobText)
+    if (t != lastJobText || tFull != lastJobFull)
     {
         lastJobText = t;
-        jobLabel.setText (t, juce::dontSendNotification);
+        lastJobFull = tFull;
+        jobLabel.setStatus (t, tFull);
     }
     if (prog != jobProgress)
     {
@@ -1579,7 +2071,12 @@ void HotStepLinkEditor::refreshQueue()
     queueList.setCards (cards, selectedJob);
     // The QUEUE header count and the job card title are painted by the editor:
     // repaint when either changes, else they stay at 0 / "No job yet".
-    if (! noHeaderRepaintForTest && (queueList.getNumActiveCards() != lastQueueCountShown || currentJob != lastJobCardShown))
+#if defined (HSLINK_TEST_HOOKS)
+    const bool noHeaderRepaint = noHeaderRepaintForTest;
+#else
+    const bool noHeaderRepaint = false;
+#endif
+    if (! noHeaderRepaint && (queueList.getNumActiveCards() != lastQueueCountShown || currentJob != lastJobCardShown))
     {
         lastQueueCountShown = queueList.getNumActiveCards();
         lastJobCardShown = currentJob;
@@ -1646,6 +2143,15 @@ void HotStepLinkEditor::refreshTakes()
         juce::StringArray now;
         for (const auto& cell : takeModel.cells)
         {
+            // A take that registerTake is still handing over (listed, its bytes still
+            // in <name>.wav.part) is not known yet: selecting it now would find no
+            // file. It counts as arrived on the first refresh after the hand-over.
+            bool inHandOver = cell.handingOver;
+#if defined (HSLINK_TEST_HOOKS)
+            inHandOver = inHandOver && ! testSelectInHandOver; // teeth: the code before
+#endif
+            if (inHandOver)
+                continue;
             now.add (cell.key);
             if (takeKeysSeeded && cell.shown && ! knownTakeKeys.contains (cell.key))
                 arrived = cell.key;
@@ -1667,13 +2173,28 @@ void HotStepLinkEditor::refreshTakes()
         // An open take editor does not block it (Apply crop, stretch, Export loop add a
         // take while it is open): the new take is selected for audition, and the editor
         // stays on the take it edits.
-        if (arrived.isNotEmpty() && ! (openEditorBlocksSelectForTest && takeEditor.isOpen()) && ! noAutoSelectForTest)
+#if defined (HSLINK_TEST_HOOKS)
+        const bool noHeaderRepaint = noHeaderRepaintForTest;
+#else
+        const bool noHeaderRepaint = false;
+#endif
+#if defined (HSLINK_TEST_HOOKS)
+        const bool openEditorBlocksSelect = openEditorBlocksSelectForTest;
+#else
+        const bool openEditorBlocksSelect = false;
+#endif
+#if defined (HSLINK_TEST_HOOKS)
+        const bool noAutoSelect = noAutoSelectForTest;
+#else
+        const bool noAutoSelect = false;
+#endif
+        if (arrived.isNotEmpty() && ! (openEditorBlocksSelect && takeEditor.isOpen()) && ! noAutoSelect)
         {
             const auto before = proc.audition.getSelected();
             selectTake (arrived); // refreshes the whole take area itself
             if (proc.audition.getSelected() != before)
             {
-                if (! noHeaderRepaintForTest && takeList.getNumCells() != lastTakeCountShown)
+                if (! noHeaderRepaint && takeList.getNumCells() != lastTakeCountShown)
                 {
                     lastTakeCountShown = takeList.getNumCells();
                     repaint();
@@ -1686,7 +2207,12 @@ void HotStepLinkEditor::refreshTakes()
                        "Not saved: could not write to " + notice.stableFolder
                            + ". Kept in a temporary folder; you can still audition it and use Export WAV."
                              " Dragging to the DAW is off until it is saved.");
-    if (takeList.getNumCells() != lastTakeCountShown)
+#if defined (HSLINK_TEST_HOOKS)
+    const bool noHeaderRepaint = noHeaderRepaintForTest;
+#else
+    const bool noHeaderRepaint = false;
+#endif
+    if (! noHeaderRepaint && takeList.getNumCells() != lastTakeCountShown)
     {
         // The TAKES header count is painted by the editor: repaint in the same call.
         lastTakeCountShown = takeList.getNumCells();
@@ -1712,6 +2238,7 @@ void HotStepLinkEditor::refreshTakes()
             {
                 const auto fc = withFitBars (cell, takeEditor.userFitBpm());
                 takeEditor.setLiveGrid (takeEditorGridOf (fc), editorTempoText (fc));
+                takeEditor.setLiveTempo (cell.tempoState == HslinkTakeEntry::tempoMeasured ? cell.tempo : TempoMeasure::Result {});
             }
         }
         editTakeButton.setEnabled (anySelected && ! selMissing);
@@ -1735,7 +2262,7 @@ void HotStepLinkEditor::refreshTakes()
                                          : juce::String ("Four new takes near the selected take (seeds just past its seed)");
         if (moreLikeButton.getTooltip() != moreTip)
             moreLikeButton.setTooltip (moreTip);
-        if (takeEditor.isOpen() && ! editedListed && TakeEditorMath::testMutant.load() != TakeEditorMath::mutNoSelfClose)
+        if (takeEditor.isOpen() && ! editedListed && ! TakeEditorMath::teMutant (TakeEditorMath::mutNoSelfClose))
             closeTakeEditor (false);
     }
     const auto noticeText = notice.text();
@@ -1767,8 +2294,13 @@ void HotStepLinkEditor::refreshTakes()
         bool selMissing = false;
         for (const auto& c : takeModel.cells)
             selMissing = selMissing || (c.selected && c.missing);
+#if defined (HSLINK_TEST_HOOKS)
+        const bool editorStats = TakeGrid::testEditorStats.load();
+#else
+        const bool editorStats = false;
+#endif
         exportWavButton.setEnabled (sel != juce::File() && ! selMissing
-                                    && (! TakeGrid::testEditorStats.load() || EditorFs::exists (sel, EditorFs::tagTick)));
+                                    && (! editorStats || EditorFs::exists (sel, EditorFs::tagTick)));
         exportMidiButton.setEnabled (sel != juce::File() && ! midiBusy);
         const bool canDrag = sel != juce::File() && (! midiBusy || midiDrag.isBuilding());
         if (midiDrag.isEnabled() != canDrag)
@@ -1845,16 +2377,25 @@ bool HotStepLinkEditor::openTakeEditor()
                 t.warpMarkersEdited = e.warpMarkersEdited;
                 t.warpTagBpm = e.warpTagBpm;
             }
+        if (cell.tempoState == HslinkTakeEntry::tempoMeasured)
+            t.tempo = cell.tempo; // F1: AUTO-WARP tracks beats on its onsets
         t.gridEdit = cell.gridEdit; // R1b: the hand grid stored on the take (setTakeGrid)
         if ((cell.tempoState == HslinkTakeEntry::tempoMeasured && cell.tempo.valid)
             || cell.tempoState == HslinkTakeEntry::tempoEstimated)
             t.takeBpm = cell.tempo.bpm > 0.0 ? cell.tempo.bpm : 0.0; // Fit to bars opens on the take tempo
         takeEditor.open (t);
+#if defined (HSLINK_TEST_HOOKS)
+        if (testKeyRevealMutant != 6) // teeth 6: the take editor leaves the key shown
+#endif
+        if (keyRevealed)
+            setKeyRevealed (false); // the take editor covers SETTINGS: mask the key again (no save)
         takeEditor.setVisible (true);
         takeEditor.toFront (false);
+#if defined (HSLINK_TEST_HOOKS)
         if (offlineMutantForTest == mutOverlayFullWindow && overlay.isVisible())
             overlay.toFront (false);
         else
+#endif
             overlay.setVisible (false); // the offline banner sits on the Generate plate; the editor needs no server
         return true;
     }
@@ -1879,7 +2420,28 @@ TakeGrid::Model HotStepLinkEditor::buildTakeModel()
     for (auto& c : m.cells)
     {
         const double takeBpm = c.tempoState == HslinkTakeEntry::tempoMeasured && c.tempo.valid ? c.tempo.bpm : 0.0;
-        c.fitScore = TakeGrid::fitToBarsScore (c.durationS, takeBpm, hostBpm, beatsPerBar);
+        // FIT option C: length vs the take's requested duration (its job request), tempo
+        // folded against the host tempo. No requested duration: beat grid (option A).
+        double requestedS = 0.0;
+        if (DawJob job; c.jobId != 0 && proc.daw.getJob (c.jobId, job))
+            requestedS = job.request.durationS;
+        // Card 65840a44 option C: flag a take whose length is far from the asked duration, once.
+        if (requestedS > 0.0 && c.durationS > 0.0 && ! durationNotedKeys.contains (c.key))
+        {
+            durationNotedKeys.add (c.key);
+            DawJob job;
+            proc.daw.getJob (c.jobId, job);
+            const auto bid = job.request.expectedBackend.isNotEmpty() ? job.request.expectedBackend : proc.getSelectedBackendId();
+            const auto note = DawJobRequest::durationMismatchNote (DawWorker::backendLabel (bid), requestedS, c.durationS);
+            if (note.isNotEmpty())
+            {
+                takesNote = note;
+                takesNoteUntilMs = juce::Time::getMillisecondCounter() + 8000;
+            }
+        }
+        c.fitLen = TakeGrid::fitLengthScore (c.durationS, requestedS, hostBpm, beatsPerBar);
+        c.fitTempo = TakeGrid::fitTempoScore (takeBpm, hostBpm);
+        c.fitScore = TakeGrid::fitMinScore (c.fitLen, c.fitTempo);
     }
     return m;
 }
@@ -1929,7 +2491,12 @@ juce::File HotStepLinkEditor::warpedFileFor (const juce::File& temp, const juce:
     // marker moved (what Play hears). The render is TakeStretch::renderWarped, as Play,
     // written once as 32 bit float beside the lasting root and reused while the take
     // and the marker list stay the same.
-    if (noWarpExportForTest || src == juce::File() || ! takeEditor.isOpen() || takeEditor.getTemp() != temp)
+#if defined (HSLINK_TEST_HOOKS)
+    const bool noWarpExport = noWarpExportForTest;
+#else
+    const bool noWarpExport = false;
+#endif
+    if (noWarpExport || src == juce::File() || ! takeEditor.isOpen() || takeEditor.getTemp() != temp)
         return src;
     const auto markers = takeEditor.effectiveWarp();
     if (markers.empty())
@@ -1971,14 +2538,24 @@ juce::File HotStepLinkEditor::warpedFileFor (const juce::File& temp, const juce:
             return {};
         }
     }
-    if (! noWarpTagForTest)
+#if defined (HSLINK_TEST_HOOKS)
+    const bool noWarpTag = noWarpTagForTest;
+#else
+    const bool noWarpTag = false;
+#endif
+    if (! noWarpTag)
         WavTempoTag::inject (part, takeEditor.warpResultBpm());
     if (! part.moveFileTo (out))
     {
         part.deleteFile();
         return out.existsAsFile() ? out : juce::File();
     }
-    if (! noWarpCacheCapForTest)
+#if defined (HSLINK_TEST_HOOKS)
+    const bool noWarpCacheCap = noWarpCacheCapForTest;
+#else
+    const bool noWarpCacheCap = false;
+#endif
+    if (! noWarpCacheCap)
         trimWarpCache (dir, out);
     return out;
 }
@@ -2006,6 +2583,7 @@ void HotStepLinkEditor::trimWarpCache (const juce::File& dir, const juce::File& 
     }
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 int HotStepLinkEditor::takeCellMissingForTest (const juce::String& key) const
 {
     const auto* c = static_cast<const TakeCell*> (takeList.cellForKey (key));
@@ -2013,6 +2591,7 @@ int HotStepLinkEditor::takeCellMissingForTest (const juce::String& key) const
         return -1;
     return c->isMissing() && c->getAlpha() < 0.9f ? 1 : 0;
 }
+#endif
 
 juce::File HotStepLinkEditor::exportSource()
 {
@@ -2077,13 +2656,20 @@ void HotStepLinkEditor::exportWav()
     });
 }
 
-void HotStepLinkEditor::showExportResult (const juce::File& written)
+void HotStepLinkEditor::showExportResult (const juce::File& written, const juce::StringArray& names)
 {
     // Same for Export WAV and Export MIDI: the full output folder stays on screen until the next export.
+    // MIDI passes every file name it wrote: they follow the folder, and the tooltip lists them.
+#if defined (HSLINK_TEST_HOOKS)
+    if (testSkipExportResult)
+        return;
+#endif
     lastExportFile = written;
     const auto folder = written.getParentDirectory().getFullPathName();
-    exportPathLabel.setText ("Saved to: " + folder, juce::dontSendNotification);
-    exportPathLabel.setTooltip (written.getFullPathName());
+    exportPathLabel.setText ("Saved to: " + folder + (names.isEmpty() ? juce::String() : "  (" + names.joinIntoString (", ") + ")"),
+                             juce::dontSendNotification);
+    exportPathLabel.setTooltip (names.isEmpty() ? written.getFullPathName()
+                                                : folder + "\n" + names.joinIntoString ("\n"));
     const bool wasVisible = exportPathLabel.isVisible();
     exportPathLabel.setVisible (true);
     showExportButton.setVisible (true);
@@ -2093,12 +2679,12 @@ void HotStepLinkEditor::showExportResult (const juce::File& written)
 
 juce::StringArray HotStepLinkEditor::midiFilesForSelection() const
 {
-    if (proc.audition.getSelected() != lastMidiSelection || lastMidiHits == juce::File())
+    if (proc.audition.getSelected() != lastMidiSelection || lastMidiFiles.isEmpty())
         return {};
     juce::StringArray out;
-    for (const auto& f : { lastMidiHits, lastMidiNotes, lastMidiTempo })
-        if (f != juce::File() && f.existsAsFile())
-            out.add (f.getFullPathName());
+    for (const auto& path : lastMidiFiles)
+        if (juce::File (path).existsAsFile())
+            out.add (path);
     return out;
 }
 
@@ -2193,35 +2779,90 @@ MidiBuildResult buildMidiFiles (const MidiBuildInputs& in, const juce::File& des
     dir.createDirectory();
         const auto name = src.getFileNameWithoutExtension();
         const double dur = (double) (cut ? r1 - r0 : len) / sr;
-        if (hasTempo)
+        const double origin = MidiExport::exportOriginTicks (hits, bpmOut, beatsPerBar, sigDen, map, down);
+        // Chords (opt-in): analysed on the region, the detected key goes into every file.
+        std::optional<MidiExport::KeySig> key;
+        ChordExport::ChordResult chordRes;
+        if (in.chords)
         {
-            tempoOut = dir.getChildFile (name + "_tempo.mid");
-            if (! MidiExport::writeFile (MidiExport::buildTempoFile (bpmOut, down, beatsPerBar, dur, sigDen, std::nullopt, map,
-                                                                 MidiExport::exportOriginTicks (hits, bpmOut, beatsPerBar, sigDen, map, down)), tempoOut))
+            juce::AudioBuffer<float> region (buf.getNumChannels(), (int) juce::jmax<juce::int64> (1, r1 - r0));
+            region.clear();
+            for (int ch = 0; ch < buf.getNumChannels(); ++ch)
+                if (r1 > r0)
+                    region.copyFrom (ch, 0, buf, ch, (int) r0, (int) (r1 - r0));
+            chordRes = ChordExport::analyseChords (region, sr, bpmOut, down, beatsPerBar, sigDen, map,
+                                                   in.chordMode == 1 ? ChordExport::Mode::PerBeat : ChordExport::Mode::PerBar);
+            key = chordRes.key.sig;
+        }
+        // Build every asked-for part first; then write them apart, or as one multitrack file.
+        const bool wantTempo = hasTempo && in.tempo;
+        if (in.tempo && ! hasTempo)
+            r.skipped.add ("tempo: the take has no tempo (hits at 120 BPM)");
+        std::optional<juce::MidiFile> tempoF, hitsF, melodyF, chordsF;
+        if (wantTempo)
+            tempoF = MidiExport::buildTempoFile (bpmOut, down, beatsPerBar, dur, sigDen, key, map, origin);
+        if (in.drums)
+            hitsF = MidiExport::buildHitsFile (hits, bpmOut, beatsPerBar, sigDen, key, map,
+                                               in.quantDiv, in.quantStrength, down);
+        // Tonal takes also get a pitched note track (Auto: skipped with a reason otherwise).
+        if (in.melody)
+        {
+            if (MidiExport::isTonal (pitch) && ! notes.empty())
+                melodyF = MidiExport::buildNotesFile (notes, name + " melody", bpmOut, beatsPerBar, sigDen, key, map,
+                                                      in.quantDiv, in.quantStrength, origin);
+            else
+                r.skipped.add ("melody: the take is not tonal");
+        }
+        if (in.chords)
+        {
+            if (! chordRes.chords.empty())
+                chordsF = ChordExport::buildChordsFile (chordRes.chords, name + " chords", bpmOut, beatsPerBar, sigDen,
+                                                        key, map, origin);
+            else
+                r.skipped.add ("chords: no chord found");
+        }
+        auto put = [&] (const juce::MidiFile& f, const juce::String& suffix, juce::File& out)
+        {
+            out = dir.getChildFile (name + suffix);
+            if (! MidiExport::writeFile (f, out))
             {
-                err = "could not write " + tempoOut.getFullPathName();
-                tempoOut = juce::File();
+                err = "could not write " + out.getFullPathName();
+                out = juce::File();
+            }
+        };
+        if (in.combined)
+        {
+            // Track 0: the tempo file's conductor (tempo, meter, key, bar markers), else a
+            // plain tempo track; then track 1 of each part (each part's own track 0 is the
+            // same tempo track, so it is dropped).
+            if (hitsF || melodyF || chordsF || tempoF)
+            {
+                juce::MidiFile all;
+                all.setTicksPerQuarterNote (MidiExport::kPpq);
+                if (tempoF)
+                    all.addTrack (*tempoF->getTrack (0));
+                else
+                    all.addTrack (MidiExport::tempoTrack (bpmOut, beatsPerBar, sigDen, key, map, origin));
+                for (const auto* f : { &hitsF, &melodyF, &chordsF })
+                    if (f->has_value() && (*f)->getNumTracks() >= 2)
+                        all.addTrack (*(*f)->getTrack (1));
+                put (all, "_multitrack.mid", r.combined);
             }
         }
-        hitsOut = dir.getChildFile (name + "_hits.mid");
-        if (! MidiExport::writeFile (MidiExport::buildHitsFile (hits, bpmOut, beatsPerBar, sigDen, std::nullopt, map,
-                                                                 in.quantDiv, in.quantStrength, down), hitsOut))
+        else
         {
-            err = "could not write " + hitsOut.getFullPathName();
-            hitsOut = juce::File();
+            if (tempoF)
+                put (*tempoF, "_tempo.mid", tempoOut);
+            if (hitsF)
+                put (*hitsF, "_hits.mid", hitsOut);
+            if (melodyF)
+                put (*melodyF, "_melody.mid", r.notes);
+            if (chordsF)
+                put (*chordsF, "_chords.mid", r.chords);
         }
-        // Tonal takes also get a pitched note track (the hits track is always written).
-        if (MidiExport::isTonal (pitch) && ! notes.empty())
-        {
-            r.notes = dir.getChildFile (name + "_melody.mid");
-            if (! MidiExport::writeFile (MidiExport::buildNotesFile (notes, name + " melody", bpmOut, beatsPerBar, sigDen, std::nullopt, map,
-                                                                 in.quantDiv, in.quantStrength,
-                                                                 MidiExport::exportOriginTicks (hits, bpmOut, beatsPerBar, sigDen, map, down)), r.notes))
-            {
-                err = "could not write " + r.notes.getFullPathName();
-                r.notes = juce::File();
-            }
-        }
+        if (err.isEmpty() && r.files().isEmpty())
+            err = r.skipped.isEmpty() ? juce::String ("nothing to export: pick a part in the MIDI picker")
+                                      : "nothing to export (" + r.skipped.joinIntoString ("; ") + ")";
     }
     return r;
 }
@@ -2232,8 +2873,8 @@ juce::StringArray buildMidiFilesForDrag (const MidiBuildInputs& in, const juce::
     juce::StringArray out;
     if (r.err.isNotEmpty())
         return out;
-    for (const auto& f : { r.hits, r.notes, r.tempo })
-        if (f != juce::File() && f.existsAsFile())
+    for (const auto& f : r.files())
+        if (f.existsAsFile())
             out.add (f.getFullPathName());
     return out;
 }
@@ -2358,45 +2999,56 @@ void HotStepLinkEditor::exportMidi()
     MidiBuildInputs in;
     if (! midiInputsForSelection (in))
         return;
+#if defined (HSLINK_TEST_HOOKS)
     in.mutant = midiMutantForTest;
-    const bool hasTempo = in.hasTempo;
+#endif
+    applyMidiPicker (in);
     midiBusy = true;
     exportMidiButton.setEnabled (false);
+    setMidiPickerOpen (false);
     jobLabel.setText ("Exporting MIDI...", juce::dontSendNotification);
     juce::Component::SafePointer<HotStepLinkEditor> safe (this);
-    const bool sync = midiSyncForTest;
-    auto work = [safe, sel, in, hasTempo, sync]
+#if defined (HSLINK_TEST_HOOKS)
+    const bool midiSync = midiSyncForTest;
+#else
+    const bool midiSync = false;
+#endif
+    const bool sync = midiSync;
+    auto work = [safe, sel, in, sync]
     {
         const auto r = buildMidiFiles (in, in.src.getParentDirectory());
-        const auto tempoOut = r.tempo, hitsOut = r.hits, notesOut = r.notes;
-        const auto err = r.err;
-        auto done = [safe, sel, tempoOut, hitsOut, notesOut, err, hasTempo]
+        auto done = [safe, sel, r]
         {
             if (safe == nullptr)
                 return;
             auto& ed = *safe;
             ed.midiBusy = false;
             ed.lastMidiSelection = sel;
-            ed.lastMidiTempo = tempoOut;
-            ed.lastMidiHits = hitsOut;
-            ed.lastMidiNotes = notesOut;
-            if (err.isNotEmpty())
+            ed.lastMidiTempo = r.tempo;
+            ed.lastMidiHits = r.hits;
+            ed.lastMidiNotes = r.notes;
+            ed.lastMidiFiles.clear();
+            juce::StringArray names;
+            for (const auto& f : r.files())
+            {
+                ed.lastMidiFiles.add (f.getFullPathName());
+                names.add (f.getFileName());
+            }
+            if (r.err.isNotEmpty())
             {
                 ed.jobLabel.setText ("MIDI export failed", juce::dontSendNotification);
-                ed.collectionPanel.showNote ("MIDI export failed: " + err, true, 8000);
+                ed.collectionPanel.showNote ("MIDI export failed: " + r.err, true, 8000);
                 return;
             }
-            juce::String note ("Exported MIDI to " + hitsOut.getParentDirectory().getFullPathName() + ": "
-                               + hitsOut.getFileName());
-            if (notesOut != juce::File())
-                note << ", " << notesOut.getFileName();
-            if (tempoOut != juce::File())
-                note << ", " << tempoOut.getFileName();
-            else if (! hasTempo)
-                note << " (no tempo map: the take has no tempo; hits at 120 BPM)";
-            ed.jobLabel.setText ("Exported " + hitsOut.getFileName(), juce::dontSendNotification);
+            const auto first = r.files().getFirst();
+            juce::String note ("Exported MIDI to " + first.getParentDirectory().getFullPathName() + ": "
+                               + names.joinIntoString (", "));
+            if (! r.skipped.isEmpty())
+                note << " (skipped " << r.skipped.joinIntoString ("; ") << ")";
+            ed.jobLabel.setText ("Exported " + juce::String (names.size()) + (names.size() == 1 ? " MIDI file" : " MIDI files"),
+                                 juce::dontSendNotification);
             ed.collectionPanel.showNote (note, false, 8000);
-            ed.showExportResult (hitsOut);
+            ed.showExportResult (first, names);
         };
         if (sync)
             done();
@@ -2417,6 +3069,7 @@ bool HotStepLinkEditor::buildMidiForDrag()
     MidiBuildInputs in;
     if (! midiInputsForSelection (in))
         return false;
+    applyMidiPicker (in); // the drag chip carries the same files as Export MIDI
     midiBusy = true;
     exportMidiButton.setEnabled (false);
     jobLabel.setText ("Building MIDI for drag...", juce::dontSendNotification);
@@ -2436,6 +3089,10 @@ bool HotStepLinkEditor::buildMidiForDrag()
                 ed.lastMidiSelection = sel;
                 ed.lastMidiTempo = r.tempo;
                 ed.lastMidiHits = r.hits;
+                ed.lastMidiNotes = r.notes;
+                ed.lastMidiFiles.clear();
+                for (const auto& f : r.files())
+                    ed.lastMidiFiles.add (f.getFullPathName());
                 files = ed.midiFilesForSelection();
                 ed.jobLabel.setText ("MIDI ready to drag", juce::dontSendNotification);
             }
@@ -2507,17 +3164,104 @@ void HotStepLinkEditor::applyModeGating (const DawStatus& st)
     lastNonTurbo = nonTurbo;
     lastBase = base;
     lastOnline = st.online;
+    applyBackendRefLock();
+}
+
+float HotStepLinkEditor::keySaveNoteWidth (const juce::String& text)
+{
+    juce::GlyphArrangement ga;
+    ga.addLineOfText (juce::Font (juce::FontOptions (10.0f)), text, 0.0f, 0.0f);
+    return ga.getBoundingBox (0, -1, true).getWidth();
+}
+
+juce::String HotStepLinkEditor::keySaveNoteTextFor (float availWidth)
+{
+    for (const char* t : { "Key not saved to disk. It works until you close LINK.", "Not saved to disk. Works until LINK closes." })
+        if (keySaveNoteWidth (t) <= availWidth)
+            return t;
+    return {};
+}
+
+void HotStepLinkEditor::noteKeySave (bool saveTried, bool stored)
+{
+    // Never reads or shows the key: only whether the save was tried and what it returned.
+#if defined (HSLINK_TEST_HOOKS)
+    const auto teeth = juce::SystemStats::getEnvironmentVariable ("HSLINK_TEETH", {});
+    if (teeth == "RESULT_IGNORED")
+        return; // teeth: the handler ignores the result, as before
+    if (teeth == "CLEAR_ON_UNCHANGED" && ! saveTried)
+        keySaveNote.setVisible (false); // teeth: an unchanged key clears the note
+#endif
+    if (! saveTried)
+        return; // unchanged key, nothing was saved: neither shows nor clears
+    keySaveNote.setVisible (! stored);
+}
+
+juce::String HotStepLinkEditor::refLockNoteText (const juce::String& backendId)
+{
+    if (backendId.isEmpty())
+        return "pick a backend to use reference audio";
+    return backendId == "ace" ? juce::String() : juce::String ("reference audio needs ACE-Step");
+}
+
+void HotStepLinkEditor::dismissRefHint()
+{
+    if (! refHintSeen)
+    {
+        // Seen for this session whatever the write returned (the hint stays hidden after a
+        // click). A write that failed here is tried again by the processor on the next
+        // finished capture, one try per capture, so this never loops from the poll.
+        refHintSeen = true;
+        HotStepLinkProcessor::saveRefHintSeen();
+    }
+    sourceWave.setRefHint (false, standalone);
+    sourceWave.setTooltip ("Captured source clip (repaint / lego)");
+}
+
+// Only ACE-Step reads reference audio (src_audio): repaint, lego and the strength box lock
+// for any other backend, with a note beside the row saying why. Message thread.
+void HotStepLinkEditor::applyBackendRefLock()
+{
+    const auto bid = proc.getSelectedBackendId();
+    const bool ace = bid == "ace";
+    const bool autoB = bid.isEmpty();
+    const bool nonTurbo = lastNonTurbo && ace;
+    const bool base = lastBase && ace;
     modeBox.setItemEnabled (2, nonTurbo);
     modeBox.setItemEnabled (3, base);
     juce::String tip ("text2music: always available");
-    tip << "\nrepaint: " << (nonTurbo ? "available" : "needs a non-turbo DiT model on the server")
-        << "\nlego: " << (base ? "available" : "needs the base DiT model on the server");
+    if (! ace)
+        tip << "\nrepaint, lego: " << (autoB ? "pick a backend to use reference audio" : "need the ACE-Step backend");
+    else
+        tip << "\nrepaint: " << (lastNonTurbo ? "available" : "needs a non-turbo DiT model on the server")
+            << "\nlego: " << (lastBase ? "available" : "needs the base DiT model on the server");
     modeBox.setTooltip (tip);
+    strengthEditor.setEnabled (ace);
+    strengthEditor.setReadOnly (! ace);
+    // Locked text uses the same dimmed tone as disabled button text (kDim at 0.6).
+    strengthEditor.applyColourToAllText (ace ? kText : kDim.withAlpha (0.6f));
+    strengthEditor.setColour (juce::TextEditor::textColourId, ace ? kText : kDim.withAlpha (0.6f));
+    const auto note = refLockNoteText (bid);
+    if (note.isNotEmpty())
+        refLockNote.setText (note, juce::dontSendNotification);
+    refLockNote.setVisible (note.isNotEmpty());
     const int id = modeBox.getSelectedId();
     if ((id == 2 && ! nonTurbo) || (id == 3 && ! base))
     {
+        // Leaving ACE-Step: keep the ACE mode so switching back restores it.
+        if (! ace)
+            proc.setAceModeId (id);
         modeBox.setSelectedId (1, juce::dontSendNotification);
         proc.setModeId (1);
+    }
+    else if (ace && id == 1)
+    {
+        const int saved = proc.getAceModeId();
+        if ((saved == 2 && nonTurbo) || (saved == 3 && base))
+        {
+            modeBox.setSelectedId (saved, juce::dontSendNotification);
+            proc.setModeId (saved);
+        }
     }
 }
 
@@ -2884,8 +3628,13 @@ void HotStepLinkEditor::paint (juce::Graphics& g)
         g.drawRoundedRectangle (pc.reduced (0.5f), 5.0f, 1.0f);
         // No stat in paint: "a take is selected" is the audition selection being set.
         const auto sel = proc.audition.getSelected();
+#if defined (HSLINK_TEST_HOOKS)
+        const bool editorStats = TakeGrid::testEditorStats.load();
+#else
+        const bool editorStats = false;
+#endif
         const bool haveSel = sel != juce::File()
-                             && (! TakeGrid::testEditorStats.load() || EditorFs::exists (sel, EditorFs::tagPaint));
+                             && (! editorStats || EditorFs::exists (sel, EditorFs::tagPaint));
         g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
         g.setColour (kDim);
         auto line = previewCard.reduced (8, 6).removeFromTop (16);
@@ -3030,6 +3779,7 @@ void HotStepLinkEditor::resized()
     {
         auto s = statusArea.reduced (12, 0);
         versionLabel.setBounds (s.removeFromRight (280));
+        exposureLabel.setBounds (s.removeFromRight (190));
         syncLabel.setBounds (s);
     }
 
@@ -3110,7 +3860,40 @@ void HotStepLinkEditor::resized()
         a.removeFromTop (8);
         field (a, urlCaption, urlEditor, 26);
         field (a, keyCaption, keyEditor, 26);
-        field (a, modeCaption, modeBox, 26);
+        {
+            // Show / Hide: right end of the key field row, one gap clear of the field. Button
+            // height is the panel's (Close, 24 px), centred on the 26 px field row.
+            auto row = keyEditor.getBounds();
+            int revealH = kKeyRevealH;
+#if defined (HSLINK_TEST_HOOKS)
+            if (testKeyRevealMutant == 7) // teeth 7: the field row's height, as it was
+                revealH = 26;
+#endif
+            keyRevealButton.setBounds (row.removeFromRight (kKeyRevealW).withSizeKeepingCentre (kKeyRevealW, revealH));
+            row.removeFromRight (gap);
+            keyEditor.setBounds (row);
+        }
+        {
+            // Refused-save note: right part of the "DAW key" caption row, kKeyNoteGap clear of the caption text.
+            const auto cap = keyCaption.getBounds();
+            juce::GlyphArrangement ga;
+            ga.addLineOfText (keyCaption.getFont(), keyCaption.getText(), 0.0f, 0.0f);
+            const int capText = keyCaption.getBorderSize().getLeft() + (int) std::ceil (ga.getBoundingBox (0, -1, true).getWidth());
+            const auto nb = cap.withTrimmedLeft (juce::jmin (cap.getWidth(), capText + kKeyNoteGap));
+            keySaveNote.setBounds (nb);
+            keySaveNote.setText (keySaveNoteTextFor ((float) (nb.getWidth() - keySaveNote.getBorderSize().getRight())), juce::dontSendNotification);
+        }
+        {
+            // Mode row: mode box left half, strength box right half (no extra height).
+            auto cap = a.removeFromTop (16);
+            modeCaption.setBounds (cap);
+            refLockNote.setBounds (cap.withTrimmedLeft (96));
+            auto row = a.removeFromTop (26);
+            modeBox.setBounds (row.removeFromLeft ((row.getWidth() - gap) / 2));
+            row.removeFromLeft (gap);
+            strengthEditor.setBounds (row);
+            a.removeFromTop (8);
+        }
         field (a, backendCaption, backendBox, 26);
         field (a, aceModelCaption, aceModelBox, 26);
         regionCaption.setBounds (a.removeFromTop (16));
@@ -3194,7 +3977,12 @@ void HotStepLinkEditor::resized()
         generateButton.setBounds (a.removeFromTop (44));
         // Offline banner: over the GENERATE controls (knobs, seed/key, Generate) only, so the
         // take list, Edit take, audition, export and drag-out stay usable with no server.
-        if (offlineMutantForTest == mutOverlayFullWindow)
+#if defined (HSLINK_TEST_HOOKS)
+        const bool overlayFullWindow = offlineMutantForTest == mutOverlayFullWindow;
+#else
+        const bool overlayFullWindow = false;
+#endif
+        if (overlayFullWindow)
             overlay.setBounds (getLocalBounds().withTrimmedTop (headerArea.getHeight()));
         else
             overlay.setBounds (juce::Rectangle<int>::leftTopRightBottom (genPlate.getX() + 4, knobPanel.getY(),
@@ -3235,12 +4023,35 @@ void HotStepLinkEditor::resized()
         exp.removeFromRight (gap);
         // The Q combo needs about 80 px for "Q 1/16" plus its arrow; size it first, then the
         // strength slider takes what is left so Export MIDI keeps at least half the row.
-        const int qW = juce::jmin (82, exp.getWidth() * 2 / 5);
-        quantStrengthSlider.setBounds (exp.removeFromRight (juce::jmin (56, (exp.getWidth() - qW) / 3)));
+#if defined (HSLINK_TEST_HOOKS)
+        const bool oldQuantLayout = testOldQuantLayout;
+#else
+        const bool oldQuantLayout = false;
+#endif
+        if (oldQuantLayout)
+        {
+            quantStrengthSlider.setBounds (exp.removeFromRight (juce::jmin (60, exp.getWidth() / 4)));
+            exp.removeFromRight (gap);
+            quantizeBox.setBounds (exp.removeFromRight (juce::jmin (72, exp.getWidth() / 3)));
+        }
+        else
+        {
+            const int qW = juce::jmin (82, exp.getWidth() * 2 / 5);
+            quantStrengthSlider.setBounds (exp.removeFromRight (juce::jmin (56, (exp.getWidth() - qW) / 3)));
+            exp.removeFromRight (gap);
+            quantizeBox.setBounds (exp.removeFromRight (qW));
+        }
         exp.removeFromRight (gap);
-        quantizeBox.setBounds (exp.removeFromRight (qW));
-        exp.removeFromRight (gap);
+        // Split button: the picker arrow is the right 22 px of Export MIDI, flush.
+        exportMidiMenuButton.setBounds (exp.removeFromRight (22));
         exportMidiButton.setBounds (exp);
+        exportMidiButton.setConnectedEdges (juce::Button::ConnectedOnRight);
+        exportMidiMenuButton.setConnectedEdges (juce::Button::ConnectedOnLeft);
+        // MIDI picker card: above the split button, right edge on the arrow, kept on screen.
+        midiPicker.setBounds (juce::Rectangle<int> (exportMidiMenuButton.getRight() - MidiExportPopover::kW,
+                                                    exportMidiButton.getY() - 4 - MidiExportPopover::kH,
+                                                    MidiExportPopover::kW, MidiExportPopover::kH)
+                                  .constrainedWithin (getLocalBounds()));
         a.removeFromBottom (6);
         // All or nothing: no squeezed transport row while the window is too short for it.
         auto tr = a.removeFromBottom (a.getHeight() >= 26 ? 26 : 0);
@@ -3381,16 +4192,17 @@ void RoleCardRow::paint (juce::Graphics& g)
     for (int i = 0; i < RoleCards::kCount; ++i)
     {
         const bool on = i == active;
+        const float dimA = (dimmed & (1u << i)) != 0 ? 0.4f : 1.0f; // backend not listed by the server
         auto r = cardBounds (i).toFloat().reduced (0.5f);
         g.setColour (on ? kAccent.withAlpha (0.12f) : (i == hover ? kField.brighter (0.08f) : kField));
         g.fillRoundedRectangle (r, 5.0f);
-        g.setColour (on ? kAccent.withAlpha (0.75f) : kEdge);
+        g.setColour ((on ? kAccent.withAlpha (0.75f) : kEdge).withMultipliedAlpha (dimA));
         g.drawRoundedRectangle (r, 5.0f, 1.0f);
         auto in = cardBounds (i).reduced (9, 4);
-        g.setColour (on ? kAccent : kBright);
+        g.setColour ((on ? kAccent : kBright).withMultipliedAlpha (dimA));
         g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
         g.drawText (RoleCards::title (i), in.removeFromTop (in.getHeight() / 2), juce::Justification::centredLeft, true);
-        g.setColour (on ? kText : kDim);
+        g.setColour ((on ? kText : kDim).withMultipliedAlpha (dimA));
         g.setFont (juce::FontOptions (10.0f));
         g.drawText (RoleCards::subtitle (i), in, juce::Justification::centredLeft, true);
     }
@@ -3441,11 +4253,60 @@ void QueueListComponent::mouseDown (const juce::MouseEvent& e)
 }
 
 //==============================================================================
+juce::uint32 TakeCell::thumbNowMs()
+{
+#if defined (HSLINK_TEST_HOOKS)
+    if (testThumbClock)
+        return testThumbClock();
+#endif
+    return juce::Time::getMillisecondCounter();
+}
+
 bool TakeCell::repointThumbIfGone (const juce::File& src)
 {
-    if (src == juce::File() || src == thumbFile || thumbFile.existsAsFile() || ! src.existsAsFile())
+    if (src == juce::File())
+        return false;
+    // A cell whose thumbnail has a length is done: no file call for it here.
+    const bool empty = thumb.getTotalLength() <= 0.0;
+    if (src == thumbFile)
+    {
+        // Same path, nothing read from it. The cell was made while the take was listed
+        // and its file was still <name>.part (registerTake lists before the rename), so
+        // the first read found no file. Read it again once it is there. A file that is
+        // there and gives no length (empty, not audio) uses up the retries; a file that
+        // is not there yet does not.
+        // The retries are spaced kThumbRetryGapMs apart (a counter compare, no file
+        // call), so a file held by another program right after the rename is not
+        // given up on within three refreshes. A capped or waiting cell makes no call.
+        int cap = kThumbRetries;
+#if defined (HSLINK_TEST_HOOKS)
+        if (testThumbRetryCap > 0)
+            cap = testThumbRetryCap; // teeth: the cap before
+#endif
+        if (! empty || thumbRetries >= cap)
+            return false;
+        const auto nowMs = thumbNowMs();
+        bool waiting = thumbRetries > 0 && (juce::uint32) (nowMs - thumbRetryAtMs) < (juce::uint32) kThumbRetryGapMs;
+#if defined (HSLINK_TEST_HOOKS)
+        waiting = waiting && ! testThumbNoSpacing; // teeth: the code before
+        if (! waiting)
+            ++testThumbExistsCalls;
+#endif
+        if (waiting || ! thumbFile.existsAsFile())
+            return false;
+        ++thumbRetries;
+        thumbRetryAtMs = nowMs;
+        EditorFs::count (EditorFs::tagCell);
+        EditorFs::countThumbSource (thumbFile);
+        thumb.setSource (new juce::FileInputSource (thumbFile));
+        repaint();
+        return thumb.getTotalLength() > 0.0;
+    }
+    if (thumbFile.existsAsFile() || ! src.existsAsFile())
         return false;
     thumbFile = src;
+    thumbRetries = 0;
+    thumbRetryAtMs = 0;
     thumb.setSource (new juce::FileInputSource (thumbFile));
     repaint();
     return true;
@@ -3534,6 +4395,13 @@ void TakeCell::paint (juce::Graphics& g)
         fitRow = ri.removeFromBottom (12);
         ri.removeFromBottom (3);
     }
+#if defined (HSLINK_TEST_HOOKS)
+    const int lengthMutant = TakeGrid::testLengthMutant.load();
+#else
+    const int lengthMutant = 0;
+#endif
+    if (hasChipRow() && lengthMutant != 3)
+        ri.removeFromBottom (kChipRowH + kChipGap); // the bpm / length chips get their own row under the waveform
     g.setColour (selected ? kAccent : kLav.withAlpha (0.85f));
     if (thumb.getTotalLength() > 0.0)
         thumb.drawChannels (g, ri, 0.0, thumb.getTotalLength(), 1.0f);
@@ -3541,7 +4409,7 @@ void TakeCell::paint (juce::Graphics& g)
         g.drawText ("loading...", ri, juce::Justification::centred);
     if (tempoShown().isNotEmpty())
     {
-        // Lower left corner of the waveform, on a dark plate so it reads over the peaks.
+        // Left end of the chip row under the waveform, on a dark plate.
         const auto plate = tempoPlate();
         g.setColour (juce::Colours::black.withAlpha (0.62f));
         g.fillRoundedRectangle (plate.toFloat(), 3.0f);
@@ -3553,7 +4421,7 @@ void TakeCell::paint (juce::Graphics& g)
     }
     if (const auto lp = lengthPlate(); ! lp.isEmpty())
     {
-        // Lower right corner: the take length, always shown; the tempo tag gives way (tempoShown).
+        // Right end of the chip row: the take length, always shown; the tempo tag gives way (tempoShown).
         g.setColour (juce::Colours::black.withAlpha (0.62f));
         g.fillRoundedRectangle (lp.toFloat(), 3.0f);
         g.setColour (kText);
@@ -3562,15 +4430,16 @@ void TakeCell::paint (juce::Graphics& g)
     }
     if (! fitRow.isEmpty())
     {
-        const int score = juce::jlimit (0, 100, fitTag.text.getTrailingIntValue());
+        const int score = juce::jlimit (0, 100, fitScore);
         const auto col = fitTag.colour == TakeGrid::TempoTag::green ? juce::Colour (0xff6fd08c)
-                       : fitTag.colour == TakeGrid::TempoTag::amber ? juce::Colour (0xffffb347) : juce::Colour (0xffff6b6b);
+                       : fitTag.colour == TakeGrid::TempoTag::amber ? juce::Colour (0xffffb347)
+                       : fitTag.colour == TakeGrid::TempoTag::red ? juce::Colour (0xffff6b6b) : kDim;
         auto fr = fitRow;
         g.setColour (kDim);
         g.setFont (juce::FontOptions (9.0f, juce::Font::bold));
         g.drawText ("FIT", fr.removeFromLeft (22), juce::Justification::centredLeft);
         g.setColour (col);
-        g.drawText (juce::String (score), fr.removeFromRight (24), juce::Justification::centredRight);
+        g.drawText (fitTag.text, fr.removeFromRight (juce::jmin (100, fr.getWidth() / 2)), juce::Justification::centredRight, true);
         fr.removeFromRight (4);
         auto bar = fr.withSizeKeepingCentre (fr.getWidth(), 4).toFloat();
         g.setColour (juce::Colour (0xff1c2131));
@@ -3586,17 +4455,54 @@ juce::Rectangle<int> TakeCell::waveArea() const
     ri.removeFromTop (22); // head row 18 + gap 4
     if (fitTag.text.isNotEmpty())
         ri.removeFromBottom (15); // FIT row 12 + gap 3
+#if defined (HSLINK_TEST_HOOKS)
+    const int lengthMutant = TakeGrid::testLengthMutant.load();
+#else
+    const int lengthMutant = 0;
+#endif
+    if (hasChipRow() && lengthMutant != 3) // mutant 3: chips back over the waveform
+        ri.removeFromBottom (kChipRowH + kChipGap); // chip row, never over the waveform
     return ri;
 }
+
+bool TakeCell::hasChipRow() const
+{
+    return (tempoTag.text.isNotEmpty() || lengthText.isNotEmpty()) && ! missing && ! dragRefused;
+}
+
+juce::Rectangle<int> TakeCell::chipRow() const
+{
+    if (! hasChipRow())
+        return {};
+    const auto wa = waveArea();
+#if defined (HSLINK_TEST_HOOKS)
+    if (TakeGrid::testLengthMutant.load() == 3)
+        return { wa.getX(), wa.getBottom() - kChipRowH, wa.getWidth(), kChipRowH }; // the old corner plates
+#endif
+    return { wa.getX(), wa.getBottom() + kChipGap, wa.getWidth(), kChipRowH };
+}
+
+#if defined (HSLINK_TEST_HOOKS)
+int TakeCell::chipGapForTest() const
+{
+    // Smallest vertical gap from the waveform bottom to any chip (negative = overlap); 1000 = no chips.
+    int gap = 1000;
+    const auto wa = waveArea();
+    for (const auto& c : { tempoPlate(), lengthPlate() })
+        if (! c.isEmpty())
+            gap = juce::jmin (gap, c.getY() - wa.getBottom());
+    return gap;
+}
+#endif
 
 juce::Rectangle<int> TakeCell::tempoPlate() const
 {
     const auto t = tempoShown();
     if (t.isEmpty())
         return {};
-    const auto ri = waveArea();
+    const auto ri = chipRow();
     const int w = juce::jmin (ri.getWidth(), 8 + (int) std::ceil (lengthTextWidth (t)));
-    return { ri.getX(), ri.getBottom() - 12, w, 12 };
+    return { ri.getX(), ri.getY(), w, ri.getHeight() };
 }
 
 float TakeCell::lengthTextWidth (const juce::String& t)
@@ -3611,7 +4517,12 @@ float TakeCell::lengthTextWidth (const juce::String& t)
 juce::String TakeCell::tempoShown() const
 {
     const auto& full = tempoTag.text;
-    if (full.isEmpty() || TakeGrid::testLengthMutant.load() == 2)
+#if defined (HSLINK_TEST_HOOKS)
+    const int lengthMutant = TakeGrid::testLengthMutant.load();
+#else
+    const int lengthMutant = 0;
+#endif
+    if (full.isEmpty() || lengthMutant == 2)
         return full;
     const auto ri = waveArea();
     const auto lp = lengthPlate();
@@ -3634,20 +4545,22 @@ juce::Rectangle<int> TakeCell::lengthPlate() const
 {
     if (lengthText.isEmpty() || missing || dragRefused)
         return {};
-    const auto ri = waveArea();
+    const auto ri = chipRow();
     const int w = 8 + (int) std::ceil (lengthTextWidth (lengthText));
     if (w > ri.getWidth())
         return {}; // narrower than the length text itself
-    return { ri.getRight() - w, ri.getBottom() - 12, w, 12 };
+    return { ri.getRight() - w, ri.getY(), w, ri.getHeight() };
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 bool TakeCell::lengthFitsForTest (juce::Rectangle<int>* plateOut, juce::Rectangle<int>* tempoOut) const
 {
     const auto lp = lengthPlate();
     if (plateOut != nullptr) *plateOut = lp;
     if (tempoOut != nullptr) *tempoOut = tempoPlate();
-    return ! lp.isEmpty() && waveArea().contains (lp) && lengthTextWidth (lengthText) <= (float) (lp.getWidth() - 8);
+    return ! lp.isEmpty() && chipRow().contains (lp) && lengthTextWidth (lengthText) <= (float) (lp.getWidth() - 8);
 }
+#endif
 
 void TakeCell::resized()
 {
@@ -3783,7 +4696,12 @@ void TakeListComponent::setTakes (const std::vector<TakeGrid::Cell>& shownCells,
     for (int i = 0; i < cells.size() && i < (int) shownCells.size(); ++i)
     {
         const auto& m = shownCells[(size_t) i];
-        if (! TakeGrid::testNoThumbFallback.load())
+#if defined (HSLINK_TEST_HOOKS)
+        const bool noThumbFallback = TakeGrid::testNoThumbFallback.load();
+#else
+        const bool noThumbFallback = false;
+#endif
+        if (! noThumbFallback)
             cells[i]->repointThumbIfGone (TakeGrid::thumbSourceOf (m));
         cells[i]->deleteKey = m.temp.getFullPathName(); // set on every refresh: a kept cell follows its place in the list
         cells[i]->setSelected (m.selected);
@@ -3793,7 +4711,7 @@ void TakeListComponent::setTakes (const std::vector<TakeGrid::Cell>& shownCells,
         if (m.missing)
             cells[i]->setTooltip ("File missing: " + m.file.getFullPathName());
         cells[i]->setTempoTag (TakeGrid::tempoTagOf (m.tempoState, m.tempo, m.resolved));
-        cells[i]->setFitTag (TakeGrid::fitTagOf (m.fitScore));
+        cells[i]->setFitTag (TakeGrid::fitTagOf (m.fitLen, m.fitTempo), m.fitScore);
         cells[i]->setLengthText (TakeGrid::lengthTextOf (m.durationS));
     }
 }
@@ -4207,6 +5125,104 @@ SourceWaveView::HeaderStyle SourceWaveView::headerStyleFor (CaptureState s)
     return { kDim, false };
 }
 
+juce::StringArray SourceWaveView::refHintLines (bool standaloneApp, bool compact)
+{
+    if (compact)
+        return { standaloneApp ? "Reference: Drop WAV..., then repaint or lego in SETTINGS"
+                               : "Reference: ARM + play, then repaint or lego in SETTINGS" };
+    return { standaloneApp ? "To reference a track: Drop WAV..."
+                           : "To reference a track: ARM, then play the host.",
+             "In SETTINGS pick ACE-Step and repaint or lego." };
+}
+
+#if defined (HSLINK_TEST_HOOKS)
+std::atomic<bool> SourceWaveView::testHintAlwaysFits { false };
+std::atomic<bool> SourceWaveView::testHintIgnoresSource { false };
+std::atomic<bool> SourceWaveView::testLabelAlwaysCaptured { false };
+#endif
+
+juce::String SourceWaveView::headerLabelFor (bool isRecording, bool hasSource)
+{
+    if (isRecording)
+        return "RECORDING";
+    return hasSource ? "CAPTURED" : "";
+}
+
+juce::String SourceWaveView::headerLabel() const
+{
+    bool hasSource = file != juce::File(); // the rule the CAPTURE button readout uses
+#if defined (HSLINK_TEST_HOOKS)
+    if (testLabelAlwaysCaptured.load())
+        hasSource = true; // teeth: the old code, CAPTURED whatever the source
+#endif
+    return headerLabelFor (recording, hasSource);
+}
+
+bool SourceWaveView::refHintFits (const juce::StringArray& lines, juce::Rectangle<int> area)
+{
+#if defined (HSLINK_TEST_HOOKS)
+    if (testHintAlwaysFits.load())
+        return ! lines.isEmpty();
+#endif
+    if (lines.isEmpty() || lines.size() * kRefHintLineH > area.getHeight())
+        return false;
+    for (const auto& l : lines)
+    {
+        juce::AttributedString as;
+        as.append (l, juce::FontOptions (kRefHintFontH));
+        juce::TextLayout tl;
+        tl.createLayout (as, 100000.0f);
+        if (tl.getWidth() > (float) area.getWidth())
+            return false;
+    }
+    return true;
+}
+
+juce::StringArray SourceWaveView::refHintFor (bool standaloneApp, juce::Rectangle<int> area)
+{
+    for (const bool compact : { false, true })
+    {
+        const auto lines = refHintLines (standaloneApp, compact);
+        if (refHintFits (lines, area))
+            return lines;
+    }
+    return {};
+}
+
+void SourceWaveView::setRefHint (bool on, bool standaloneApp)
+{
+    if (on != refHintOn || standaloneApp != refHintStandalone)
+    {
+        refHintOn = on;
+        refHintStandalone = standaloneApp;
+        repaint();
+    }
+}
+
+juce::Rectangle<int> SourceWaveView::waveArea() const
+{
+    auto r = getLocalBounds();
+    r.removeFromTop (16);
+    r.removeFromBottom (14);
+    return r.reduced (2, 2);
+}
+
+bool SourceWaveView::refHintShowing() const
+{
+    bool noSource = file == juce::File();
+#if defined (HSLINK_TEST_HOOKS)
+    if (testHintIgnoresSource.load())
+        noSource = true; // teeth: the hint ignores the source
+#endif
+    return refHintOn && ! recording && noSource && ! refHintFor (refHintStandalone, waveArea()).isEmpty();
+}
+
+void SourceWaveView::mouseDown (const juce::MouseEvent& e)
+{
+    if (e.mods.isLeftButtonDown() && refHintShowing() && waveArea().contains (e.getPosition()) && onRefHintDismiss)
+        onRefHintDismiss();
+}
+
 void SourceWaveView::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds();
@@ -4223,7 +5239,7 @@ void SourceWaveView::paint (juce::Graphics& g)
         label.removeFromLeft (3);
     }
     g.setColour (st.text);
-    g.drawText (recording ? "RECORDING" : "CAPTURED", label, juce::Justification::centredLeft);
+    g.drawText (headerLabel(), label, juce::Justification::centredLeft); // empty with no source: nothing drawn
 
     const double bars = bpm > 0.0 ? lengthS * bpm / 240.0 : 0.0; // 4/4 bars
     if (bars > 0.0)
@@ -4251,6 +5267,16 @@ void SourceWaveView::paint (juce::Graphics& g)
             const float bot = mid - juce::jlimit (-1.0f, 0.0f, lo) * half;
             g.drawVerticalLine (wave.getX() + x, top, juce::jmax (top + 1.0f, bot));
         }
+    }
+    else if (refHintShowing())
+    {
+        // First-run hint in place of the centre line and "no capture yet" (same area, no overlap).
+        const auto lines = refHintFor (refHintStandalone, wave);
+        auto box = wave.withSizeKeepingCentre (wave.getWidth(), lines.size() * kRefHintLineH);
+        g.setColour (kText);
+        g.setFont (juce::FontOptions (kRefHintFontH));
+        for (const auto& l : lines)
+            g.drawText (l, box.removeFromTop (kRefHintLineH), juce::Justification::centred, false);
     }
     else
     {
@@ -4305,7 +5331,12 @@ void HotStepLinkEditor::parseShotArgs (const juce::String& cmd)
     if (const auto w = valueOf ("--shot-load"); w.isNotEmpty())
     {
         useSourceFile (juce::File (w));
-        if (proc.addShotTake (juce::File (w))) // listed as take 0, so --shot-take 0 works on a fresh launch
+        // listed as take 0, so --shot-take 0 works on a fresh launch. A hot file is a pending
+        // guarded import: wait for it here (dev shot hook only) so take 0 exists right away.
+        const auto added = proc.addShotTakeChecked (juce::File (w));
+        if (added == HotStepLinkProcessor::AddTake::pending)
+            proc.waitTakeStretchIdle (30000);
+        if (added == HotStepLinkProcessor::AddTake::added || added == HotStepLinkProcessor::AddTake::pending)
             refreshTakes();
     }
     if (const auto t = valueOf ("--shot-take"); t.isNotEmpty())
@@ -4360,4 +5391,55 @@ void HotStepLinkEditor::runShotStep()
     if (shot.marker >= 0)
         takeEditor.shotDragWarp (shot.marker, shot.dstSec, shot.snap);
     shot.step = 0;
+}
+
+void HotStepLinkEditor::commitServerUrl()
+{
+    if (urlEditor.isReadOnly())
+        return;
+    const bool ok = proc.setServerUrl (urlEditor.getText());
+    if (ok)
+    {
+        urlEditor.removeColour (juce::TextEditor::outlineColourId);
+        urlEditor.removeColour (juce::TextEditor::focusedOutlineColourId);
+    }
+    else
+    {
+        urlEditor.setColour (juce::TextEditor::outlineColourId, juce::Colours::red);
+        urlEditor.setColour (juce::TextEditor::focusedOutlineColourId, juce::Colours::red);
+    }
+    urlEditor.setTooltip (ok ? juce::String() : juce::String ("Expected http://host:port"));
+    if (ok)
+        updateExposureWarning();
+    urlEditor.repaint();
+}
+
+void HotStepLinkEditor::updateExposureWarning()
+{
+    // Never reads or logs the key value: only whether one is set. Never blocks connecting.
+    const bool noKey = keyEditor.getText().trim().isEmpty();
+    const bool exposed = HotStepLinkProcessor::shouldWarnExposure (proc.getServerUrl(), ! noKey);
+    exposureLabel.setText (exposed ? "Remote server, no key set" : "", juce::dontSendNotification);
+    exposureLabel.setVisible (exposed);
+    // The red invalid-URL outline wins over amber.
+    const bool redShown = urlEditor.isColourSpecified (juce::TextEditor::outlineColourId)
+                          && urlEditor.findColour (juce::TextEditor::outlineColourId) == juce::Colours::red;
+    if (redShown)
+        return;
+    const bool overridden = HotStepLinkProcessor::serverUrlOverride().isNotEmpty();
+    if (exposed)
+    {
+        urlEditor.setColour (juce::TextEditor::outlineColourId, kAmberB);
+        urlEditor.setColour (juce::TextEditor::focusedOutlineColourId, kAmberB);
+        urlEditor.setTooltip ("Remote server with no Key: anyone on your network can drive this HOT-Step. "
+                              "Set HOTSTEP_DAW_KEY on the server and enter it here.");
+    }
+    else
+    {
+        urlEditor.removeColour (juce::TextEditor::outlineColourId);
+        urlEditor.removeColour (juce::TextEditor::focusedOutlineColourId);
+        urlEditor.setTooltip (overridden ? juce::String ("Server URL set by HSLINK_SERVER_URL (launch override, not saved)")
+                                         : juce::String());
+    }
+    urlEditor.repaint();
 }

@@ -5,6 +5,7 @@
 // parameter value exactly where it was. Same-tag XML with an unknown version attribute is
 // accepted, because loadState only checks the root tag name.
 #include "PluginProcessor.h"
+#include "TestSettingsRedirect.h"
 
 #include <cstdio>
 #include <vector>
@@ -78,6 +79,7 @@ void rejectCase (HotStepLinkProcessor& p, const void* data, int size, const char
 
 int main()
 {
+    HslinkTestSettingsRedirect settingsRedirect ("clapverdict"); // never the real user settings; first, before any processor
     juce::ScopedJuceInitialiser_GUI init;
     HotStepLinkProcessor p;
     setNonDefault (p);

@@ -17,10 +17,14 @@
 
 namespace TakeEdit
 {
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<int> testLevelMutant { lvMutNone };
+#endif
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<const char*> testEditPartToken { nullptr };
 std::atomic<bool> testUntaggedWarp { false };
+#endif
 
 EditData EditData::sanitized (juce::int64 lengthSamples) const
 {
@@ -229,7 +233,12 @@ namespace
             std::vector<float> mono ((size_t) len, 0.0f);
             for (int c = 0; c < res.channels; ++c)
                 juce::FloatVectorOperations::add (mono.data(), in.getReadPointer (c), (int) len);
-            const auto window = testLevelMutant.load() == lvMutNoZeroSnap ? (juce::int64) 0
+#if defined (HSLINK_TEST_HOOKS)
+            const int snapMutant = testLevelMutant.load();
+#else
+            const int snapMutant = lvMutNone;
+#endif
+            const auto window = snapMutant == lvMutNoZeroSnap ? (juce::int64) 0
                               : (juce::int64) std::llround (juce::jlimit (0.0, kMaxFadeMs, opt.zeroCrossingMs) * sr / 1000.0);
             const juce::int64 cs0 = cs, ce0 = ce;
             if (d.cropStart >= 0)
@@ -246,15 +255,20 @@ namespace
             return fail ("aborted");
 
         const auto fadeAsked = (juce::int64) std::llround (juce::jlimit (0.0, kMaxFadeMs, opt.fadeMs) * sr / 1000.0);
-        const bool revOn = d.reverse && ! warpRender && testLevelMutant.load() != lvMutNoReverse;
+#if defined (HSLINK_TEST_HOOKS)
+        const int levelMutant = testLevelMutant.load();
+#else
+        const int levelMutant = lvMutNone;
+#endif
+        const bool revOn = d.reverse && ! warpRender && ! opt.cutSplice && levelMutant != lvMutNoReverse;
         // Loop seam length, known before the reverse so the pre-roll can be reversed with it.
         juce::int64 seamX = 0;
         if (loopRender)
         {
-            const juce::int64 xUser = testLevelMutant.load() == lvMutNoXfade ? 0 : (juce::int64) std::llround (d.loopXfadeMs * sr / 1000.0);
+            const juce::int64 xUser = levelMutant == lvMutNoXfade ? 0 : (juce::int64) std::llround (d.loopXfadeMs * sr / 1000.0);
             seamX = juce::jmin (juce::jmax (fadeAsked, xUser), ls, (le - ls) / 2);
             // Reversed, the audio before the loop start is the audio after its end, backwards.
-            if (revOn && testLevelMutant.load() != lvMutRevSeamForward)
+            if (revOn && levelMutant != lvMutRevSeamForward)
                 seamX = juce::jmin (seamX, len - le);
         }
         // Reverse: the kept region backwards, after the crop and before the fades and gain.
@@ -262,14 +276,45 @@ namespace
         // reversed audio after the loop end, so the seam fades from what plays.
         if (revOn)
         {
-            const juce::int64 pad = loopRender && testLevelMutant.load() != lvMutRevSeamForward ? seamX : 0;
+            const juce::int64 pad = loopRender && levelMutant != lvMutRevSeamForward ? seamX : 0;
             const juce::int64 r0 = loopRender ? ls - pad : cs, r1 = loopRender ? le + pad : ce;
             if (r0 >= 0 && r1 > r0)
                 for (int c = 0; c < in.getNumChannels(); ++c)
                     std::reverse (in.getWritePointer (c) + r0, in.getWritePointer (c) + r1);
         }
         juce::AudioBuffer<float> out;
-        if (loopRender)
+        if (opt.cutSplice)
+        {
+            // F2: [0, ls - x) + crossfade (end of the left part into the start of the right
+            // part, x frames) + [le + x, len). Length len - (le - ls) - x.
+            if (loopRender || warpRender)
+                return fail ("cut and splice cannot be a loop or a warp render");
+            if (ls < 0 || le <= ls || le > len)
+                return fail ("no region to cut");
+            if (ls == 0 && le == len)
+                return fail ("the cut would remove the whole take");
+            const juce::int64 xUser = (juce::int64) std::llround (d.loopXfadeMs * sr / 1000.0);
+            const juce::int64 x = juce::jmin (juce::jmax (fadeAsked, xUser), ls, len - le);
+            res.cutRemoved = le - ls;
+            res.seamFadeSamples = x;
+            res.outSamples = len - (le - ls) - x;
+            out.setSize (res.channels, (int) res.outSamples);
+            for (int c = 0; c < res.channels; ++c)
+            {
+                const float* src = in.getReadPointer (c);
+                float* dst = out.getWritePointer (c);
+                std::copy (src, src + (ls - x), dst);
+                for (juce::int64 i = 0; i < x; ++i)
+                {
+                    const double t = ((double) i + 0.5) / (double) x * kHalfPi;
+                    dst[ls - x + i] = (float) ((double) src[ls - x + i] * std::cos (t) + (double) src[le + i] * std::sin (t));
+                }
+                std::copy (src + le + x, src + len, dst + ls);
+            }
+            res.used.loopStart = ls;
+            res.used.loopEnd = le;
+        }
+        else if (loopRender)
         {
             const juce::int64 cell = le - ls;
             res.outSamples = cell * (juce::int64) opt.loopRepeats;
@@ -326,11 +371,24 @@ namespace
         }
         else if (warpRender)
         {
-            // The whole file, piecewise warped; crop and loop points are not used.
+            // The whole file, piecewise warped, then only the S/E section (crop mapped
+            // through the markers) is kept, same bounds as Apply crop. Loop points are not used.
             out = TakeStretch::renderWarped (in, sr, opt.warp, stopNow);
             if (out.getNumSamples() <= 0)
                 return fail (stopNow() ? "aborted" : "the warp markers are not usable");
+            std::int64_t w0 = 0, w1 = 0;
+            if (! WarpMarkers::warpedCropRange (opt.warp, cs, ce, (std::int64_t) out.getNumSamples(), w0, w1))
+                return fail ("the crop region is empty");
+            if (w0 > 0 || w1 < (std::int64_t) out.getNumSamples())
+            {
+                juce::AudioBuffer<float> part (out.getNumChannels(), (int) (w1 - w0));
+                for (int c = 0; c < out.getNumChannels(); ++c)
+                    part.copyFrom (c, 0, out, c, (int) w0, (int) (w1 - w0));
+                out = std::move (part);
+            }
             res.outSamples = out.getNumSamples();
+            res.used.cropStart = cs;
+            res.used.cropEnd = ce;
         }
         else
         {
@@ -338,7 +396,7 @@ namespace
             const juce::int64 f = juce::jmin (fadeAsked, res.outSamples / 2);
             // F1: the user fades, sine ramps from the crop start and to the crop end,
             // applied whether or not the point is a real cut; each at most the region.
-            const bool noFade = testLevelMutant.load() == lvMutNoFade;
+            const bool noFade = levelMutant == lvMutNoFade;
             const juce::int64 fIn = noFade ? 0 : juce::jmin ((juce::int64) std::llround (d.fadeInMs * sr / 1000.0), res.outSamples);
             const juce::int64 fOut = noFade ? 0 : juce::jmin ((juce::int64) std::llround (d.fadeOutMs * sr / 1000.0), res.outSamples);
             out.setSize (res.channels, (int) res.outSamples);
@@ -370,7 +428,7 @@ namespace
             }
         }
         in.setSize (0, 0);
-        if (d.gainDb != 0.0 && testLevelMutant.load() != lvMutNoGain) // F1: the gain of the take on the whole result
+        if (d.gainDb != 0.0 && levelMutant != lvMutNoGain) // F1: the gain of the take on the whole result
             out.applyGain ((float) juce::Decibels::decibelsToGain (d.gainDb, -1000.0));
         if (opt.fitBars)
         {
@@ -380,7 +438,11 @@ namespace
         }
 
         // Write beside dest under a temporary name, then rename without replacing.
+#if defined (HSLINK_TEST_HOOKS)
         const auto* fixedToken = testEditPartToken.load();
+#else
+        const char* const fixedToken = nullptr;
+#endif
         const auto part = rq.dest.getSiblingFile (rq.dest.getFileName() + "." + (fixedToken != nullptr ? juce::String (fixedToken) : ExclusiveFile::uniqueToken (6))
                                                  + ".editing");
         // Created here, exclusively: a file that is already at that name is not ours and is
@@ -423,7 +485,12 @@ namespace
         }
         if (stopNow())
             return fail ("aborted");
-        const double tagBpm = warpRender ? (testUntaggedWarp.load() ? 0.0 : opt.warpBpm > 0.0 ? opt.warpBpm : 0.0)
+#if defined (HSLINK_TEST_HOOKS)
+        const bool untaggedWarp = testUntaggedWarp.load();
+#else
+        const bool untaggedWarp = false;
+#endif
+        const double tagBpm = warpRender ? (untaggedWarp ? 0.0 : opt.warpBpm > 0.0 ? opt.warpBpm : 0.0)
                                          : (gridUsable (opt.gridBpm, opt.gridDownbeatSec) ? opt.gridBpm : 0.0);
         WavTempoTag::inject (part, tagBpm); // tempo tags for DAW warping; skipped when the tempo is unknown
         if (! ExclusiveFile::moveNoReplace (part, rq.dest))

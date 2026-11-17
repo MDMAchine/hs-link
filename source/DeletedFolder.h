@@ -93,10 +93,16 @@ namespace DeletedFolder
 
     // Test seam, false in the plugin. true = the rename step is not made and reports
     // failure, so moveToDeletedFolder returns kept with the file where it was.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testFailRename;
+#endif
     // Times the real rename call was made (tests).
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> renameCalls;
+#endif
     // Test seam, false in the plugin. true = sourceState answers unknown for every
     // path (a drive that cannot be reached), so moveToDeletedFolder returns kept.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testSourceUnknown;
+#endif
 }

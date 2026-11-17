@@ -15,9 +15,11 @@
 
 namespace DeletedFolder
 {
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> testFailRename { false };
 std::atomic<int> renameCalls { 0 };
 std::atomic<bool> testSourceUnknown { false };
+#endif
 
 juce::String folderName() { return "Deleted"; }
 
@@ -115,8 +117,10 @@ Probe probePath (const juce::File& path)
 
 Source sourceState (const juce::File& file)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testSourceUnknown.load())
         return Source::unknown;
+#endif
     return sourceStateWith (file, [] (const juce::File& f) { return probePath (f); });
 }
 
@@ -146,9 +150,13 @@ juce::String pickFreeName (const juce::String& fileName,
 // juce::File::moveFileTo deletes an existing target first.
 static bool renameNoReplace (const juce::File& from, const juce::File& to)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testFailRename.load())
         return false;
+#endif
+#if defined (HSLINK_TEST_HOOKS)
     ++renameCalls;
+#endif
    #if JUCE_WINDOWS
     // Flags 0: no MOVEFILE_COPY_ALLOWED (fails across volumes), no MOVEFILE_REPLACE_EXISTING.
     return MoveFileExW (from.getFullPathName().toWideCharPointer(),

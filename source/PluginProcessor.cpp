@@ -9,6 +9,8 @@
 #include "WavTempoTag.h"
 #include <set>
 #include <mutex>
+#include <cstring>
+#include <string>
 
 namespace
 {
@@ -24,6 +26,10 @@ static const juce::Identifier kStarredId ("Starred"), kStarId ("Take"), kStarNam
 namespace HslinkDebugLog
 {
     static std::mutex& mtx() { static std::mutex m; return m; }
+#if defined (HSLINK_TEST_HOOKS)
+    static std::atomic<bool> countOnly { false }; // test build: keys are remembered, nothing is written
+    static std::atomic<int> seenSize[2] {};        // entries in the unlimited [0] and the capped [1] once-set
+#endif
     static bool enabled()
     {
         static const bool on = juce::SystemStats::getEnvironmentVariable ("HSLINK_DEBUG_LOG", {}).trim() == "1";
@@ -39,17 +45,47 @@ namespace HslinkDebugLog
         dir.getChildFile ("link_debug.log").appendText (juce::Time::getCurrentTime().toString (true, true, true, true)
                                                         + " " + msg + juce::newLine, false, false, nullptr);
     }
-    static void writeOnce (const juce::String& key, const juce::String& msg)
+    // cap > 0: the "seen" set of that caller's keys never holds more than cap entries (it is
+    // emptied when full, so a text can be logged again after cap other texts). cap 0 = no limit.
+    // True when a writeOnce call could write (or, in the test build, count) anything: callers
+    // with a costly key or message ask first and build nothing when it is false.
+    static bool wanted()
     {
-        if (! enabled())
-            return;
-        static std::set<juce::String> seen;
+#if defined (HSLINK_TEST_HOOKS)
+        if (countOnly.load())
+            return true;
+#endif
+        return enabled();
+    }
+    // True the first time a key is seen (and the log is on): the caller then builds the
+    // message and calls write(). False for a key seen already, so no message is built.
+    static bool firstTime (const juce::String& key, int cap = 0)
+    {
+        if (! wanted())
+            return false;
+        static std::set<juce::String> seen, seenCapped;
         {
             std::lock_guard<std::mutex> g (mtx());
-            if (! seen.insert (key).second)
-                return;
+            auto& s = cap > 0 ? seenCapped : seen;
+            if (s.count (key) != 0)
+                return false;
+            if (cap > 0 && (int) s.size() >= cap)
+                s.clear();
+            s.insert (key);
+#if defined (HSLINK_TEST_HOOKS)
+            seenSize[cap > 0 ? 1 : 0].store ((int) s.size());
+#endif
         }
-        write (msg);
+#if defined (HSLINK_TEST_HOOKS)
+        if (countOnly.load())
+            return false;
+#endif
+        return true;
+    }
+    static void writeOnce (const juce::String& key, const juce::String& msg, int cap = 0)
+    {
+        if (firstTime (key, cap))
+            write (msg);
     }
 }
 
@@ -207,12 +243,14 @@ HotStepLinkProcessor::HotStepLinkProcessor()
     for (int attempt = 0; attempt < 5; ++attempt)
     {
         tempSessionName = sessionName + "_" + ExclusiveFile::uniqueToken (6);
+#if defined (HSLINK_TEST_HOOKS)
         if (auto* nameFor = testSessionNameFor.load()) // test hook only
         {
             const auto forced = nameFor (attempt);
             if (forced.isNotEmpty())
                 tempSessionName = forced;
         }
+#endif
         const auto dir = DawWorker::tempRoot().getChildFile (tempSessionName);
         dir.createDirectory();
         if (attempt == 4 || ownLock.tryAcquire (dir) != ExclusiveFile::SessionLock::Result::Busy)
@@ -230,7 +268,9 @@ HotStepLinkProcessor::HotStepLinkProcessor()
                                       + DawWorker::tempRoot().getChildFile (tempSessionName).getFullPathName()
                                       + " could not be locked; this instance runs without a session lock");
     }
+#if defined (HSLINK_TEST_HOOKS)
     if (! ExclusiveFile::testLegacyOverwrite.load())
+#endif
         sessionName = tempSessionName;
     daw.setTakesFolder (DawWorker::tempRoot().getChildFile (tempSessionName));
     daw.setEndpoint (kDefaultServerUrl, dawKey);
@@ -245,10 +285,10 @@ HotStepLinkProcessor::HotStepLinkProcessor()
         if (env.isNotEmpty() && juce::File::isAbsolutePath (env))
             setCollectionRoot (juce::File (env));
     }
-    // Test / development hook, read once: HSLINK_STABLE_ROOT points the lasting take
+    // Test / development hook, read once: HSLINK_TAKES_ROOT points the lasting take
     // folder elsewhere before the saver thread starts.
     {
-        const auto env = juce::SystemStats::getEnvironmentVariable ("HSLINK_STABLE_ROOT", {});
+        const auto env = juce::SystemStats::getEnvironmentVariable ("HSLINK_TAKES_ROOT", {});
         if (env.isNotEmpty() && juce::File::isAbsolutePath (env))
             setStableRoot (juce::File (env));
     }
@@ -269,7 +309,9 @@ HotStepLinkProcessor::~HotStepLinkProcessor()
     // are both told to end before the wait for the collection pool, so the worker
     // does not start another download during that wait.
     const bool closeGuard = shutdownGuard.load();
+#if defined (HSLINK_TEST_HOOKS)
     destructorBegan = true;
+#endif
     // Tempo measurements: told to stop first (a running one ends at its next poll), and
     // the gate is closed, so no job stores a result from here on.
     measureGate->stop = true;
@@ -285,8 +327,10 @@ HotStepLinkProcessor::~HotStepLinkProcessor()
         if (signalWorkerEarly.load())
             daw.signalStop();
     }
+#if defined (HSLINK_TEST_HOOKS)
     if (auto* beforePool = testBeforePoolWait.load()) // test hook only
         beforePool (*this);
+#endif
     stretchPool.removeAllJobs (true, 20000);    // stopped above: ends within its next poll, lists nothing (gate closed)
     measurePool.removeAllJobs (true, 20000);    // stopped above: ends within its next poll
     collectionPool.removeAllJobs (true, 20000); // a background rescan never outlives the processor
@@ -329,9 +373,11 @@ HotStepLinkProcessor::~HotStepLinkProcessor()
         // verified copy). A starred take is treated like any other. No file is
         // looked at for this and nothing is done under takesLock but reading the list.
         bool keep = false;
+#if defined (HSLINK_TEST_HOOKS)
         if (testDtorProbesLasting.load())
             keep = legacyFolderReferenced (dir); // teeth only: the old probing
         else
+#endif
         {
             std::lock_guard<std::mutex> g (takesLock);
             for (const auto& t : takes)
@@ -472,6 +518,7 @@ juce::Array<juce::File> HotStepLinkProcessor::getOwnTempFolders() const
     return out;
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<int> EditorFs::testCalls[EditorFs::tagCount] {};
 std::atomic<bool> TakeGrid::testEditorStats { false };
 std::atomic<int> TakeGrid::testLengthMutant { 0 };
@@ -481,7 +528,9 @@ std::atomic<bool> TakeGrid::testNoTempFallback { false };
 std::atomic<bool> TakeGrid::testNoThumbFallback { false };
 std::atomic<int> EditorFs::testThumbTemp { 0 };
 std::atomic<int> EditorFs::testThumbElsewhere { 0 };
+#endif
 
+#if defined (HSLINK_TEST_HOOKS)
 void EditorFs::countThumbSource (const juce::File& f)
 {
     if (f.isAChildOf (DawWorker::tempRoot()))
@@ -489,14 +538,22 @@ void EditorFs::countThumbSource (const juce::File& f)
     else
         ++testThumbElsewhere;
 }
+#endif
 
 juce::File TakeGrid::thumbSourceOf (const Cell& c)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testThumbFromLasting.load())
         return c.file;
+#endif
     // The temp copy while it exists; once cleanup has removed it, the lasting copy
     // (a card made after the temp went would otherwise stay on "loading...").
-    if (testNoThumbFallback.load() || c.temp.existsAsFile() || c.file == juce::File() || c.file == c.temp
+#if defined (HSLINK_TEST_HOOKS)
+    const bool noThumbFallback = testNoThumbFallback.load();
+#else
+    const bool noThumbFallback = false;
+#endif
+    if (noThumbFallback || c.temp.existsAsFile() || c.file == juce::File() || c.file == c.temp
         || ! c.file.existsAsFile())
         return c.temp;
     return c.file;
@@ -506,7 +563,12 @@ juce::File TakeGrid::actionFileOf (const Cell& c, EditorFs::Tag tag, bool* found
 {
     bool ok = EditorFs::exists (c.file, tag);
     auto use = c.file;
-    if (! ok && ! testNoTempFallback.load() && c.saved && c.temp != juce::File() && c.temp != c.file
+#if defined (HSLINK_TEST_HOOKS)
+    const bool noTempFallback = testNoTempFallback.load();
+#else
+    const bool noTempFallback = false;
+#endif
+    if (! ok && ! noTempFallback && c.saved && c.temp != juce::File() && c.temp != c.file
         && EditorFs::exists (c.temp, tag))
     {
         use = c.temp;
@@ -516,9 +578,11 @@ juce::File TakeGrid::actionFileOf (const Cell& c, EditorFs::Tag tag, bool* found
         *found = ok;
     return use;
 }
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<int> HotStepLinkProcessor::testRescueLastingProbes { 0 };
 std::atomic<void (*) (HotStepLinkProcessor&)> HotStepLinkProcessor::testBeforeRescueTake { nullptr };
 std::atomic<bool> HotStepLinkProcessor::testRescueProbeBeforeClosing { false };
+#endif
 
 juce::String TakeGrid::keyOf (const HslinkTakeEntry& e)
 {
@@ -568,11 +632,19 @@ TakeGrid::Model TakeGrid::build (const std::vector<HslinkTakeEntry>& takes, int 
                                    + " durS " + juce::String (t.durationS, 2));
         c.badge = ! c.saved && t.copyFailed;
         c.pending = ! c.saved && ! t.copyFailed;
-        c.missing = t.missing && ! testMissingIgnored.load();
+        c.handingOver = t.handingOver;
+#if defined (HSLINK_TEST_HOOKS)
+        const bool missingIgnored = testMissingIgnored.load();
+#else
+        const bool missingIgnored = false;
+#endif
+        c.missing = t.missing && ! missingIgnored;
         c.dragAllowed = c.saved && ! c.missing;
         c.shown = (selectedJob == 0 || t.jobId == selectedJob) && (c.saved || showUnsaved);
+#if defined (HSLINK_TEST_HOOKS)
         if (c.shown && testEditorStats.load() && ! EditorFs::exists (c.file, EditorFs::tagTick))
             c.shown = false; // test only: the old filter
+#endif
         c.selected = selected != juce::File() && (selected == t.temp || (c.saved && selected == t.stable));
         c.starred = isStarred != nullptr && isStarred (c.file);
         c.tempoState = t.tempoState;
@@ -603,6 +675,52 @@ int TakeGrid::fitToBarsScore (double lengthSec, double takeBpm, double hostBpm, 
     return juce::jlimit (0, 100, juce::roundToInt (100.0 * score));
 }
 
+int TakeGrid::fitLengthScore (double lengthSec, double requestedSec, double bpm, int beatsPerBar)
+{
+    if (! std::isfinite (lengthSec) || lengthSec <= 0.0)
+        return -1;
+    if (std::isfinite (requestedSec) && requestedSec > 0.0)
+    {
+        const double sigma = kFitLenSigmaFrac * requestedSec;
+        const double z = (lengthSec - requestedSec) / sigma;
+        return juce::jlimit (0, 100, juce::roundToInt (100.0 * std::exp (-0.5 * z * z)));
+    }
+    juce::ignoreUnused (bpm, beatsPerBar);
+    return -1; // no requested length: no length part (no bar-grid fallback)
+}
+
+int TakeGrid::fitTempoScore (double measuredBpm, double requestedBpm)
+{
+    if (! std::isfinite (measuredBpm) || ! std::isfinite (requestedBpm) || measuredBpm <= 0.0 || requestedBpm <= 0.0)
+        return -1;
+    const double r = std::log2 (measuredBpm / requestedBpm);
+    const double err = juce::jmin (std::abs (r), std::abs (r - 1.0), std::abs (r + 1.0));
+    const double tol = std::log2 (1.0 + kFitTempoFoldTol);
+    return juce::jlimit (0, 100, juce::roundToInt (100.0 * (1.0 - juce::jmin (1.0, err / tol))));
+}
+
+int TakeGrid::fitMinScore (int lenScore, int tempoScore)
+{
+    if (lenScore < 0) return tempoScore < 0 ? -1 : tempoScore;
+    if (tempoScore < 0) return lenScore;
+    return juce::jmin (lenScore, tempoScore);
+}
+
+TakeGrid::TempoTag TakeGrid::fitTagOf (int lenScore, int tempoScore)
+{
+    TempoTag t;
+    const int m = fitMinScore (lenScore, tempoScore);
+    if (m < 0)
+    {
+        t.text = "-";
+        return t; // colour none: never a red 0
+    }
+    auto part = [] (const char* n, int v) { return v < 0 ? juce::String() : juce::String (n) + juce::String (v); };
+    t.text = part ("len ", lenScore) + (lenScore >= 0 && tempoScore >= 0 ? " / " : "") + part ("tempo ", tempoScore);
+    t.colour = m >= 80 ? TempoTag::green : m >= 50 ? TempoTag::amber : TempoTag::red;
+    return t;
+}
+
 TakeGrid::TempoTag TakeGrid::fitTagOf (int score)
 {
     TempoTag t;
@@ -617,7 +735,12 @@ juce::String TakeGrid::lengthTextOf (double seconds)
 {
     if (! (seconds > 0.0))
         return {};
-    if (seconds < 59.95 || testLengthMutant.load() == 1)
+#if defined (HSLINK_TEST_HOOKS)
+    const bool lengthNoMinutes = testLengthMutant.load() == 1;
+#else
+    const bool lengthNoMinutes = false;
+#endif
+    if (seconds < 59.95 || lengthNoMinutes)
         return juce::String (seconds, 1) + " s";
     const int total = juce::roundToInt (seconds);
     return juce::String (total / 60) + ":" + juce::String (total % 60).paddedLeft ('0', 2);
@@ -816,8 +939,10 @@ void HotStepLinkProcessor::requestTakeMeasure (const juce::File& tempFile, doubl
                 TempoMeasure::Result r;
                 bool measured = ! gate->stop.load()
                                 && measureTakeForCell (tempFile, hintBpm, r, [gate] { return gate->stop.load(); });
+#if defined (HSLINK_TEST_HOOKS)
                 if (measured && testFailRemeasure.load())
                     r = TempoMeasure::Result(); // tests only: no number
+#endif
                 std::lock_guard<std::mutex> g (gate->lock);
                 if (! gate->closed)
                 {
@@ -909,7 +1034,12 @@ bool HotStepLinkProcessor::requestTakeStretch (const juce::File& tempFile, doubl
                 if (gate->closed)
                     return; // closing: the file stays in the temp session folder, unlisted
                 TakeEntry e = src;
-                if (! testDerivedInheritsNum.load())
+#if defined (HSLINK_TEST_HOOKS)
+                const bool derivedInheritsNum = testDerivedInheritsNum.load();
+#else
+                const bool derivedInheritsNum = false;
+#endif
+                if (! derivedInheritsNum)
                     e.number = 0; // D2c: a derived take is a new take, fresh number on top
 #if ! defined (HSLINK_TEETH_COPY_EXTERNAL)
                 e.external = false; // the copy is the plugin's own file, not the user's
@@ -924,7 +1054,12 @@ bool HotStepLinkProcessor::requestTakeStretch (const juce::File& tempFile, doubl
                 e.tempoState = TakeEntry::tempoNotMeasured;
                 e.tempo = TempoMeasure::Result();
                 e.resolvedTempo = TempoResolve::Resolved();
-                e.estimatedBpm = testNoDerivedEstimate.load() ? 0.0 : toBpm; // fallback if the remeasure has no number
+#if defined (HSLINK_TEST_HOOKS)
+                const bool noDerivedEstimate = testNoDerivedEstimate.load();
+#else
+                const bool noDerivedEstimate = false;
+#endif
+                e.estimatedBpm = noDerivedEstimate ? 0.0 : toBpm; // fallback if the remeasure has no number
                 {
                     std::lock_guard<std::mutex> tl (takesLock);
                     for (const auto& t : takes)
@@ -975,9 +1110,11 @@ juce::String HotStepLinkProcessor::editedTakeName (const juce::String& name, con
         what << ' ' << (juce::int64) m.srcFrame << ':' << (juce::int64) m.dstFrame;
     if (! options.warp.empty())
         what << ' ' << juce::String (options.warpBpm, 3);
+    if (options.cutSplice)
+        what << " cut " << juce::String (edit.loopXfadeMs, 3);
     const auto hash = juce::String::toHexString ((int) (what.hashCode64() & 0xffff)).paddedLeft ('0', 4);
     return stem + (options.loopRepeats >= 1 ? "_edl" + juce::String (options.loopRepeats) + "x"
-                                             : juce::String (options.warp.empty() ? "_edc" : "_edw")) + hash + ".wav";
+                                             : juce::String (options.cutSplice ? "_edx" : options.warp.empty() ? "_edc" : "_edw")) + hash + ".wav";
 }
 
 bool HotStepLinkProcessor::setTakeEdit (const juce::File& tempFile, const TakeEdit::EditData& edit)
@@ -1075,7 +1212,9 @@ bool HotStepLinkProcessor::getTakeEditReport (juce::uint64 ticket, TakeEditRepor
     return false;
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<juce::uint64> HotStepLinkProcessor::testHoldEditFromTicket { 0 };
+#endif
 
 HotStepLinkProcessor::TakeEditState HotStepLinkProcessor::getTakeEditState (juce::uint64 ticket) const
 {
@@ -1103,6 +1242,7 @@ void HotStepLinkProcessor::storeTakeEditReportLocked (TakeEditReport report)
         takeEditReports.pop_front();
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 void HotStepLinkProcessor::setTakeNameForTest (const juce::File& tempFile, const juce::String& name)
 {
     std::lock_guard<std::mutex> g (takesLock);
@@ -1110,12 +1250,46 @@ void HotStepLinkProcessor::setTakeNameForTest (const juce::File& tempFile, const
         if (t.temp == tempFile)
             t.name = name;
 }
+#endif
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<int> HotStepLinkProcessor::addTakeMutantForTest { HotStepLinkProcessor::mutAddTakeNone };
+#endif
 
 bool HotStepLinkProcessor::addShotTake (const juce::File& wav)
 {
-    if (! wav.existsAsFile())
+    const auto r = addShotTakeChecked (wav);
+    return r == AddTake::added || r == AddTake::pending;
+}
+
+juce::String HotStepLinkProcessor::takeImportMessage()
+{
+    std::lock_guard<std::mutex> g (takesLock);
+    juce::String m;
+    std::swap (m, importMessage);
+    return m;
+}
+
+juce::String HotStepLinkProcessor::importKey (const juce::File& f)
+{
+   #if JUCE_WINDOWS || JUCE_MAC
+    return f.getFullPathName().toLowerCase();
+   #else
+    return f.getFullPathName();
+   #endif
+}
+
+bool HotStepLinkProcessor::importListedLocked (const juce::String& key) const
+{
+    for (const auto& t : takes)
+        if (importKey (t.temp) == key || (t.importedFrom != juce::File() && importKey (t.importedFrom) == key))
+            return true;
+    return false;
+}
+
+bool HotStepLinkProcessor::listUserFileLocked (const juce::File& wav, double durationS)
+{
+    if (importListedLocked (importKey (wav)))
         return false;
     TakeEntry e;
     e.temp = wav;
@@ -1124,30 +1298,222 @@ bool HotStepLinkProcessor::addShotTake (const juce::File& wav)
     e.copyFailed = e.handingOver = false;
     e.external = true; // the user's file: delete never moves it
     e.createdMs = juce::Time::currentTimeMillis();
+    e.durationS = durationS;
+    takes.insert (takes.begin(), e);
+    numberTakeLocked (takes.front()); // D2: stable number, once
+    stableByTemp[wav.getFullPathName()] = wav;
+    return true;
+}
+
+HotStepLinkProcessor::AddTake HotStepLinkProcessor::addShotTakeChecked (const juce::File& wav)
+{
+    if (! wav.existsAsFile())
+        return AddTake::refused;
+    const auto key = importKey (wav);
+    double durationS = 0.0;
+    bool peakKnown = false;
+    float samplePeak = 0.0f;
     {
         juce::AudioFormatManager fm;
         fm.registerBasicFormats();
         if (std::unique_ptr<juce::AudioFormatReader> r (fm.createReaderFor (wav)); r != nullptr && r->sampleRate > 0.0)
         {
             double rate = r->sampleRate; // the file's own rate, not the host's
+#if defined (HSLINK_TEST_HOOKS)
             if (addTakeMutantForTest.load() == mutAddTakeWrongRate)
                 rate = getSampleRate() > 0.0 ? getSampleRate() : 48000.0;
-            e.durationS = (double) r->lengthInSamples / rate;
+#endif
+            durationS = (double) r->lengthInSamples / rate;
+            if (r->lengthInSamples > 0 && r->numChannels > 0)
+            {
+                // Cheap sample-peak read: a file at or under kImportInPlaceDbfs is listed in place now.
+                std::vector<juce::Range<float>> lv ((size_t) r->numChannels);
+                r->readMaxLevels (0, r->lengthInSamples, lv.data(), (int) r->numChannels);
+                for (const auto& l : lv)
+                    samplePeak = juce::jmax (samplePeak, std::abs (l.getStart()), std::abs (l.getEnd()));
+                peakKnown = true;
+            }
         }
     }
+    const bool inPlace = ! peakKnown || juce::Decibels::gainToDecibels (samplePeak, -200.0f) <= kImportInPlaceDbfs;
     {
         std::lock_guard<std::mutex> g (takesLock);
-        for (const auto& t : takes)
-            if (t.temp == wav)
-                return false;
-        takes.insert (takes.begin(), e);
-        numberTakeLocked (takes.front()); // D2: stable number, once
-        stableByTemp[wav.getFullPathName()] = wav;
+        if (importListedLocked (key))
+            return AddTake::duplicate;
+        for (const auto& p : pendingImports)
+            if (p == key)
+                return AddTake::duplicate;
+        if (inPlace)
+        {
+            listUserFileLocked (wav, durationS);
+        }
+        else
+        {
+            if (closingNow() || measureGate->stop.load())
+                return AddTake::refused;
+            pendingImports.push_back (key);
+        }
     }
-    // Same tempo path as a generated take: measure, then resolve (file name first), so
-    // the grid and warp markers exist for the loaded file.
-    requestTakeMeasure (wav, 0.0);
-    return true;
+    if (inPlace)
+    {
+        // Same tempo path as a generated take: measure, then resolve (file name first), so
+        // the grid and warp markers exist for the loaded file.
+        requestTakeMeasure (wav, 0.0);
+        return AddTake::added;
+    }
+    // Hot file: true-peak scan, and a guarded session copy if over the guard, on the
+    // stretch pool. The job reaches the processor only under the gate while it is open.
+    // The user's file is only read. Nothing may leave the job by exception.
+    const auto sessionDir = tempSessionName.isNotEmpty() ? DawWorker::tempRoot().getChildFile (tempSessionName) : juce::File();
+    stretchPool.addJob ([this, gate = measureGate, wav, key, durationS, sessionDir]
+    {
+        // One exit guard for every way out of the job (return or exception): the key
+        // leaves pendingImports, so a failed import is never reported as a duplicate
+        // later, and a copy this job wrote but did not list is removed. Only that
+        // exact copy is deleted, and only while no take lists it; the user's file is
+        // never touched. With the gate closed the processor is going away: nothing is
+        // reached, and a copy stays in the temp session folder.
+        bool keyCleared = false, copyMade = false, copyKept = false;
+        const char* thrown = nullptr;
+        juce::File copy;
+        const juce::ScopeGuard atExit { [&]
+        {
+            if (keyCleared && (! copyMade || copyKept))
+                return;
+            try
+            {
+                // Decided under takesLock, deleted after it is released (no file call
+                // under takesLock). The gate stays held, so the processor outlives this.
+                juce::File toDelete;
+                std::lock_guard<std::mutex> g (gate->lock);
+                if (gate->closed)
+                    return;
+                {
+                    std::lock_guard<std::mutex> tl (takesLock);
+                    if (! keyCleared)
+                    {
+                        pendingImports.erase (std::remove (pendingImports.begin(), pendingImports.end(), key), pendingImports.end());
+                        importMessage = "Take not added: " + wav.getFileName() + ": " + (thrown != nullptr ? thrown : "unexpected error");
+                    }
+                    if (copyMade && ! copyKept)
+                    {
+                        bool isListed = false;
+                        for (const auto& t : takes)
+                            isListed = isListed || t.temp == copy;
+                        if (! isListed)
+                            toDelete = copy;
+                    }
+                }
+                if (toDelete != juce::File())
+                    toDelete.deleteFile();
+            }
+            catch (...)
+            {
+            }
+        } };
+        try
+        {
+            juce::String failure;
+            bool hot = false;
+            {
+                juce::AudioFormatManager fm;
+                fm.registerBasicFormats();
+                std::unique_ptr<juce::AudioFormatReader> rd (fm.createReaderFor (wav));
+                if (rd == nullptr || rd->lengthInSamples <= 0 || rd->numChannels <= 0
+                    || rd->lengthInSamples > (juce::int64) std::numeric_limits<int>::max())
+                {
+                    failure = "unreadable or too long";
+                }
+                else
+                {
+                    juce::AudioBuffer<float> buf ((int) rd->numChannels, (int) rd->lengthInSamples);
+                    if (! rd->read (&buf, 0, (int) rd->lengthInSamples, 0, true, true))
+                        failure = "read failed";
+                    else
+                        hot = PeakGuard::importGainForPeak (PeakGuard::truePeakDb (buf)) < 0.0f;
+                }
+            }
+            PeakGuard::GuardCopyResult res;
+            if (failure.isEmpty() && hot && ! gate->stop.load())
+            {
+                if (sessionDir == juce::File() || ! (sessionDir.isDirectory() || sessionDir.createDirectory()))
+                    failure = "no temp session folder";
+                else
+                {
+                    copy = sessionDir.getNonexistentChildFile (wav.getFileNameWithoutExtension(), ".wav", false);
+                    res = PeakGuard::guardCopy (wav, copy); // deletes a partial dest itself
+                    copyMade = res.ok;
+                    if (! res.ok)
+                        failure = res.reason;
+                }
+            }
+            if (failure.isEmpty() && hot && copy == juce::File())
+                failure = "closing";
+            if (failure.isNotEmpty())
+                juce::Logger::writeToLog ("HOT-STEP LINK: import of " + wav.getFileName() + " not done: " + failure);
+            std::lock_guard<std::mutex> g (gate->lock);
+            if (gate->closed)
+                return; // closing: a copy stays in the temp session folder, unlisted
+            bool listed = false;
+            {
+                std::lock_guard<std::mutex> tl (takesLock);
+                pendingImports.erase (std::remove (pendingImports.begin(), pendingImports.end(), key), pendingImports.end());
+                keyCleared = true;
+                if (failure.isNotEmpty())
+                {
+                    importMessage = "Take not added: " + wav.getFileName() + ": " + failure;
+                    return;
+                }
+                if (! hot)
+                {
+                    // Not listed = the same file got listed while this import was pending.
+                    listed = listUserFileLocked (wav, durationS);
+                    importMessage = (listed ? "Added take: " : "Already in the take list: ") + wav.getFileName();
+                }
+                else
+                {
+                    bool already = importListedLocked (key); // in place or as importedFrom
+                    for (const auto& t : takes)
+                        already = already || t.temp == copy;
+                    if (already)
+                    {
+                        // Listed while this import was pending: say so; the exit
+                        // guard removes the copy this job wrote (if no take lists it).
+                        importMessage = "Already in the take list: " + wav.getFileName();
+                        return;
+                    }
+                    TakeEntry e;
+                    e.temp = copy;
+                    e.stable = juce::File(); // the saver copies it to the takes folder
+                    e.name = copy.getFileName();
+                    e.copyFailed = e.handingOver = false;
+                    e.external = false; // the guarded copy is the plugin's own file
+                    e.importedFrom = wav;
+                    e.createdMs = juce::Time::currentTimeMillis();
+                    e.durationS = durationS;
+                    takes.insert (takes.begin(), e);
+                    numberTakeLocked (takes.front()); // D2: stable number, once
+                    listed = true;
+                    copyKept = true;
+                    importMessage = "Added take: " + copy.getFileName() + "  " + PeakGuard::text (res.gainDb);
+                }
+            }
+            if (! listed)
+                return;
+            requestTakeMeasure (hot ? copy : wav, 0.0);
+            if (hot)
+                wakeSaverForNewTake();
+        }
+        catch (const std::bad_alloc&)
+        {
+            thrown = "not enough memory";
+        }
+        catch (...)
+        {
+            thrown = "unexpected error";
+        }
+    });
+    return AddTake::pending;
 }
 
 juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, const TakeEdit::EditData& edit, const TakeEdit::EditOptions& options,
@@ -1168,8 +1534,13 @@ juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, 
         {
             const auto clean = edit.sanitized();
             std::lock_guard<std::mutex> g (takesLock);
+#if defined (HSLINK_TEST_HOOKS)
+            const bool missingIgnored = TakeGrid::testMissingIgnored.load();
+#else
+            const bool missingIgnored = false;
+#endif
             for (auto& t : takes)
-                if (t.temp == tempFile && ! t.handingOver && ! (t.missing && ! TakeGrid::testMissingIgnored.load()))
+                if (t.temp == tempFile && ! t.handingOver && ! (t.missing && ! missingIgnored))
                 {
                     t.edit = clean;
                     src = t;
@@ -1198,7 +1569,8 @@ juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, 
         const bool gridSkipped = options.snapToGrid && ! haveGrid;
         rq.options.snapToGrid = options.snapToGrid && haveGrid;
         rq.options.gridBpm = ! haveGrid ? 0.0 : (handGrid ? src.gridEdit.bpm : src.tempo.bpm);
-        rq.options.gridDownbeatSec = ! haveGrid ? 0.0 : (handGrid ? src.gridEdit.downbeatSec : src.tempo.downbeatSec);
+        rq.options.gridDownbeatSec = HostSyncState::renderGridDownbeat (haveGrid, handGrid, src.gridEdit.downbeatSec,
+                                                         src.tempo.downbeatSec, (double) src.tempo.level);
         // The render itself touches no processor (own reader, own buffers). The job
         // reaches the processor only to store its report and list the new take, under
         // the gate and only while it is open. Nothing may leave the job by exception.
@@ -1230,8 +1602,10 @@ juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, 
                 ~Ended() { mark (false); } // last, after the gate lock of the body is let go
             } ended { markJob };
             markJob (true);
+#if defined (HSLINK_TEST_HOOKS)
             while (testHoldEditFromTicket.load() != 0 && ticket >= testHoldEditFromTicket.load() && ! gate->stop.load())
                 juce::Thread::sleep (2); // tests only
+#endif
             bool reported = false;
             try
             {
@@ -1243,9 +1617,14 @@ juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, 
                 std::lock_guard<std::mutex> g (gate->lock);
                 if (gate->closed)
                     return; // closing: a finished file stays in the temp session folder, unlisted
-                bool listed = false;
+                bool listed = false, carried = false;
                 TakeEntry e = src;
-                if (! testDerivedInheritsNum.load())
+#if defined (HSLINK_TEST_HOOKS)
+                const bool derivedInheritsNum = testDerivedInheritsNum.load();
+#else
+                const bool derivedInheritsNum = false;
+#endif
+                if (! derivedInheritsNum)
                     e.number = 0; // D2c: a derived take is a new take, fresh number on top
 #if ! defined (HSLINK_TEETH_COPY_EXTERNAL)
                 e.external = false; // the copy is the plugin's own file, not the user's
@@ -1258,11 +1637,38 @@ juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, 
                     e.copyFailed = e.handingOver = false;
                     e.durationS = (double) res.outSamples / res.sampleRate;
                     e.createdMs = juce::Time::currentTimeMillis();
-                    e.estimatedBpm = testNoDerivedEstimate.load() ? 0.0 : derivedTempoOf (src); // before the reset
+#if defined (HSLINK_TEST_HOOKS)
+                    const bool noDerivedEstimate = testNoDerivedEstimate.load();
+#else
+                    const bool noDerivedEstimate = false;
+#endif
+                    e.estimatedBpm = noDerivedEstimate ? 0.0 : derivedTempoOf (src); // before the reset
                     e.tempoState = TakeEntry::tempoNotMeasured;
                     e.tempo = TempoMeasure::Result();
                     e.resolvedTempo = TempoResolve::Resolved();
                     e.edit = TakeEdit::EditData(); // the points were positions in the source file
+                    // F4b: an edit that keeps the tempo (crop, cut/splice, fades, gain, reverse; not
+                    // warp, which sets its own) carries the source measurement: bpm, drift, downbeat
+                    // (shifted by the crop start, wrapped to one beat). No remeasure, no "bpm ..." pill.
+#if defined (HSLINK_TEST_HOOKS)
+                    const bool noCarryTempo = testNoCarryTempo.load();
+#else
+                    const bool noCarryTempo = false;
+#endif
+                    if (! noCarryTempo && rq.options.warp.empty() && src.tempoState == TakeEntry::tempoMeasured
+                        && src.tempo.valid && src.tempo.bpm > 0.0)
+                    {
+                        e.tempoState = TakeEntry::tempoMeasured;
+                        e.tempo = src.tempo;
+                        e.resolvedTempo = src.resolvedTempo;
+                        const double beat = 60.0 / src.tempo.bpm;
+                        const double shift = res.used.cropStart > 0 ? (double) res.used.cropStart / res.sampleRate : 0.0;
+                        double db = std::fmod (src.tempo.downbeatSec - shift, beat);
+                        if (db < 0.0)
+                            db += beat;
+                        e.tempo.downbeatSec = db;
+                        carried = true;
+                    }
                 }
                 {
                     std::lock_guard<std::mutex> tl (takesLock);
@@ -1291,7 +1697,8 @@ juce::uint64 HotStepLinkProcessor::requestTakeEdit (const juce::File& tempFile, 
                 }
                 if (! listed)
                     return;
-                requestTakeMeasure (e.temp, e.bpm);
+                if (! carried)
+                    requestTakeMeasure (e.temp, e.bpm);
                 wakeSaverForNewTake();
             }
             catch (...)
@@ -1365,7 +1772,12 @@ void HotStepLinkProcessor::storeTakeTempo (const juce::File& tempFile, bool meas
         const bool usable = r.valid && r.bpm > 0.0 && r.level >= TempoMeasure::Level::medium;
         // A stretch to a target is exact by construction: its name carries the target
         // ("_st" N "bpm"), so it takes the firm file-name tempo below, never "est".
-        const bool firmName = ! testStretchEst.load()
+#if defined (HSLINK_TEST_HOOKS)
+        const bool stretchEst = testStretchEst.load();
+#else
+        const bool stretchEst = false;
+#endif
+        const bool firmName = ! stretchEst
                               && TempoResolve::parseTempoFromFileName (t.name.isEmpty() ? t.temp.getFileName() : t.name) > 0.0;
         if (measured && ! usable && t.estimatedBpm > 0.0 && ! firmName)
         {
@@ -1405,6 +1817,7 @@ bool HotStepLinkProcessor::waitTakeMeasureIdle (int timeoutMs)
     return true;
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> HotStepLinkProcessor::testDtorProbesLasting { false };
 std::atomic<bool> HotStepLinkProcessor::testMergeOnLoad { false };
 std::atomic<bool> HotStepLinkProcessor::testRenumberTakes { false };
@@ -1412,14 +1825,21 @@ std::atomic<bool> HotStepLinkProcessor::testDerivedInheritsNum { false };
 std::atomic<bool> HotStepLinkProcessor::testDropTakeTempoOnSave { false };
 std::atomic<bool> HotStepLinkProcessor::testFailRemeasure { false };
 std::atomic<bool> HotStepLinkProcessor::testNoDerivedEstimate { false };
+std::atomic<bool> HotStepLinkProcessor::testNoCarryTempo { false };
 std::atomic<bool> HotStepLinkProcessor::testStretchEst { false };
 std::atomic<int> HotStepLinkProcessor::testDtorLastingProbes { 0 };
+#endif
 std::atomic<bool> HotStepLinkProcessor::signalWorkerEarly { true };
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> HotStepLinkProcessor::testWorkerCopies { false };
+#endif
 std::atomic<bool> HotStepLinkProcessor::handOverGuard { true };
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<void (*) (HotStepLinkProcessor&)> HotStepLinkProcessor::testBeforePoolWait { nullptr };
 std::atomic<juce::String (*) (int)> HotStepLinkProcessor::testSessionNameFor { nullptr };
+#endif
 
+#if defined (HSLINK_TEST_HOOKS)
 // TEST ONLY (testDtorProbesLasting): the keep-or-delete decision as it was before the
 // destructor decided from memory. It stats files under takesLock, one probe of the
 // lasting root per starred take. The shipped destructor never calls it.
@@ -1440,14 +1860,17 @@ bool HotStepLinkProcessor::legacyFolderReferenced (const juce::File& dir) const
             ++testDtorLastingProbes;
             // The probe is a lasting-root step of the closing thread: counted and
             // passed to the step hook like every other one (a test slows it there).
+#if defined (HSLINK_TEST_HOOKS)
             ++ExclusiveFile::testStepsByTag[ExclusiveFile::tagClosing];
             if (auto* hook = ExclusiveFile::testStepHook.load())
                 hook ("close probe");
+#endif
             if (! it->second.existsAsFile())
                 return true;
         }
     return false;
 }
+#endif
 
 juce::AudioProcessorValueTreeState::ParameterLayout HotStepLinkProcessor::createLayout()
 {
@@ -1818,14 +2241,83 @@ juce::String HotStepLinkProcessor::getServerUrl() const
     return ov.isNotEmpty() ? ov : getSavedServerUrl();
 }
 
-void HotStepLinkProcessor::setServerUrl (const juce::String& url)
+bool HotStepLinkProcessor::isValidServerUrl (const juce::String& urlIn)
+{
+    auto url = urlIn.trim();
+    juce::String rest;
+    if (url.startsWithIgnoreCase ("http://"))       rest = url.substring (7);
+    else if (url.startsWithIgnoreCase ("https://")) rest = url.substring (8);
+    else return false;
+    if (rest.endsWithChar ('/'))
+        rest = rest.dropLastCharacters (1);
+    if (rest.isEmpty() || rest.containsAnyOf (" /\\?#@\t"))
+        return false;
+    const int colon = rest.lastIndexOfChar (':');
+    const auto host = colon >= 0 ? rest.substring (0, colon) : rest;
+    if (host.isEmpty() || host.containsChar (':'))
+        return false;
+    if (colon >= 0)
+    {
+        const auto port = rest.substring (colon + 1);
+        if (port.isEmpty() || port.length() > 5 || ! port.containsOnly ("0123456789"))
+            return false;
+        const int n = port.getIntValue();
+        if (n < 1 || n > 65535)
+            return false;
+    }
+    return true;
+}
+
+bool HotStepLinkProcessor::shouldWarnExposure (const juce::String& url, bool keySet)
+{
+    return ! keySet && ! isLoopbackServerUrl (url);
+}
+
+bool HotStepLinkProcessor::isLoopbackServerUrl (const juce::String& urlIn)
+{
+    auto rest = urlIn.trim();
+    if (rest.startsWithIgnoreCase ("https://"))     rest = rest.substring (8);
+    else if (rest.startsWithIgnoreCase ("http://")) rest = rest.substring (7);
+    else return false;
+    if (rest.endsWithChar ('/'))
+        rest = rest.dropLastCharacters (1);
+    // IPv6 loopback: isValidServerUrl rejects bracketed hosts, so check it on its own.
+    if (rest == "::1" || rest == "[::1]")
+        return true;
+    if (rest.startsWith ("[::1]:"))
+    {
+        const auto port = rest.substring (6);
+        return port.isNotEmpty() && port.length() <= 5 && port.containsOnly ("0123456789")
+               && port.getIntValue() >= 1 && port.getIntValue() <= 65535;
+    }
+    if (! isValidServerUrl (urlIn))
+        return false;
+    const int colon = rest.lastIndexOfChar (':');
+    const auto host = (colon >= 0 ? rest.substring (0, colon) : rest).toLowerCase();
+    if (host == "localhost")
+        return true;
+    juce::StringArray parts;
+    parts.addTokens (host, ".", "");
+    if (parts.size() != 4 || parts[0] != "127")
+        return false;
+    for (auto& part : parts)
+        if (part.isEmpty() || part.length() > 3 || ! part.containsOnly ("0123456789") || part.getIntValue() > 255)
+            return false;
+    return true;
+}
+
+bool HotStepLinkProcessor::setServerUrl (const juce::String& urlIn)
 {
 #if ! defined (HSLINK_TEETH_URL_TYPED_SAVE)
     if (serverUrlOverride().isNotEmpty())
-        return; // env override active: typed text never reaches state or the endpoint
+        return false; // env override active: typed text never reaches state or the endpoint
 #endif
+    const auto url = urlIn.trim();
+    if (! isValidServerUrl (url))
+        return false; // keep the old value
     apvts.state.setProperty (kServerUrlId, url, nullptr);
     daw.setEndpoint (url, getDawKey());
+    return true;
 }
 
 juce::File HotStepLinkProcessor::keyStoreFile()
@@ -1857,15 +2349,195 @@ juce::String HotStepLinkProcessor::loadStoredKey()
     return props.getValue ("dawKey", {});
 }
 
-void HotStepLinkProcessor::saveStoredKey (const juce::String& key)
+// One lock per settings file, shared by every process of this user that reads, changes and
+// writes it (two hosts, or a host and the standalone). Named from the full path, so another
+// file (a test's scratch file) has its own lock.
+static juce::String settingsLockName (const juce::File& f)
 {
+    return "HOTSTEP_LINK.settings." + juce::String::toHexString (f.getFullPathName().toLowerCase().hashCode64());
+}
+
+#if defined (HSLINK_TEST_HOOKS)
+#if defined (HSLINK_TEST_HOOKS)
+std::atomic<bool> HotStepLinkProcessor::testKeySaveNoAside { false };
+std::atomic<bool> HotStepLinkProcessor::testKeyAsideFails { false };
+std::atomic<bool> HotStepLinkProcessor::testNoSettingsLock { false };
+std::atomic<int> HotStepLinkProcessor::testFlagPauseAfterReadMs { 0 };
+juce::String HotStepLinkProcessor::settingsLockNameForTest() { return settingsLockName (keyStoreFile()); }
+#endif
+#endif
+
+// Held across the read, the change and the write of the settings file. Waits at most
+// kSettingsLockTimeoutMs; a writer that does not get the lock writes nothing.
+struct SettingsFileLock
+{
+    explicit SettingsFileLock (const juce::File& f) : lock (settingsLockName (f))
+    {
+#if defined (HSLINK_TEST_HOOKS)
+        if (HotStepLinkProcessor::testNoSettingsLock.load())
+        {
+            held = true; // teeth: the behaviour before the lock
+            return;
+        }
+#endif
+        held = entered = lock.enter (HotStepLinkProcessor::kSettingsLockTimeoutMs);
+    }
+    ~SettingsFileLock()
+    {
+        if (entered)
+            lock.exit();
+    }
+    juce::InterProcessLock lock;
+    bool held = false, entered = false;
+};
+
+// "<name>.unreadable-<yyyyMMdd-HHmmss>" and nothing else.
+static bool isAsideCopyName (const juce::String& name, const juce::String& prefix)
+{
+    if (! name.startsWith (prefix) || name.length() != prefix.length() + 15)
+        return false;
+    const auto stamp = name.substring (prefix.length());
+    return stamp[8] == '-' && stamp.substring (0, 8).containsOnly ("0123456789")
+           && stamp.substring (9).containsOnly ("0123456789");
+}
+
+// Copies an unreadable settings file aside, then keeps the newest 2 such copies (they hold
+// the key in plain text). False when the copy could not be made or does not match.
+static bool copyUnreadableAside (const juce::File& f)
+{
+#if defined (HSLINK_TEST_HOOKS)
+    if (HotStepLinkProcessor::testKeyAsideFails.load())
+        return false;
+#endif
+    const juce::String prefix = f.getFileName() + ".unreadable-";
+    juce::StringArray names;
+    for (const auto& c : f.getParentDirectory().findChildFiles (juce::File::findFiles, false, prefix + "*"))
+        if (isAsideCopyName (c.getFileName(), prefix))
+            names.add (c.getFileName());
+    names.sort (false); // the stamp sorts by time
+    const juce::String newest = names.isEmpty() ? juce::String() : names[names.size() - 1];
+    // The new copy is named after the newest one already there: a stamp already taken (or
+    // older than the newest copy) steps one second on, so no copy is ever overwritten.
+    auto when = juce::Time::getCurrentTime();
+    juce::String name;
+    for (int i = 0; i < 3600; ++i)
+    {
+        name = prefix + when.formatted ("%Y%m%d-%H%M%S");
+        if (name.compare (newest) > 0 && ! f.getSiblingFile (name).exists())
+            break;
+        when += juce::RelativeTime::seconds (1.0);
+    }
+    const auto dest = f.getSiblingFile (name);
+    if (dest.exists() || ! f.copyFileTo (dest) || dest.getSize() != f.getSize())
+        return false;
+    names.add (name);
+    names.sort (false);
+    int extra = names.size() - 2;
+    for (int i = 0; i < names.size() && extra > 0; ++i)
+        if (names[i] != name) // never the copy just made
+        {
+            f.getSiblingFile (names[i]).deleteFile();
+            --extra;
+        }
+    return true;
+}
+
+bool HotStepLinkProcessor::saveStoredKey (const juce::String& key)
+{
+#if defined (HSLINK_TEST_HOOKS)
+    ++keySaveCallsForTest;
+#endif
     const auto f = keyStoreFile();
-    if (key.isEmpty() && ! f.existsAsFile())
-        return;
-    f.getParentDirectory().createDirectory();
+    const SettingsFileLock fileLock (f); // read, aside copy and write: one unit across processes
+    if (! fileLock.held)
+        return false; // another process holds the file: nothing written, the caller keeps its value
+    if (! f.existsAsFile())
+    {
+        if (key.isEmpty())
+            return true; // nothing stored, nothing to clear
+        f.getParentDirectory().createDirectory();
+    }
+    else
+    {
+        // A sharing violation or another process mid-replace looks the same as a damaged
+        // file: read again a few times (80 ms at most) before deciding it is unreadable.
+        bool readable = false;
+        for (int attempt = 0; attempt < 3 && ! readable; ++attempt)
+        {
+            if (attempt > 0)
+                juce::Thread::sleep (40);
+            juce::PropertiesFile probe (f, keyStoreOptions());
+            readable = probe.isValidFile();
+        }
+        bool asideNeeded = ! readable;
+#if defined (HSLINK_TEST_HOOKS)
+        if (testKeySaveNoAside.load())
+            asideNeeded = false; // teeth: the old behaviour, replace with no copy
+#endif
+        if (asideNeeded && ! copyUnreadableAside (f))
+            return false; // never replace an unreadable file without a copy of it
+    }
     juce::PropertiesFile props (f, keyStoreOptions());
     props.setValue ("dawKey", key);
-    props.saveIfNeeded();
+    return props.saveIfNeeded();
+}
+
+bool HotStepLinkProcessor::loadRefHintSeen()
+{
+    const auto f = keyStoreFile();
+    if (! f.existsAsFile())
+        return false;
+    juce::PropertiesFile props (f, keyStoreOptions());
+    return props.getBoolValue ("refHintSeen", false);
+}
+
+#if defined (HSLINK_TEST_HOOKS)
+#if defined (HSLINK_TEST_HOOKS)
+std::atomic<int> HotStepLinkProcessor::refHintWritesForTest { 0 };
+std::atomic<int> HotStepLinkProcessor::refHintSaveCallsForTest { 0 };
+std::atomic<bool> HotStepLinkProcessor::testRefHintFromDefaults { false };
+std::atomic<bool> HotStepLinkProcessor::testNoCaptureHintHook { false };
+std::atomic<bool> HotStepLinkProcessor::testCaptureNotedFirst { false };
+#endif
+#endif
+
+bool HotStepLinkProcessor::saveRefHintSeen()
+{
+    const auto f = keyStoreFile();
+    f.getParentDirectory().createDirectory();
+#if defined (HSLINK_TEST_HOOKS)
+    ++refHintSaveCallsForTest;
+#endif
+    const SettingsFileLock fileLock (f); // read and write: one unit across processes
+    if (! fileLock.held)
+        return false; // another process holds the file: nothing written, tried again on the next capture
+#if defined (HSLINK_TEST_HOOKS)
+    if (testRefHintFromDefaults.load())
+    {
+        // Teeth only: the unsafe write, a fresh file holding nothing but the flag.
+        f.deleteFile();
+        juce::PropertiesFile fresh (f, keyStoreOptions());
+        fresh.setValue ("refHintSeen", true);
+        ++refHintWritesForTest;
+        return fresh.save();
+    }
+#endif
+    juce::PropertiesFile props (f, keyStoreOptions());
+    if (! props.isValidFile())
+        return false; // the file exists but cannot be parsed: leave it exactly as it is
+    if (props.getBoolValue ("refHintSeen", false))
+        return true;  // already set: nothing to write
+    props.setValue ("refHintSeen", true);
+#if defined (HSLINK_TEST_HOOKS)
+    if (const int pauseMs = testFlagPauseAfterReadMs.load(); pauseMs > 0)
+    {
+        // Seam: the read is done and the write has not started.
+        f.getSiblingFile (f.getFileName() + ".readdone").create();
+        juce::Thread::sleep (pauseMs);
+    }
+    ++refHintWritesForTest;
+#endif
+    return props.save();
 }
 
 juce::String HotStepLinkProcessor::getDawKey() const
@@ -1877,19 +2549,25 @@ juce::String HotStepLinkProcessor::getDawKey() const
 #endif
 }
 
-void HotStepLinkProcessor::setDawKey (const juce::String& key)
+bool HotStepLinkProcessor::setDawKey (const juce::String& key, bool* saveTried)
 {
+    bool stored = true;
+    if (saveTried != nullptr)
+        *saveTried = false;
 #if defined (HSLINK_TEETH_KEY_IN_STATE)
     apvts.state.setProperty (kDawKeyId, key, nullptr); // teeth: old behaviour, key in state
 #else
     if (key != dawKey)
     {
         dawKey = key;
-        saveStoredKey (key);
+        stored = saveStoredKey (key);
+        if (saveTried != nullptr)
+            *saveTried = true;
     }
     apvts.state.setProperty (kKeySetId, key.isNotEmpty(), nullptr);
 #endif
     daw.setEndpoint (getServerUrl(), key);
+    return stored;
 }
 
 void HotStepLinkProcessor::getStateInformation (juce::MemoryBlock& destData)
@@ -1959,7 +2637,7 @@ bool HotStepLinkProcessor::loadState (const void* data, int sizeInBytes)
 static const juce::Identifier kTakesId ("Takes"), kTakesVerId ("v"), kTkId ("T"), kTkPathId ("path"), kTkRelId ("rel"),
                               kTkNameId ("name"), kTkOrderId ("order"), kTkInfoId ("info"), kTkGridSetId ("gset"),
                               kTkGridBpmId ("gbpm"), kTkGridDbId ("gdb"), kTkWarpId ("warp"), kTkWarpEdId ("wed"),
-                              kTkWarpTagId ("wtag"), kTkTempoId ("tst"), kTkExtId ("ext"),
+                              kTkWarpTagId ("wtag"), kTkWarpPinId ("wpin"), kTkTempoId ("tst"), kTkExtId ("ext"),
                               kTkNumId ("num"), kTkEstId ("est");
 static constexpr int kTakesStateMax = 256;
 static constexpr int kTakesStateBytes = 1 << 20;
@@ -1967,8 +2645,10 @@ static constexpr int kTakesStateBytes = 1 << 20;
 void HotStepLinkProcessor::writeTakesState (juce::ValueTree& state) const
 {
     state.removeChild (state.getChildWithName (kTakesId), nullptr);
+#if defined (HSLINK_TEST_HOOKS)
     if (testNoTakesWrite.load())
         return; // teeth TS_NO_WRITE: no takes in the saved state
+#endif
     try
     {
         juce::ValueTree list (kTakesId);
@@ -1980,8 +2660,10 @@ void HotStepLinkProcessor::writeTakesState (juce::ValueTree& state) const
             // An external take (Add as take, shot-loaded WAV) is the user's own lasting file:
             // it is saved by its path (flag ext) with no copy, so it is never duplicated.
             bool skip = t.stable == juce::File() || t.adopted || t.handingOver;
+#if defined (HSLINK_TEST_HOOKS)
             if (testSkipExternalTakes.load())
                 skip = skip || t.external; // teeth TS_SKIP_EXTERNAL: the pre-fix filter
+#endif
             if (skip)
                 continue;
             if (n >= kTakesStateMax || bytes >= kTakesStateBytes)
@@ -1997,7 +2679,12 @@ void HotStepLinkProcessor::writeTakesState (juce::ValueTree& state) const
             ci.durationS = t.durationS;
             ci.seed = t.seed;
             ci.createdMs = t.createdMs;
-            ci.tempoMeasured = t.tempoState == TakeEntry::tempoMeasured && ! testDropTakeTempoOnSave.load();
+#if defined (HSLINK_TEST_HOOKS)
+            const bool dropTakeTempoOnSave = testDropTakeTempoOnSave.load();
+#else
+            const bool dropTakeTempoOnSave = false;
+#endif
+            ci.tempoMeasured = t.tempoState == TakeEntry::tempoMeasured && ! dropTakeTempoOnSave;
             ci.tempo = t.tempo;
             ci.resolvedTempo = t.resolvedTempo;
             ci.edit = t.edit;
@@ -2036,6 +2723,12 @@ void HotStepLinkProcessor::writeTakesState (juce::ValueTree& state) const
                 c.setProperty (kTkWarpId, b64, nullptr);
                 c.setProperty (kTkWarpEdId, t.warpMarkersEdited, nullptr);
                 c.setProperty (kTkWarpTagId, t.warpTagBpm, nullptr);
+                juce::String pins; // F3: pinned marker indices, absent = none pinned
+                for (size_t k = 0; k < t.warpMarkers.size(); ++k)
+                    if (t.warpMarkers[k].pinned)
+                        pins << (pins.isEmpty() ? "" : ",") << (int) k;
+                if (pins.isNotEmpty())
+                    c.setProperty (kTkWarpPinId, pins, nullptr);
             }
             bytes += info.length() + warpBytes + t.stable.getFullPathName().length() * 2 + 200;
             list.appendChild (c, nullptr);
@@ -2095,7 +2788,12 @@ void HotStepLinkProcessor::readTakesState (juce::ValueTree& state)
             // the user's file: delete never moves it. The saved flag is not trusted: a file
             // outside the takes root is always treated as the user's (state can be edited).
             e.external = (bool) c.getProperty (kTkExtId, false);
-            if (! testTrustExt.load() && (root == juce::File() || ! f.isAChildOf (root)))
+#if defined (HSLINK_TEST_HOOKS)
+            const bool trustExt = testTrustExt.load();
+#else
+            const bool trustExt = false;
+#endif
+            if (! trustExt && (root == juce::File() || ! f.isAChildOf (root)))
                 e.external = true;
             e.caption = ci.caption;
             e.backend = ci.backend;
@@ -2145,6 +2843,13 @@ void HotStepLinkProcessor::readTakesState (juce::ValueTree& state)
                 e.warpMarkersEdited = (bool) c.getProperty (kTkWarpEdId, false);
                 const double tag = (double) c.getProperty (kTkWarpTagId, 0.0);
                 e.warpTagBpm = std::isfinite (tag) && tag > 0.0 ? tag : 0.0;
+                // F3: old state has no wpin: every marker loads unpinned.
+                for (const auto& tok : juce::StringArray::fromTokens (c.getProperty (kTkWarpPinId, "").toString(), ",", ""))
+                {
+                    const int k = tok.getIntValue();
+                    if (tok.isNotEmpty() && k >= 0 && (size_t) k < e.warpMarkers.size())
+                        e.warpMarkers[(size_t) k].pinned = true;
+                }
             }
             restored.push_back (std::move (e));
         }
@@ -2179,7 +2884,11 @@ void HotStepLinkProcessor::readTakesState (juce::ValueTree& state)
             // handed over by a running download (registerTake/handOver find them by temp).
             std::lock_guard<std::mutex> g (takesLock);
             std::vector<TakeEntry> next;
+#if defined (HSLINK_TEST_HOOKS)
             const bool mergeMutant = testMergeOnLoad.load(); // teeth: the old merge-on-load
+#else
+            const bool mergeMutant = false;
+#endif
             for (auto& t : takes)
                 if (t.adopted || t.handingOver || mergeMutant)
                     next.push_back (std::move (t));
@@ -2340,8 +3049,10 @@ bool HotStepLinkProcessor::closingNow() const
 }
 
 std::atomic<bool> HotStepLinkProcessor::shutdownGuard { true };
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<int> HotStepLinkProcessor::testCopyDelayMs { 0 };
 std::atomic<int> HotStepLinkProcessor::testAttemptsAfterClose { 0 };
+#endif
 
 // Before every lasting copy: false = closing, no attempt starts. Counts the attempt
 // (tests) and holds the test delay.
@@ -2350,20 +3061,26 @@ bool HotStepLinkProcessor::countCopyAttempt()
     if (shutdownGuard.load() && shuttingDown.load())
         return false;
     ++copyAttempts;
+#if defined (HSLINK_TEST_HOOKS)
     if (destructorBegan.load())
         ++testAttemptsAfterClose;
     const int delay = testCopyDelayMs.load();
     if (delay > 0)
         juce::Thread::sleep (delay);
+#endif
     return true;
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> HotStepLinkProcessor::testStopAfterRecord { false };
 std::atomic<bool> HotStepLinkProcessor::testNoTakesWrite { false };
 std::atomic<bool> HotStepLinkProcessor::testTrustExt { false };
 std::atomic<bool> HotStepLinkProcessor::testSkipExternalTakes { false };
+#endif
 std::atomic<bool> HotStepLinkProcessor::recordBeforeCopy { true };
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> HotStepLinkProcessor::testStopBeforePublish { false };
+#endif
 
 std::atomic<bool> PeakGuard::enabled { true };
 std::atomic<int> PeakGuard::mode { PeakGuard::kGuard };
@@ -2414,6 +3131,11 @@ float PeakGuard::gainForPeak (float truePeakDbtp)
     return truePeakDbtp > kCeilingDbtp ? target - truePeakDbtp : 0.0f;
 }
 
+float PeakGuard::importGainForPeak (float truePeakDbtp)
+{
+    return truePeakDbtp > kImportTargetDbtp ? kImportTargetDbtp - truePeakDbtp : 0.0f;
+}
+
 float PeakGuard::gainForMode (float truePeakDbtp, int m)
 {
 #if defined (HSLINK_TEETH_NO_NORMALISE)
@@ -2430,6 +3152,22 @@ float PeakGuard::gainForMode (float truePeakDbtp, int m)
     }
     return gainForPeak (truePeakDbtp);
 }
+
+// Shared by applyToFile and guardCopy: encodes buf as a WAV into mb.
+static bool writeWavToMemory (const juce::AudioBuffer<float>& buf, double sr, int nch, int bits, bool isFloat,
+                              const std::unordered_map<juce::String, juce::String>& meta, juce::MemoryBlock& mb)
+{
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::OutputStream> os (std::make_unique<juce::MemoryOutputStream> (mb, false));
+    auto w = wav.createWriterFor (os, juce::AudioFormatWriterOptions{}
+                                          .withSampleRate (sr)
+                                          .withNumChannels (nch)
+                                          .withBitsPerSample (bits)
+                                          .withMetadataValues (meta)
+                                          .withSampleFormat (isFloat ? juce::AudioFormatWriterOptions::SampleFormat::floatingPoint
+                                                                     : juce::AudioFormatWriterOptions::SampleFormat::integral));
+    return w != nullptr && w->writeFromAudioSampleBuffer (buf, 0, buf.getNumSamples());
+} // writer flushed and closed on return
 
 float PeakGuard::applyToFile (const juce::File& wavFile)
 {
@@ -2457,19 +3195,67 @@ float PeakGuard::applyToFile (const juce::File& wavFile)
         meta[k] = rd->metadataValues[k];
     rd.reset(); // the file is closed before it is replaced
     juce::MemoryBlock mb;
-    {
-        std::unique_ptr<juce::OutputStream> os (std::make_unique<juce::MemoryOutputStream> (mb, false));
-        auto w = wav.createWriterFor (os, juce::AudioFormatWriterOptions{}
-                                              .withSampleRate (sr)
-                                              .withNumChannels (nch)
-                                              .withBitsPerSample (bits)
-                                              .withMetadataValues (meta)
-                                              .withSampleFormat (isFloat ? juce::AudioFormatWriterOptions::SampleFormat::floatingPoint
-                                                                         : juce::AudioFormatWriterOptions::SampleFormat::integral));
-        if (w == nullptr || ! w->writeFromAudioSampleBuffer (buf, 0, len))
-            return 0.0f;
-    } // writer flushed and closed here
+    if (! writeWavToMemory (buf, sr, nch, bits, isFloat, meta, mb))
+        return 0.0f;
     return wavFile.replaceWithData (mb.getData(), mb.getSize()) ? g : 0.0f;
+}
+
+PeakGuard::GuardCopyResult PeakGuard::guardCopy (const juce::File& src, const juce::File& dest)
+{
+    GuardCopyResult r;
+    auto fail = [&] (const juce::String& why)
+    {
+        r.ok = false;
+        r.reason = why;
+        return r;
+    };
+    if (! src.existsAsFile())
+        return fail ("source file not found");
+    if (dest == src)
+        return fail ("destination is the source");
+    juce::AudioFormatManager fm;
+    fm.registerFormat (new juce::WavAudioFormat(), true);
+    fm.registerFormat (new juce::AiffAudioFormat(), false);
+    fm.registerFormat (new juce::FlacAudioFormat(), false);
+    std::unique_ptr<juce::AudioFormatReader> rd (fm.createReaderFor (src)); // read-only stream
+    if (rd == nullptr)
+        return fail ("unsupported or unreadable audio file");
+    if (rd->lengthInSamples <= 0 || rd->numChannels <= 0
+        || rd->lengthInSamples > (juce::int64) std::numeric_limits<int>::max())
+        return fail ("empty or too long audio file");
+    const int len = (int) rd->lengthInSamples;
+    const int nch = (int) rd->numChannels;
+    juce::AudioBuffer<float> buf (nch, len);
+    if (! rd->read (&buf, 0, len, 0, true, true))
+        return fail ("read failed");
+    r.truePeakDb = truePeakDb (buf);
+    const float g = importGainForPeak (r.truePeakDb);
+#if ! defined (HSLINK_TEETH_IMPORT_NO_GUARD)
+    if (g != 0.0f)
+        buf.applyGain (juce::Decibels::decibelsToGain (g));
+    r.gainDb = g;
+#else
+    juce::ignoreUnused (g); // teeth: copy without the guard
+#endif
+    const double sr = rd->sampleRate;
+    const bool isFloat = rd->usesFloatingPointData;
+    const int srcBits = (int) rd->bitsPerSample;
+    const int bits = isFloat ? 32 : (srcBits <= 16 ? 16 : (srcBits <= 24 ? 24 : 32));
+    std::unordered_map<juce::String, juce::String> meta;
+    if (dynamic_cast<juce::WavAudioFormat*> (fm.findFormatForFileExtension (src.getFileExtension())) != nullptr)
+        for (const auto& k : rd->metadataValues.getAllKeys())
+            meta[k] = rd->metadataValues[k];
+    rd.reset();
+    juce::MemoryBlock mb;
+    if (! writeWavToMemory (buf, sr, nch, bits, isFloat, meta, mb))
+        return fail ("WAV encode failed");
+    if (! dest.replaceWithData (mb.getData(), mb.getSize()))
+    {
+        dest.deleteFile();
+        return fail ("could not write " + dest.getFullPathName());
+    }
+    r.ok = true;
+    return r;
 }
 
 float PeakGuard::applyToExport (const juce::File& src, const juce::File& dest)
@@ -2522,10 +3308,16 @@ void HotStepLinkProcessor::registerTake (const DawJob& job, int takeIndex)
             if (t.temp == e.temp || t.temp == part)
                 return;
     }
+#if defined (HSLINK_TEST_HOOKS)
     const bool stopBeforePublish = testStopBeforePublish.load();
     if (stopBeforePublish && ! recordFirst)
         return; // test hook, old order: stopped after the metadata read, nothing recorded
+#endif
+#if defined (HSLINK_TEST_HOOKS)
     const bool stopHere = testStopAfterRecord.load();
+#else
+    const bool stopHere = false;
+#endif
     if (! early && stopHere)
         return; // teeth only: the old order stopped while its copy runs (file published, nothing recorded)
     if (early)
@@ -2562,11 +3354,17 @@ void HotStepLinkProcessor::registerTake (const DawJob& job, int takeIndex)
         } handOverAtExit { handOver };
         if (recordFirst)
         {
+#if defined (HSLINK_TEST_HOOKS)
             if (stopBeforePublish)
                 return; // test hook: recorded and listed, the bytes still in the .part
+#endif
             // File IO outside takesLock; the lock is held for the one write only. Until
             // then the entry shows the requested length.
+#if defined (HSLINK_TEST_HOOKS)
             const double secs = CollectionStore::testDisabled.load() ? 0.0 : readTakeDuration (e.temp);
+#else
+            const double secs = readTakeDuration (e.temp);
+#endif
             if (secs > 0.0)
             {
                 e.durationS = secs;
@@ -2626,7 +3424,12 @@ void HotStepLinkProcessor::registerTake (const DawJob& job, int takeIndex)
         requestTakeMeasure (e.temp, e.bpm);
         if (stopHere)
             return;
-        if (! testWorkerCopies.load())
+#if defined (HSLINK_TEST_HOOKS)
+        const bool workerCopies = testWorkerCopies.load();
+#else
+        const bool workerCopies = false;
+#endif
+        if (! workerCopies)
         {
             // Recorded, marked and published: this thread is done. The lasting copy is
             // the saver thread's, which is woken here and copies at once. While closing
@@ -3080,8 +3883,10 @@ void HotStepLinkProcessor::finishAdoptedFolders()
 
 void HotStepLinkProcessor::fillTakeMetadata (TakeEntry& e, const DawJob& job, int takeIndex, bool readFile)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (CollectionStore::testDisabled.load())
         return; // teeth: no metadata
+#endif
     const auto& rq = job.request;
     e.caption = rq.caption;
     // The server does not report which backend an Auto job ran on, so Auto stays "auto".
@@ -3165,8 +3970,10 @@ void HotStepLinkProcessor::refreshCollection()
 
 void HotStepLinkProcessor::requestCollectionRefresh()
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (CollectionView::testDisabled.load())
         return; // teeth: no background rescan
+#endif
     if (collectionPool.getNumJobs() > 1)
         return; // one running and one waiting already cover this request
     collectionPool.addJob ([this] { refreshCollection(); });
@@ -3254,19 +4061,30 @@ int HotStepLinkProcessor::ensureStableCopies (bool freshOnly, int* firstFailures
         if (t.adopted)
         {
             copyResult = ExclusiveFile::CopyResult::Aborted;
+#if defined (HSLINK_TEST_HOOKS)
             if (auto* hook = testBeforeRescueTake.load())
                 hook (*this); // tests only
+#endif
             // A file under the final name with the same size is this take, copied by an
             // earlier pass (copies are published by an exclusive rename). Not a file call
             // on the lasting root once closing.
             const auto already = t.destFolder.getChildFile (t.name);
             const auto size = t.temp.getSize();
-            if (! closingNow() || testRescueProbeBeforeClosing.load())
+#if defined (HSLINK_TEST_HOOKS)
+            const bool rescueProbeBeforeClosing = testRescueProbeBeforeClosing.load();
+#else
+            const bool rescueProbeBeforeClosing = false;
+#endif
+            if (! closingNow() || rescueProbeBeforeClosing)
             {
+#if defined (HSLINK_TEST_HOOKS)
                 ++testRescueLastingProbes;
+#endif
                 if (! ExclusiveFile::isPartial (already) && already.existsAsFile())
                 {
+#if defined (HSLINK_TEST_HOOKS)
                     ++testRescueLastingProbes;
+#endif
                     alreadyThere = already.getSize() == size;
                 }
             }
@@ -3366,9 +4184,11 @@ std::vector<HotStepLinkProcessor::TakeEntry> HotStepLinkProcessor::getTakes()
             out.push_back (t);
     // D2: one order everywhere, newest (highest stable number) on top.
     std::stable_sort (out.begin(), out.end(), [] (const TakeEntry& x, const TakeEntry& y) { return x.number > y.number; });
+#if defined (HSLINK_TEST_HOOKS)
     if (testRenumberTakes.load()) // teeth: numbers follow position, oldest = 1
         for (size_t i = 0; i < out.size(); ++i)
             out[i].number = (int) (out.size() - i);
+#endif
     return out;
 }
 
@@ -3380,7 +4200,9 @@ void HotStepLinkProcessor::setPinnedTake (const juce::File& f)
 
 //==============================================================================
 // Take delete with a short undo. See the header for the rules.
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool (*) (const juce::File&)> HotStepLinkProcessor::testTrashFile { nullptr };
+#endif
 
 juce::String HotStepLinkProcessor::takeDeleteText (TakeDelete result)
 {
@@ -3659,12 +4481,14 @@ void HotStepLinkProcessor::finishTakeDelete (const PendingTakeDelete& p)
     if (! kept && ! p.entry.external) // an external (shot-loaded) file is never moved
     {
         auto result = MoveToDeleted::alreadyGone;
+#if defined (HSLINK_TEST_HOOKS)
         if (auto* fn = testTrashFile.load())
         {
             if (target.existsAsFile())
                 result = fn (target) ? MoveToDeleted::moved : MoveToDeleted::kept;
         }
         else
+#endif
             result = moveToDeletedFolder (target); // plain rename into <folder of the file>/Deleted
         if (result != MoveToDeleted::alreadyGone)
             ++takeDeleteMoves;
@@ -3777,15 +4601,29 @@ void DawWorker::setEndpoint (const juce::String& baseUrl, const juce::String& da
         return;
     url = norm;
     key = dawKey;
+#if defined (HSLINK_TEST_HOOKS)
+    const auto keptKnown = status.backendsKnown; // teeth capsMutKeepOnUrl only
+    const auto keptIds = status.backendIds;
+#endif
     status = DawStatus(); // new endpoint: forget the old server's state
+    backendListDue = true; // and ask the new one for its backend list, once
+#if defined (HSLINK_TEST_HOOKS)
+    if (testCapsMutant.load() == capsMutKeepOnUrl)
+    {
+        status.backendsKnown = keptKnown;
+        status.backendIds = keptIds;
+    }
+#endif
     wakeForRetry = true;
     notify();
 }
 
 juce::String DawWorker::normaliseBaseUrl (const juce::String& typed)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testNoUrlNormalise.load())
         return typed; // teeth: the old code used the typed text as is
+#endif
     auto u = typed.trim();
     const int sep = u.indexOfAnyOf (":;/");
     if (sep > 0 && u.substring (0, sep).containsOnly ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"))
@@ -3924,9 +4762,14 @@ bool DawWorker::heartbeat (juce::String& body, juce::String& err, juce::String& 
     }
     const auto reqUrl = base + "/api/v1/daw/status";
     juce::WebInputStream in (juce::URL (reqUrl), false);
-    if (k.isNotEmpty())
-        in.withExtraHeaders ("X-DAW-Key: " + k);
+    const juce::String hbHeaders = k.isNotEmpty() ? "X-DAW-Key: " + k : juce::String();
+    if (hbHeaders.isNotEmpty())
+        in.withExtraHeaders (hbHeaders);
     in.withConnectionTimeout (kRequestTimeoutMs);
+    in.withNumRedirectsToFollow (kMaxRedirects); // S2: the key header never follows a redirect
+#if defined (HSLINK_TEST_HOOKS)
+    testCapture (juce::URL (reqUrl).toString (true), hbHeaders, kMaxRedirects);
+#endif
     {
         std::lock_guard<std::mutex> g (lock);
         if (threadShouldExit())
@@ -3971,6 +4814,7 @@ void DawWorker::run()
                 err = "bad status JSON";
             }
             int waitMs = kHeartbeatMs;
+            bool askBackends = false;
             {
                 std::lock_guard<std::mutex> g (lock);
                 auto attempts = status.recentAttempts;
@@ -3992,6 +4836,28 @@ void DawWorker::run()
                     parsed.heartbeatsOk = status.heartbeatsOk + 1;
                     parsed.everOnline = true;
                     parsed.lastOkMs = (juce::int64) juce::Time::getMillisecondCounter();
+                    // The backend list is not part of the status reply: it is carried over
+                    // like the attempts, and asked for again only on offline to online.
+                    parsed.backendsKnown = status.backendsKnown;
+                    parsed.backendIds = status.backendIds;
+                    // Not read from computeOnline here: a list request that got no answer
+                    // can itself leave the last good response old, which read as "was
+                    // offline" and asked again on every heartbeat.
+                    const bool due = listBackends.load() && backendListDue.exchange (false);
+                    askBackends = due;
+#if defined (HSLINK_TEST_HOOKS)
+                    if (testCapsMutant.load() == capsMutOldFetchLoop)
+                        askBackends = listBackends.load()
+                                      && ! computeOnline (status, parsed.lastOkMs, deadlineEnabled.load(),
+                                                          offlineAfterMs.load(), offlineAfterFailures.load());
+                    if (testCapsMutant.load() == capsMutNoCarry)
+                    {
+                        parsed.backendsKnown = false;
+                        parsed.backendIds.clear();
+                    }
+                    if (testCapsMutant.load() == capsMutFetchEveryBeat)
+                        askBackends = listBackends.load();
+#endif
                     status = parsed;
                     backoffMs = 1000;
                 }
@@ -4004,10 +4870,15 @@ void DawWorker::run()
                     {
                         waitMs = backoffMs;
                         backoffMs = juce::jmin (5000, backoffMs * 2);
+                        backendListDue = true; // offline: the next good heartbeat asks once
                     }
                 }
             }
             nextHeartbeatMs = (juce::int64) juce::Time::getMillisecondCounter() + waitMs;
+            // After the status is published and the next heartbeat is timed: the pill is
+            // already "online" and the request counts as waiting like any other.
+            if (askBackends && ! threadShouldExit())
+                fetchBackendList();
         }
         processJobs();
         if (threadShouldExit())
@@ -4034,6 +4905,79 @@ juce::String DawJobRequest::resolveModel (const juce::String& mode, const juce::
     return aceModel == 1 ? juce::String ("turbo") : aceModel == 2 ? juce::String ("base") : juce::String();
 }
 
+int DawJobRequest::maxTakesForBackend (const juce::String& backendId)
+{
+    // Known per-backend max takes per request. Every backend not listed has no limit.
+    if (backendId == "heartmula") return 1;
+    return 0;
+}
+
+int DawJobRequest::clampTakesForBackend (int takes, const juce::String& backendId)
+{
+    const int mx = maxTakesForBackend (backendId);
+    return (mx > 0 && takes > mx) ? mx : takes;
+}
+
+juce::String DawJobRequest::takesClampNote (int takes, const juce::String& backendId)
+{
+    const int mx = maxTakesForBackend (backendId);
+    if (mx <= 0 || takes <= mx)
+        return {};
+    const auto name = DawWorker::backendLabel (backendId);
+    if (mx == 1)
+        return name + " makes one take per request; Takes set to 1";
+    return name + " makes at most " + juce::String (mx) + " takes per request; Takes set to " + juce::String (mx);
+}
+
+juce::uint32 DawJobRequest::ignoredFieldsForBackend (const juce::String& backendId)
+{
+    // Field-tested entries only, each with its evidence. Unknown = honoured.
+    // minimax-m3: Duration ignored (field test, asked 15 s, got 20.1 s).
+    if (backendId == "minimax-m3") return ignDuration;
+    return 0;
+}
+
+juce::String DawJobRequest::ignoredFieldsNote (juce::uint32 mask, const juce::String& backendId)
+{
+    static const std::pair<juce::uint32, const char*> names[] = {
+        { ignDuration, "Duration" }, { ignBpm, "BPM" }, { ignKey, "Key" }, { ignTimesig, "Time sig" },
+        { ignSteps, "Steps" }, { ignGuidance, "Guidance" }, { ignSeed, "Seed" }, { ignVariation, "Variation" },
+        { ignLyrics, "Lyrics" } };
+    juce::StringArray parts;
+    for (const auto& n : names)
+        if ((mask & n.first) != 0)
+            parts.add (n.second);
+    if (parts.isEmpty())
+        return {};
+    return DawWorker::backendLabel (backendId) + " ignores " + parts.joinIntoString (", ");
+}
+
+juce::String DawJobRequest::ignoredNote (const DawJobRequest& r, const juce::String& backendId)
+{
+    const auto ign = ignoredFieldsForBackend (backendId);
+    juce::uint32 set = 0;
+    if (r.durationS > 0.0) set |= ignDuration;
+    if (r.bpm > 0.0) set |= ignBpm;
+    if (r.key.isNotEmpty()) set |= ignKey;
+    if (r.timesig.isNotEmpty()) set |= ignTimesig;
+    if (r.steps > 0) set |= ignSteps;
+    if (r.guidance >= 0.0) set |= ignGuidance;
+    if (r.seed >= 0) set |= ignSeed;
+    if (r.lyrics.isNotEmpty()) set |= ignLyrics;
+    return ignoredFieldsNote (ign & set, backendId);
+}
+
+juce::String DawJobRequest::durationMismatchNote (const juce::String& backendLabel, double askedSec, double gotSec)
+{
+    if (askedSec <= 0.0 || gotSec <= 0.0)
+        return {};
+    const double diff = std::abs (gotSec - askedSec);
+    if (diff <= 0.1 * askedSec || diff <= 2.0)
+        return {};
+    return backendLabel + " returned " + juce::String (gotSec, 1) + " s for "
+           + juce::String (askedSec, askedSec == std::floor (askedSec) ? 0 : 1) + " s asked";
+}
+
 juce::String DawJobRequest::toJson() const
 {
     auto* o = new juce::DynamicObject();
@@ -4057,6 +5001,9 @@ juce::String DawJobRequest::toJson() const
     // GUIDANCE / STEPS: Auto (sentinel) sends neither; the server 400s out of range, so clamp.
     if (guidance >= 0.0) o->setProperty ("guidance", juce::jlimit (0.0, 20.0, guidance));
     if (steps > 0) o->setProperty ("steps", juce::jlimit (1, 300, steps));
+    // Reference strength: only ACE-Step reads src_audio, so only send it there with a source.
+    if (coverStrength >= 0.0 && expectedBackend == "ace" && sourceWav != juce::File())
+        o->setProperty ("cover_strength", juce::jlimit (0.0, 1.0, coverStrength));
 #if ! defined (HSLINK_TEETH_NO_REGION)
     if (hasRegion)
     {
@@ -4345,7 +5292,9 @@ bool DawWorker::isTakePart (const juce::File& part, const juce::StringArray& lis
 }
 
 std::atomic<bool> DawWorker::zeroByteSkip { true };
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<int> DawWorker::testEmptyDownloads { 0 };
+#endif
 std::atomic<int> DawWorker::zeroByteSkips { 0 };
 
 namespace
@@ -4365,8 +5314,10 @@ void DawWorker::setLocklessFolder (const juce::File& folder, bool lockless)
 
 bool DawWorker::isLocklessFolder (const juce::File& folder)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (ExclusiveFile::testNoLegacyGuard.load())
         return false; // teeth: no registry
+#endif
     std::lock_guard<std::mutex> g (locklessLock);
     return locklessFolders.contains (folder.getFullPathName());
 }
@@ -4477,11 +5428,22 @@ juce::File DawWorker::partFileFor (const juce::File& take)
 }
 
 std::atomic<bool> DawWorker::keepUnpublished { true };
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<int> DawWorker::testFailPublish { 0 };
+#endif
 std::atomic<int> DawWorker::publishAttempts { 0 };
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> DawWorker::testExitAfterDownload { false };
 std::atomic<bool> DawWorker::testNoLiveServer { false };
+#endif
+#if defined (HSLINK_TEST_HOOKS)
+#if defined (HSLINK_TEST_HOOKS)
+std::atomic<int> DawWorker::testCapsMutant { 0 };
+#endif
+#endif
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<int> DawWorker::testLiveRedirectPort { 0 };
+#endif
 std::atomic<int> DawWorker::requestsOpened { 0 };
 std::atomic<int> DawWorker::requestsRefused { 0 };
 
@@ -4507,6 +5469,7 @@ bool DawWorker::gateRequest (juce::String& base)
 {
     if (isLiveDefaultBase (base))
     {
+#if defined (HSLINK_TEST_HOOKS)
         if (testNoLiveServer.load())
         {
             ++requestsRefused;
@@ -4514,11 +5477,27 @@ bool DawWorker::gateRequest (juce::String& base)
         }
         if (const int port = testLiveRedirectPort.load())
             base = "http://127.0.0.1:" + juce::String (port);
+#endif
     }
     ++requestsOpened;
     return true;
 }
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> DawWorker::testNoUrlNormalise { false };
+std::atomic<bool> DawWorker::testCaptureRequests { false };
+std::mutex DawWorker::testCaptureLock;
+juce::StringArray DawWorker::testCapturedUrls, DawWorker::testCapturedHeaders;
+juce::Array<int> DawWorker::testCapturedRedirects;
+void DawWorker::testCapture (const juce::String& url, const juce::String& headers, int redirects)
+{
+    if (! testCaptureRequests.load())
+        return;
+    std::lock_guard<std::mutex> g (testCaptureLock);
+    testCapturedUrls.add (url);
+    testCapturedHeaders.add (headers);
+    testCapturedRedirects.add (redirects);
+}
+#endif
 std::atomic<bool> DawWorker::captureByForm { true };
 
 int DawWorker::publishWaitMs (int tryIndex)
@@ -4536,8 +5515,12 @@ bool DawWorker::publishDownload (const juce::File& part, const juce::File& take,
     for (int i = 0; i < tries; ++i)
     {
         ++publishAttempts;
+#if defined (HSLINK_TEST_HOOKS)
         int forced = testFailPublish.load();
         while (forced > 0 && ! testFailPublish.compare_exchange_weak (forced, forced - 1)) {}
+#else
+        const int forced = 0;
+#endif
         if (forced <= 0 && ExclusiveFile::moveNoReplace (part, take))
             return true;
         // The rename reported failure but took effect (the part is gone): the answer
@@ -4747,7 +5730,7 @@ bool DawWorker::applyJobJson (const juce::String& body, DawJob& j)
     // Optional (newer servers): absent on old servers, so phase stays empty and ETA shows as before.
     j.phase = v["phase"].isString() ? v["phase"].toString() : juce::String();
 #endif
-    if (! v["take_count"].isVoid()) j.takeCount = (int) v["take_count"];
+    if (! v["take_count"].isVoid()) j.takeCount = DawJob::effectiveTakeCount (j.request.takes, (int) v["take_count"]);
     if (! v["takes_done"].isVoid())
         j.takesReady = (int) v["takes_done"];
     else if (const auto* takes = v["takes"].getArray())
@@ -4758,7 +5741,14 @@ bool DawWorker::applyJobJson (const juce::String& body, DawJob& j)
             if (! t["ready"].isVoid()) { ++flagged; if ((bool) t["ready"]) ++ready; }
         j.takesReady = flagged > 0 ? ready : takes->size();
     }
-    if (v["error"].isString())      j.error = v["error"].toString();
+    if (v["error"].isString())      j.error = plainServerError (j.request.expectedBackend, v["error"].toString(), {}, &j.errorFull);
+#if defined (HSLINK_TEST_HOOKS)
+    if (v["error"].isString() && testWeightsMutant.load() == 3) // teeth 3: this site shows the server text as sent
+    {
+        j.error = v["error"].toString();
+        j.errorFull.clear();
+    }
+#endif
     if (! v["bpm"].isVoid())        j.bpm = (double) v["bpm"];
     if (v["key"].isString())        j.key = v["key"].toString();
     if (v["dit_model"].isString())  j.ditModel = v["dit_model"].toString();
@@ -4802,6 +5792,260 @@ juce::String DawWorker::errorFromBody (const juce::String& body, int code)
     if (c.isNotEmpty()) t << " " << c;
     if (m.isNotEmpty()) t << ": " << m;
     return t;
+}
+
+namespace
+{
+// The server text as the missing-weights match reads it: lower case, on one line (control
+// characters and odd spaces are single spaces, as in the shown line), and never more than
+// DawWorker::kServerSaidScanMaxChars characters of the body. Patterns are ASCII, lower case.
+struct MatchText
+{
+    std::vector<juce::juce_wchar> s;
+
+    MatchText (const juce::String& raw, bool asSent) // asSent: whole text, nothing collapsed (test mutant only)
+    {
+        bool space = false;
+        int examined = 0;
+        for (auto p = raw.getCharPointer(); ! p.isEmpty() && (asSent || examined < DawWorker::kServerSaidScanMaxChars); ++examined)
+        {
+            const auto c = p.getAndAdvance();
+            if (! asSent && (c <= 0x20 || (c >= 0x7f && c <= 0xa0) || c == 0x2028 || c == 0x2029))
+            {
+                space = ! s.empty();
+                continue;
+            }
+            if (space)
+                s.push_back ((juce::juce_wchar) ' ');
+            space = false;
+            s.push_back (juce::CharacterFunctions::toLowerCase (c));
+        }
+    }
+
+    juce::juce_wchar at (size_t i) const { return i < s.size() ? s[i] : 0; }
+    static bool wordChar (juce::juce_wchar c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c >= 0x80; }
+
+    // True when pat occurs at a place where ok (start, end) holds.
+    template <typename Ok>
+    bool find (const std::string& pat, Ok ok) const
+    {
+        const size_t n = pat.size();
+        for (size_t i = 0; n > 0 && i + n <= s.size(); ++i)
+        {
+            size_t k = 0;
+            while (k < n && s[i + k] == (juce::juce_wchar) (unsigned char) pat[k])
+                ++k;
+            if (k == n && ok (i, i + n))
+                return true;
+        }
+        return false;
+    }
+
+    bool contains (const std::string& pat) const { return find (pat, [] (size_t, size_t) { return true; }); }
+
+    // A whole word or phrase: no letter or digit right before or after it.
+    bool word (const std::string& pat) const
+    {
+        return find (pat, [this] (size_t a, size_t b) { return ! (a > 0 && wordChar (s[a - 1])) && ! wordChar (at (b)); });
+    }
+
+    // A whole word that is not a folder name in a path ("/checkpoints/uploads/ref.wav").
+    bool fileWord (const std::string& pat) const
+    {
+        return find (pat, [this] (size_t a, size_t b)
+        {
+            return ! (a > 0 && wordChar (s[a - 1])) && ! wordChar (at (b)) && at (b) != '/' && at (b) != '\\';
+        });
+    }
+
+    // A file extension that ends its token: followed by the end, a space, a quote or closing
+    // punctuation (".pt" is not found in ".pth", ".ptx" or ".bin/ffmpeg").
+    bool ext (const std::string& pat) const
+    {
+        return find (pat, [this] (size_t, size_t b)
+        {
+            const auto c = at (b);
+            if (c == 0 || c == ' ')
+                return true;
+            if (c == '.')
+                return at (b + 1) == 0 || at (b + 1) == ' ';
+            return c < 0x80 && std::strchr ("'\"`),;:]>}!?", (int) c) != nullptr;
+        });
+    }
+};
+}
+
+juce::String DawWorker::missingWeightsText (const juce::String& backendId, const juce::String& serverText)
+{
+    // Trigger strings are inferred: the server's real wording for missing HeartMuLa weights
+    // has not been captured. Matched only in a HeartMuLa context (the job asked for it, or
+    // the text names it), and only when the text names a model file and says it is absent.
+    // When nothing matches the caller shows the server text as sent, so the match leans narrow.
+    int mutant = 0;
+#if defined (HSLINK_TEST_HOOKS)
+    mutant = testWeightsMutant.load();
+#endif
+    if (mutant == 2)
+        return {}; // teeth 2: never matches
+    const bool oldRule = mutant == 11; // teeth 11: plain substrings on the whole text as sent
+    const MatchText t (serverText, oldRule);
+    if (mutant != 1) // teeth 1: any backend
+        if (backendId.trim().toLowerCase() != "heartmula" && ! t.contains ("heartmula"))
+            return {};
+    static const char* const absentWords[] = { "not found", "not installed", "not downloaded", "missing", "no such file",
+                                               "enoent", "does not exist", "could not find", "cannot find" };
+    // Strong signal: the text plainly names a weights file. A weights file extension at the
+    // end of a token, "checkpoint file" or "weights file", or the word "weights" right beside
+    // an absent phrase ("weights not found", "missing weights").
+    bool strong = false, noun = false, absent = false;
+    if (oldRule)
+    {
+        for (const char* n : { "weight", "checkpoint", "safetensors", ".pt", ".ckpt", ".bin",
+                               "model weights", "model file", "model not installed", "model is not installed" })
+            noun = noun || t.contains (n);
+        for (const char* a : absentWords)
+            absent = absent || t.contains (a);
+    }
+    else
+    {
+        for (const char* e : { ".safetensors", ".ckpt", ".pth", ".pt" })
+            strong = strong || t.ext (e);
+        strong = strong || t.fileWord ("checkpoint file") || t.fileWord ("weights file");
+        for (const char* a : absentWords)
+        {
+            absent = absent || t.word (a);
+            strong = strong || t.word (std::string ("weights ") + a) || t.fileWord (std::string (a) + " weights");
+        }
+        // Weak signal: a model file word. The bare word "model" is not enough ("model is
+        // busy", "unknown model"), and a folder named checkpoints in a path is no signal.
+        noun = strong || t.ext (".bin");
+        for (const char* n : { "weight", "weights", "checkpoint", "checkpoints", "safetensors",
+                               "model weights", "model file", "model not installed", "model is not installed" })
+            noun = noun || t.fileWord (n);
+    }
+    if (! (noun && absent))
+        return {};
+    if (mutant != 5) // teeth 5: the exclusion words are ignored
+    {
+        // A LoRA file is another fault, whatever else the text names: never mapped.
+        if (t.contains ("lora"))
+            return {};
+        // Texts about a request field or a device are another fault, unless the text plainly
+        // names a weights file (a loader traceback with device='cuda', "download required").
+        if (! strong || mutant == 12) // teeth 12: the exclusion words veto a strong signal too
+            for (const char* x : { "argument", "parameter", "field", "required", "device" })
+                if (t.contains (x))
+                    return {};
+    }
+    return "HeartMuLa is not installed on the server (model weights missing). "
+           "Pick another backend or install it in HOT-Step.";
+}
+
+#if defined (HSLINK_TEST_HOOKS)
+void DawWorker::setLogCountOnlyForTest (bool on) { HslinkDebugLog::countOnly.store (on); }
+int DawWorker::logSeenForTest (bool capped) { return HslinkDebugLog::seenSize[capped ? 1 : 0].load(); }
+#endif
+
+juce::String DawWorker::plainServerError (const juce::String& backendId, const juce::String& raw, const juce::String& keepHint,
+                                          juce::String* fullOut)
+{
+    if (fullOut != nullptr)
+        fullOut->clear();
+    const auto plain = missingWeightsText (backendId, raw);
+#if defined (HSLINK_TEST_HOOKS)
+    if (plain.isEmpty() && testWeightsMutant.load() == 16) // teeth 16: a text that does not match is returned as sent, whole
+        return raw;
+#endif
+    // The diagnostic is not hidden: the plain sentence (on a match), then the server's text
+    // on one line, clipped. A hint the clip cut off (keepHint) is put back at the end. A text
+    // that does not match gets the same one-line, clipped form without the plain sentence.
+    // Bounded work: the scan stops once it holds one character more than the full text's
+    // limit, and never looks at more than kServerSaidScanMaxChars characters of the body, so
+    // a huge error body costs no more than a small one. The line is built once from a
+    // reserved buffer. Control characters and odd spaces count as spaces (by code point).
+    std::vector<juce::juce_wchar> buf;
+    buf.reserve ((size_t) kServerSaidFullMaxChars + 2);
+    bool space = false, more = false, odd = false; // odd: a character other than a plain space was collapsed
+    int examined = 0;
+#if defined (HSLINK_TEST_HOOKS)
+    const int mutant = testWeightsMutant.load();
+#endif
+    for (auto p = raw.getCharPointer(); ! p.isEmpty();)
+    {
+#if defined (HSLINK_TEST_HOOKS)
+        if (mutant != 9) // teeth 9: the scan has no bound
+#endif
+            if ((int) buf.size() > kServerSaidFullMaxChars || examined >= kServerSaidScanMaxChars)
+            {
+                more = true; // text left unread
+                break;
+            }
+        const auto c = p.getAndAdvance();
+        ++examined;
+        bool ws = c <= 0x20 || (c >= 0x7f && c <= 0xa0) || c == 0x2028 || c == 0x2029;
+#if defined (HSLINK_TEST_HOOKS)
+        if (mutant == 8) // teeth 8: only space, tab and line ends are collapsed
+            ws = c == ' ' || c == '\t' || c == '\r' || c == '\n';
+        if (mutant == 10) // teeth 10: every character past ASCII is taken for a space
+            ws = ws || c >= 0x80;
+#endif
+        if (ws)
+        {
+            odd = odd || c != ' ';
+            space = ! buf.empty();
+            continue;
+        }
+        if (space)
+            buf.push_back ((juce::juce_wchar) ' ');
+        space = false;
+        buf.push_back (c);
+    }
+#if defined (HSLINK_TEST_HOOKS)
+    testServerSaidExamined.store (examined);
+#endif
+    // No match, short, and nothing but plain spaces between the words: the text as sent.
+    if (plain.isEmpty() && ! more && ! odd && examined <= kServerSaidMaxChars)
+        return raw;
+    const int count = (int) buf.size();
+    juce::String one (juce::CharPointer_UTF32 (buf.data()), buf.size());
+    // The one-line text bounded for the tooltip and the debug log, so a huge body cannot bloat them.
+    const bool over = count > kServerSaidFullMaxChars || more;
+    const juce::String whole (over ? one.substring (0, kServerSaidFullMaxChars) + "..." : one);
+    // On a match the bounded text goes to the debug log (HSLINK_DEBUG_LOG=1), once per
+    // distinct text (keyed by its hash, bounded set). Key and line are built only when the
+    // log is on, and the line only when it will be written.
+    if (plain.isNotEmpty() && HslinkDebugLog::wanted())
+        if (HslinkDebugLog::firstTime ("missing-weights:" + juce::String::toHexString (whole.hashCode64()),
+#if defined (HSLINK_TEST_HOOKS)
+                                       testWeightsMutant.load() == 7 ? 0 : // teeth 7: no cap
+#endif
+                                       kServerSaidLogCap))
+            HslinkDebugLog::write ("missing weights, server text: " + whole);
+    const juce::String head (plain.isEmpty() ? juce::String() : plain + " Server said: ");
+    // "more" with a short line: the scan limit was reached inside a long run of spaces.
+    bool clipped = count > kServerSaidMaxChars || more;
+#if defined (HSLINK_TEST_HOOKS)
+    if (mutant == 6) // teeth 6: the whole text is shown
+        clipped = false;
+#endif
+    // No match, read whole, and the text ends in the hint: only the part in front of the
+    // hint counts for the cut, so a short failure text with its hint sentence stays whole.
+    if (plain.isEmpty() && clipped && ! more && keepHint.isNotEmpty() && one.endsWith (keepHint)
+        && count - keepHint.length() - 1 <= kServerSaidMaxChars)
+        clipped = false;
+    if (clipped && fullOut != nullptr)
+    {
+        // The uncut text for the job line's tooltip.
+        *fullOut = head + whole;
+        if (over && keepHint.isNotEmpty() && ! whole.contains (keepHint))
+            *fullOut << " " << keepHint;
+    }
+    if (clipped)
+        one = one.substring (0, kServerSaidMaxChars) + "...";
+    juce::String shown (head + one);
+    if (clipped && keepHint.isNotEmpty() && ! one.contains (keepHint))
+        shown << " " << keepHint;
+    return shown;
 }
 
 int DawWorker::request (const juce::String& method, const juce::String& path, const juce::String& jsonBody,
@@ -4848,6 +6092,10 @@ int DawWorker::request (const juce::String& method, const juce::String& path, co
     if (timeoutOverrideMs > 0)
         timeoutMs = timeoutOverrideMs;
     in.withConnectionTimeout (timeoutMs);
+    in.withNumRedirectsToFollow (kMaxRedirects); // S2: the key header never follows a redirect
+#if defined (HSLINK_TEST_HOOKS)
+    testCapture (u.toString (true), headers, kMaxRedirects);
+#endif
     {
         std::lock_guard<std::mutex> g (lock);
         if (threadShouldExit())
@@ -4947,9 +6195,11 @@ int DawWorker::request (const juce::String& method, const juce::String& path, co
     return code;
 }
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<DawWorker::BackendCallFn> DawWorker::testBackendCall { nullptr };
 std::atomic<DawWorker::BeforeBackendCallFn> DawWorker::testBeforeBackendCall { nullptr };
 std::atomic<DawWorker::BeforeStepFn> DawWorker::testBeforeStep { nullptr };
+#endif
 
 bool DawWorker::cancelWaitingLocked (int localId) const
 {
@@ -5004,6 +6254,84 @@ juce::String DawWorker::getSwitchingTo() const
     return {};
 }
 
+DawWorker::BackendList DawWorker::parseBackendList (int httpCode, const juce::String& body)
+{
+    BackendList out;
+#if defined (HSLINK_TEST_HOOKS)
+    if (testCapsMutant.load() == capsMutNoParse)
+        return out;
+    out.known = testCapsMutant.load() == capsMutEmptyKnown; // a missing list read as an empty one
+#endif
+    if (httpCode != 200 || body.trim().isEmpty())
+        return out;
+    const auto v = juce::JSON::parse (body);
+    const auto* arr = v["backends"].getArray();
+    if (arr == nullptr)
+        return out;
+    for (auto& b : *arr)
+    {
+#if defined (HSLINK_TEST_HOOKS)
+        if (testCapsMutant.load() == capsMutWrongField) // teeth: the wrong field name
+        {
+            if (b["name"].isString() && b["name"].toString().trim().isNotEmpty())
+                out.ids.addIfNotAlreadyThere (b["name"].toString().trim().toLowerCase());
+            continue;
+        }
+        if (testCapsMutant.load() == capsMutRawIds) // teeth: the id as sent
+        {
+            if (b["id"].isString() && b["id"].toString().isNotEmpty())
+                out.ids.addIfNotAlreadyThere (b["id"].toString());
+            continue;
+        }
+#endif
+        if (! b["id"].isString())
+            continue;
+        const auto id = b["id"].toString().trim().toLowerCase();
+        if (id.isNotEmpty())
+            out.ids.addIfNotAlreadyThere (id);
+    }
+    out.known = ! out.ids.isEmpty();
+    return out;
+}
+
+void DawWorker::storeBackendList (const BackendList& list, const juce::String& forUrl)
+{
+    std::lock_guard<std::mutex> g (lock);
+#if defined (HSLINK_TEST_HOOKS)
+    if (url != forUrl && testCapsMutant.load() != capsMutStoreAnyUrl)
+        return;
+#else
+    if (url != forUrl)
+        return;
+#endif
+    status.backendsKnown = list.known;
+    status.backendIds = list.ids;
+}
+
+void DawWorker::fetchBackendList()
+{
+    juce::String forUrl, body;
+    {
+        std::lock_guard<std::mutex> g (lock);
+        forUrl = url;
+    }
+    int code = 0;
+    int timeoutMs = kBackendListTimeoutMs;
+#if defined (HSLINK_TEST_HOOKS)
+    if (testCapsMutant.load() == capsMutOldFetchLoop)
+        timeoutMs = kSwitchTimeoutMs;
+#endif
+#if defined (HSLINK_TEST_HOOKS)
+    if (auto* fn = testBackendCall.load())
+        code = fn ("GET", "/api/backends", {}, body);
+    else
+#endif
+        code = request ("GET", "/api/backends", {}, {}, {}, {}, body, {}, timeoutMs);
+    if (threadShouldExit())
+        return;
+    storeBackendList (parseBackendList (code, body), forUrl);
+}
+
 bool DawWorker::ensureBackend (DawJob& j)
 {
     const auto want = j.request.expectedBackend;
@@ -5012,6 +6340,7 @@ bool DawWorker::ensureBackend (DawJob& j)
     const auto call = [this, &j] (const char* method, const char* path, const juce::String& json, juce::String& body)
     {
         skippedForCancel = false;
+#if defined (HSLINK_TEST_HOOKS)
         if (auto* hook = testBeforeBackendCall.load())
             hook (method, path);
         if (auto* fn = testBackendCall.load())
@@ -5023,6 +6352,7 @@ bool DawWorker::ensureBackend (DawJob& j)
             }
             return skippedForCancel ? 0 : fn (method, path, json, body);
         }
+#endif
         return request (method, path, json, {}, {}, {}, body, {}, kSwitchTimeoutMs, j.localId);
     };
     const auto label = backendLabel (want);
@@ -5047,7 +6377,21 @@ bool DawWorker::ensureBackend (DawJob& j)
     int code = 0;
     if (! cancelled)
     {
+        // Read before the request: an answer that arrives after an endpoint change belongs
+        // to the server that was replaced, and storeBackendList drops it.
+        juce::String forUrl;
+        {
+            std::lock_guard<std::mutex> g (lock);
+            forUrl = url;
+        }
         code = call ("GET", "/api/backends", {}, body);
+#if defined (HSLINK_TEST_HOOKS)
+        if (testCapsMutant.load() == capsMutUrlAfterGet) // teeth: the URL read after the answer, as it was
+        {
+            std::lock_guard<std::mutex> g (lock);
+            forUrl = url;
+        }
+#endif
         if (threadShouldExit())
         {
             mark ({});
@@ -5056,6 +6400,13 @@ bool DawWorker::ensureBackend (DawJob& j)
         // No backend list (an older server, the contract stub, no answer): submit as before
         // and let the server's own check speak. Same when the wanted backend is active.
         const auto listed = juce::JSON::parse (body);
+        {
+            // The same answer carries the backend list: refresh the picker's copy for free.
+            // An answer without a list leaves the stored one as it is.
+            const auto list = parseBackendList (code, body);
+            if (list.known)
+                storeBackendList (list, forUrl);
+        }
         if (code != 200 || ! listed["activeId"].isString() || listed["activeId"].toString() == want)
         {
             if (! mark ({}))
@@ -5086,7 +6437,18 @@ bool DawWorker::ensureBackend (DawJob& j)
         return true;
 
     j.state = DawJob::State::failed;
-    j.error = switchFailText (label, code, body);
+    {
+        // The Wait / Switch hint is the last sentence of switchFailText: kept even when the
+        // missing-weights message clips the text in front of it.
+        const auto fail = switchFailText (label, code, body);
+        const auto hint = fail.upToLastOccurrenceOf (".", false, false).fromLastOccurrenceOf (". ", false, false);
+        juce::String keep (hint.isNotEmpty() && hint != fail ? hint + "." : juce::String());
+#if defined (HSLINK_TEST_HOOKS)
+        if (testWeightsMutant.load() == 4) // teeth 4: the hint is not passed on
+            keep = {};
+#endif
+        j.error = plainServerError (want, fail, keep, &j.errorFull);
+    }
     // The jobs waiting behind it for the same backend would each ask again and fail the
     // same way. They are cancelled here with the reason; nothing is retried without the
     // user, because a retry is a new switch request to a server that just said no.
@@ -5151,8 +6513,10 @@ void DawWorker::processJobs()
     {
         if (threadShouldExit())
             return;
+#if defined (HSLINK_TEST_HOOKS)
         if (auto* hook = testBeforeStep.load())
             hook (j.localId);
+#endif
         stepJob (j);
         j.submitting = false;
         bool found = false;
@@ -5283,7 +6647,14 @@ void DawWorker::stepJob (DawJob& j)
         else
         {
             j.state = S::failed;
-            j.error = errorFromBody (body, code);
+            j.error = plainServerError (j.request.expectedBackend, errorFromBody (body, code), {}, &j.errorFull);
+#if defined (HSLINK_TEST_HOOKS)
+            if (testWeightsMutant.load() == 13) // teeth 13: the refused-submit site shows the server text as sent
+            {
+                j.error = errorFromBody (body, code);
+                j.errorFull.clear();
+            }
+#endif
         }
         return;
     }
@@ -5317,12 +6688,26 @@ void DawWorker::stepJob (DawJob& j)
         else if (code >= 400 && code < 500)
         {
             j.state = S::failed;
-            j.error = errorFromBody (body, code);
+            j.error = plainServerError (j.request.expectedBackend, errorFromBody (body, code), {}, &j.errorFull);
+#if defined (HSLINK_TEST_HOOKS)
+            if (testWeightsMutant.load() == 14) // teeth 14: the refused-status site shows the server text as sent
+            {
+                j.error = errorFromBody (body, code);
+                j.errorFull.clear();
+            }
+#endif
         }
         else if (++j.pollFailures >= kMaxPollFailures)
         {
             j.state = S::failed;
-            j.error = "lost the job: " + errorFromBody (body, code);
+            j.error = plainServerError (j.request.expectedBackend, "lost the job: " + errorFromBody (body, code), {}, &j.errorFull);
+#if defined (HSLINK_TEST_HOOKS)
+            if (testWeightsMutant.load() == 15) // teeth 15: the lost-job site shows the server text as sent
+            {
+                j.error = "lost the job: " + errorFromBody (body, code);
+                j.errorFull.clear();
+            }
+#endif
         }
         if (! j.isTerminal())
             return;
@@ -5344,18 +6729,22 @@ void DawWorker::stepJob (DawJob& j)
             juce::String eb;
             const int code = request ("GET", "/api/v1/daw/jobs/" + juce::URL::addEscapeChars (j.serverId, true) + "/audio?take=" + juce::String (n),
                                       {}, {}, {}, {}, eb, part);
+#if defined (HSLINK_TEST_HOOKS)
             if (testExitAfterDownload.load())
                 signalThreadShouldExit(); // test hook: the close arrives as the download ends
+#endif
             // request() gives 200 with the file only for a download that ran to its
             // end (every byte of Content-Length written, no exit seen up to the last
             // check). Such a file is a complete take even when the exit is signalled
             // right after: it is recorded below, never deleted.
             const bool exiting = threadShouldExit();
+#if defined (HSLINK_TEST_HOOKS)
             if (code == 200 && testEmptyDownloads.load() > 0 && testEmptyDownloads.fetch_sub (1) > 0)
             {
                 part.deleteFile(); // test hook: a 200 with an empty body
                 part.create();
             }
+#endif
             // A 200 with no bytes (or no file) is not a take: it fails like any incomplete download.
             const bool empty = code == 200 && zeroByteSkip.load() && (! part.existsAsFile() || part.getSize() <= 0);
             const bool complete = code == 200 && part.existsAsFile() && ! empty;
@@ -5441,6 +6830,67 @@ juce::String HotStepLinkProcessor::backendIdForIndex (int index)
     return kIds[juce::jlimit (0, kLast, index)];
 }
 
+bool HotStepLinkProcessor::backendAvailable (int index, bool known, const juce::StringArray& ids)
+{
+    if (! known || index <= 0)
+        return true;
+#if defined (HSLINK_TEST_HOOKS)
+    if (DawWorker::testCapsMutant.load() == DawWorker::capsMutAllAvailable)
+        return true;
+    if (DawWorker::testCapsMutant.load() == DawWorker::capsMutRawIds) // teeth: a case-sensitive, untrimmed compare
+        return ids.contains (backendIdForIndex (index), false);
+#endif
+    const auto want = backendIdForIndex (index).trim().toLowerCase();
+    for (auto& id : ids)
+        if (id.trim().toLowerCase() == want)
+            return true;
+    return false;
+}
+
+juce::StringArray HotStepLinkProcessor::backendExtras (bool known, const juce::StringArray& ids)
+{
+    juce::StringArray out;
+    if (! known)
+        return out;
+    for (auto& raw : ids)
+    {
+        const auto id = raw.trim().toLowerCase();
+        if (id.isEmpty())
+            continue;
+        bool fixed = false;
+        for (int i = 1; i < kBackendChoices; ++i)
+            fixed = fixed || backendIdForIndex (i) == id;
+        if (! fixed)
+            out.addIfNotAlreadyThere (id);
+    }
+    return out;
+}
+
+juce::String HotStepLinkProcessor::backendPickerTooltip (bool known, const juce::StringArray& ids)
+{
+    juce::String t;
+    if (! known)
+        return t;
+    juce::StringArray off;
+    for (int i = 1; i < kBackendChoices; ++i)
+        if (! backendAvailable (i, known, ids))
+            off.add (DawWorker::backendLabel (backendIdForIndex (i)));
+    if (! off.isEmpty())
+        t << "Dimmed: not available on this server, can still be picked (" << off.joinIntoString (", ") << ").";
+    const auto extra = backendExtras (known, ids);
+    if (! extra.isEmpty())
+        t << (t.isEmpty() ? "" : "\n") << "The server also lists: " << extra.joinIntoString (", ")
+          << " (not selectable here).";
+    return t;
+}
+
+juce::String HotStepLinkProcessor::backendUnlistedNote (int index, bool known, const juce::StringArray& ids)
+{
+    if (backendAvailable (index, known, ids))
+        return {};
+    return DawWorker::backendLabel (backendIdForIndex (index)) + ": not available on this server";
+}
+
 juce::String HotStepLinkProcessor::getSelectedBackendId() const
 {
     if (auto* b = apvts.getRawParameterValue ("backend"))
@@ -5468,6 +6918,8 @@ DawJobRequest HotStepLinkProcessor::makeRequest (const juce::String& caption, do
         // Server ids from HOT-Step server/src/services/backends/<dir>/index.ts.
         r.expectedBackend = backendIdForIndex ((int) std::lround (b->load()));
     }
+    r.takes = DawJobRequest::clampTakesForBackend (r.takes, r.expectedBackend);
+    r.coverStrength = getCoverStrength();
     if (auto* m = apvts.getRawParameterValue ("aceModel"))
         r.aceModel = juce::jlimit (0, 2, (int) std::lround (m->load()));
 #if ! defined (HSLINK_TEETH_NO_SEED_KEY)
@@ -5498,6 +6950,30 @@ void HotStepLinkProcessor::setPeakMode (int m)
     m = juce::jlimit ((int) PeakGuard::kOff, (int) PeakGuard::kNormalise, m);
     apvts.state.setProperty (kPeakModeId, m, nullptr);
     PeakGuard::mode.store (m);
+}
+
+static const juce::Identifier kCoverStrengthId ("coverStrength");
+
+double HotStepLinkProcessor::getCoverStrength() const
+{
+    return juce::jlimit (0.0, 1.0, (double) apvts.state.getProperty (kCoverStrengthId, 1.0));
+}
+
+void HotStepLinkProcessor::setCoverStrength (double v)
+{
+    apvts.state.setProperty (kCoverStrengthId, juce::jlimit (0.0, 1.0, v), nullptr);
+}
+
+static const juce::Identifier kAceModeId ("aceModeId");
+
+int HotStepLinkProcessor::getAceModeId() const
+{
+    return juce::jlimit (1, 3, (int) apvts.state.getProperty (kAceModeId, 1));
+}
+
+void HotStepLinkProcessor::setAceModeId (int id)
+{
+    apvts.state.setProperty (kAceModeId, juce::jlimit (1, 3, id), nullptr);
 }
 
 const char* HotStepLinkProcessor::keyName (int index)
@@ -6079,13 +7555,17 @@ void EditorAudition::stop()
     loadingNow.store (false, std::memory_order_release);
 }
 
-void EditorAudition::publish (const Audio& a, juce::int64 start, juce::int64 end, juce::int64 length, double atRate, int gen)
+void EditorAudition::publish (const Audio& a, juce::int64 start, juce::int64 end, juce::int64 length, double atRate, int gen,
+                              bool liveSwap, juce::uint32 expectSerial)
 {
     std::lock_guard<std::mutex> g (ownLock);
     if (generation.load() != gen)
         return; // stopped, or a newer Play
+    if (liveSwap && activeSerial.load (std::memory_order_acquire) != expectSerial)
+        return; // the clip it was to replace has ended or was replaced
     const juce::int64 n = a != nullptr ? (juce::int64) a->getNumSamples() : 0;
-    loadingNow.store (false, std::memory_order_release);
+    if (! liveSwap)
+        loadingNow.store (false, std::memory_order_release);
     if (n <= 0 || a->getNumChannels() <= 0)
         return;
     auto c = std::make_unique<Clip>();
@@ -6099,6 +7579,7 @@ void EditorAudition::publish (const Audio& a, juce::int64 start, juce::int64 end
         c->end = (int) juce::jlimit ((juce::int64) c->start + 1, n, (juce::int64) std::llround ((double) end * k));
     }
     c->fade = fadeSamples (atRate);
+    c->liveSwap = liveSwap;
     c->serial = ++nextSerial;
     if (c->serial == 0)
         c->serial = ++nextSerial;
@@ -6144,10 +7625,81 @@ void EditorAudition::setLevel (juce::int64 cropStart, juce::int64 cropEnd, juce:
     levelGainReq.store ((float) juce::Decibels::decibelsToGain (gainDb, -1000.0), std::memory_order_release);
 }
 
+EditorAudition::Audio EditorAudition::warped (const Audio& a, juce::int64 length, const std::vector<WarpMarkers::Marker>& warp,
+                                              double r, const std::function<bool()>& abort)
+{
+    if (a == nullptr || warp.empty() || length <= 0)
+        return a;
+    // Round 2b: the piecewise stretch, on the job. The markers are frames of the file,
+    // scaled to frames of the decoded take.
+    const double k = (double) a->getNumSamples() / (double) length;
+    auto m = warp;
+    for (auto& w : m)
+    {
+        w.srcFrame = std::llround ((double) w.srcFrame * k);
+        w.dstFrame = std::llround ((double) w.dstFrame * k);
+    }
+    m.back().srcFrame = m.back().dstFrame = a->getNumSamples();
+    auto out = TakeStretch::renderWarped (*a, r, m, abort);
+    if (out.getNumSamples() > 0)
+        return std::make_shared<const juce::AudioBuffer<float>> (std::move (out));
+    return a;
+}
+
 void EditorAudition::setWarp (std::vector<WarpMarkers::Marker> markers)
 {
-    std::lock_guard<std::mutex> g (ownLock);
-    warpMap = std::move (markers);
+    Audio have;
+    juce::int64 s = 0, e = 0, len = 0;
+    juce::uint32 serial = 0;
+    int gen = 0;
+    std::vector<WarpMarkers::Marker> warp;
+    {
+        std::lock_guard<std::mutex> g (ownLock);
+        const auto same = [] (const std::vector<WarpMarkers::Marker>& x, const std::vector<WarpMarkers::Marker>& y)
+        {
+            if (x.size() != y.size())
+                return false;
+            for (std::size_t i = 0; i < x.size(); ++i)
+                if (x[i].srcFrame != y[i].srcFrame || x[i].dstFrame != y[i].dstFrame)
+                    return false;
+            return true;
+        };
+        if (same (markers, warpMap))
+            return; // unchanged (auditionPlay sends it before every Play)
+        warpMap = std::move (markers);
+        serial = activeSerial.load (std::memory_order_acquire);
+        if (serial == 0 || loadingNow.load (std::memory_order_acquire) || bypassStop.load (std::memory_order_acquire)
+            || cache == nullptr || std::abs (cacheRate - rate.load()) > 1.0e-6 || playLength <= 0)
+            return; // nothing plays: the next play() renders it
+        have = cache;
+        s = playStart;
+        e = playEnd;
+        len = playLength;
+        warp = warpMap;
+        gen = generation.fetch_add (1) + 1; // a swap job still running publishes nothing
+    }
+    const double r = rate.load();
+    if (warp.empty())
+    {
+        publish (have, s, e, len, r, gen, true, serial);
+        return;
+    }
+    pool.addJob ([this, have, s, e, len, r, gen, serial, warp]
+    {
+        auto* job = juce::ThreadPoolJob::getCurrentThreadPoolJob();
+        std::function<bool()> abort = [this, job, gen]
+        {
+            return (job != nullptr && job->shouldExit()) || generation.load() != gen;
+        };
+        try
+        {
+            auto a = warped (have, len, warp, r, abort);
+            if (generation.load() != gen)
+                return;
+            publish (a, s, e, len, r, gen, true, serial);
+        }
+        catch (...) {} // the playing clip stays; the next Play renders again
+    });
 }
 
 void EditorAudition::play (const juce::File& take, juce::int64 start, juce::int64 end, juce::int64 length, bool loop)
@@ -6171,8 +7723,10 @@ void EditorAudition::play (const juce::File& take, juce::int64 start, juce::int6
         bypassStop.store (false, std::memory_order_release);
     }
     const int gen = generation.fetch_add (1) + 1;
+#if defined (HSLINK_TEST_HOOKS)
     if (afterGenForTest)
         afterGenForTest();
+#endif
     loopOn.store (loop, std::memory_order_relaxed);
     setRegion (start, end, length);
     const double r = rate.load();
@@ -6183,6 +7737,9 @@ void EditorAudition::play (const juce::File& take, juce::int64 start, juce::int6
         if (cache != nullptr && cacheFile == take && std::abs (cacheRate - r) < 1.0e-6)
             have = cache;
         warp = warpMap;
+        playStart = start;
+        playEnd = end;
+        playLength = length;
         if (generation.load() == gen) // else a stop() came in between: stay as it left it
             loadingNow.store (true, std::memory_order_release);
     }
@@ -6205,8 +7762,10 @@ void EditorAudition::play (const juce::File& take, juce::int64 start, juce::int6
       try // v0.5.9: a throw in the decode or the stretch must still end the loading state
       {
 #endif
+#if defined (HSLINK_TEST_HOOKS)
         if (jobThrowForTest)
             jobThrowForTest();
+#endif
         // Decoded and resampled to the host rate here, off the audio thread.
         Audio a = have;
         if (a == nullptr)
@@ -6226,21 +7785,9 @@ void EditorAudition::play (const juce::File& take, juce::int64 start, juce::int6
         }
         if (a != nullptr && ! warp.empty() && length > 0)
         {
-            // Round 2b: the piecewise stretch, here on the job. The markers are frames
-            // of the file, scaled to frames of the decoded take.
-            const double k = (double) a->getNumSamples() / (double) length;
-            auto m = warp;
-            for (auto& w : m)
-            {
-                w.srcFrame = std::llround ((double) w.srcFrame * k);
-                w.dstFrame = std::llround ((double) w.dstFrame * k);
-            }
-            m.back().srcFrame = m.back().dstFrame = a->getNumSamples();
-            auto out = TakeStretch::renderWarped (*a, r, m, abort);
+            a = warped (a, length, warp, r, abort);
             if (generation.load() != gen)
                 return;
-            if (out.getNumSamples() > 0)
-                a = std::make_shared<const juce::AudioBuffer<float>> (std::move (out));
         }
         publish (a, start, end, length, r, gen); // no audio: only ends the loading state
 #if ! defined (HSLINK_TEETH_EA_NO_TRY)
@@ -6274,8 +7821,10 @@ void EditorAudition::poll()
     }
     const auto as = activeSerial.load (std::memory_order_acquire);
     const bool atEnd = as != 0 && doneSerial.load (std::memory_order_acquire) == as;
+#if defined (HSLINK_TEST_HOOKS)
     if (pollGapForTest)
         pollGapForTest();
+#endif
     std::lock_guard<std::mutex> g (ownLock);
     if (atEnd && activeSerial.load (std::memory_order_acquire) == as)
     {
@@ -6287,9 +7836,10 @@ void EditorAudition::poll()
         activeSerial.store (0, std::memory_order_release);
     }
     const auto* hz = hazard.load();
+    const auto* hzPrev = hazardPrev.load(); // after hazard: a live swap names the old clip there first
     owned.erase (std::remove_if (owned.begin(), owned.end(), [&] (const Owned& o)
     {
-        return o.retired && o.clip.get() != hz;
+        return o.retired && o.clip.get() != hz && o.clip.get() != hzPrev;
     }), owned.end());
 }
 
@@ -6399,9 +7949,44 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
             // block. The main output ramps back from where the duck was.
             cur = nullptr;
             hazard.store (nullptr);
+            prevClip = nullptr;
+            prevLeft = 0;
+            hazardPrev.store (nullptr);
             duckMain (buf, 0, n, want != nullptr);
             return;
         }
+    }
+    // Live warp: a clip published by setWarp() while this one plays replaces it in
+    // place: same read position (dst frame), same region and gain, and the old clip
+    // fades out under the new one over the fade length. The old one stays named in
+    // hazardPrev until its fade has ended. One swap at a time: a newer one waits for it.
+    const bool swapWant = want != nullptr && want != cur && want->liveSwap && cur != nullptr && ! ended
+                          && want->audio->getNumSamples() == cur->audio->getNumSamples();
+    if (swapWant && prevClip == nullptr)
+    {
+        hazardPrev.store (cur);
+        hazard.store (want);
+        if (requested.load() != want)
+        {
+            hazard.store (cur); // replaced in between: cur stayed named in hazardPrev
+            hazardPrev.store (nullptr);
+        }
+        else
+        {
+            prevClip = cur;
+            prevPos = pos;
+            prevLeft = want->fade;
+            cur = want;
+        }
+    }
+    if (ended && want != nullptr && want != cur && want->liveSwap)
+    {
+        // A live swap for a clip that already played to its end (published before
+        // poll() cleared it): not started. Its serial is reported done, so poll()
+        // clears requested and frees it like the clip it was to replace.
+        doneSerial.store (want->serial, std::memory_order_release);
+        duckMain (buf, 0, n, false);
+        return;
     }
     if (cur == nullptr || ended)
     {
@@ -6429,7 +8014,7 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
         // two never add up. Already down (a Play over a playing clip): no wait.
         hold = duckPos < duckN;
     }
-    const bool stopping = want != cur;
+    const bool stopping = want != cur && ! swapWant;
     // Main output: down while a clip is asked for (this one, or the one that replaces
     // it), up again while this one fades out after a stop.
     const bool duckDown = want != nullptr;
@@ -6481,7 +8066,12 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
     // Reverse plus loop (as TakeEdit::renderEditFile): the window [start - xf, end + xf)
     // reads backwards, so the loop stays in place and its pre-roll is the reversed audio
     // after the loop end; the seam is limited by the audio there.
-    const bool lvRevLoop = loop && reverseReq.load (std::memory_order_relaxed) && ! revSeamCropForTest.load (std::memory_order_relaxed);
+#if defined (HSLINK_TEST_HOOKS)
+    const bool revSeamCrop = revSeamCropForTest.load (std::memory_order_relaxed);
+#else
+    const bool revSeamCrop = false;
+#endif
+    const bool lvRevLoop = loop && reverseReq.load (std::memory_order_relaxed) && ! revSeamCrop;
     const int xf = juce::jmin (juce::jmax (cur->fade, xfUser), (end - start) / 2,
                                lvRevLoop ? juce::jmax (0, src.getNumSamples() - end) : end);
     const bool preRoll = start >= xf; // audio before the region to fade the wrap into
@@ -6504,11 +8094,19 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
     const double clkBpm = clickBpm.load (std::memory_order_relaxed);
     const bool clk = clickOn.load (std::memory_order_acquire) && clkBpm > 0.0 && hr > 0.0;
     const double clkBeat = clk ? 60.0 * hr / clkBpm : 1.0;
-    const double clkOrigin = clk && ! clickNoDownbeatForTest.load (std::memory_order_relaxed) ? clickDownbeat.load (std::memory_order_relaxed) * hr : 0.0;
+#if defined (HSLINK_TEST_HOOKS)
+    const bool clickNoDownbeat = clickNoDownbeatForTest.load (std::memory_order_relaxed);
+#else
+    const bool clickNoDownbeat = false;
+#endif
+    const double clkOrigin = clk && ! clickNoDownbeat ? clickDownbeat.load (std::memory_order_relaxed) * hr : 0.0;
     const double clkLen = kClickSeconds * hr, clkW = 2.0 * juce::MathConstants<double>::pi * kClickHz / hr, clkTau = 0.004 * hr;
     const float step = 1.0f / (float) cur->fade;
     const float* s0 = src.getReadPointer (0);
     const float* s1 = src.getReadPointer (sc > 1 ? 1 : 0);
+    const float* ps0 = prevClip != nullptr ? prevClip->audio->getReadPointer (0) : nullptr;
+    const float* ps1 = prevClip != nullptr ? prevClip->audio->getReadPointer (prevClip->audio->getNumChannels() > 1 ? 1 : 0) : nullptr;
+    const int pn = prevClip != nullptr ? prevClip->audio->getNumSamples() : 0;
     float* const* out = buf.getArrayOfWritePointers();
     // The user loop seam uses the render's law (TakeEdit::seamGains): the correlation of the
     // two overlapped segments, as they play (reversed reads included), measured once per seam.
@@ -6539,7 +8137,11 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
         seamKeyRvE = rvE;
         seamKeyLen = src.getNumSamples();
     }
+#if defined (HSLINK_TEST_HOOKS)
     const bool seamOld = seamNoCorrForTest.load (std::memory_order_relaxed);
+#else
+    const bool seamOld = false;
+#endif
     float g = gain;
     int p = pos;
     bool stopped = false, finished = false;
@@ -6620,6 +8222,27 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
             }
             --jumpLeft;
         }
+        if (prevLeft > 0 && ps0 != nullptr)
+        {
+            // Live warp swap: the replaced clip fades out under the new one.
+            // Equal-power: gIn^2 + gOut^2 = 1, gIn 0 -> 1 and gOut 1 -> 0 at the ends.
+            const float t = (float) prevLeft / (float) juce::jmax (1, cur->fade);
+            float gIn = 1.0f, gOut = 0.0f;
+            swapFadeGains (t, gIn, gOut);
+            if (prevPos >= 0 && prevPos < pn)
+            {
+                l = l * gIn + ps0[rd (prevPos)] * gOut;
+                r = r * gIn + ps1[rd (prevPos)] * gOut;
+            }
+            else
+            {
+                l *= gIn;
+                r *= gIn;
+            }
+            if (++prevPos >= end && loop)
+                prevPos = start;
+            --prevLeft;
+        }
         {
             // F1: the fades at the crop ends and the gain of the take.
             float e = lvGain;
@@ -6667,6 +8290,12 @@ void EditorAudition::render (juce::AudioBuffer<float>& buf, int numSamples, bool
     // The rest of the block after a stop or the end of the clip (sample i is done).
     if (stopped || finished)
         duckMain (buf, i + 1, n, want != nullptr && ! (finished && want == cur));
+    if (prevClip != nullptr && (prevLeft <= 0 || stopped || finished))
+    {
+        prevClip = nullptr; // its fade is done: poll() may free it
+        prevLeft = 0;
+        hazardPrev.store (nullptr);
+    }
     if (stopped)
     {
         cur = nullptr;
@@ -6734,6 +8363,21 @@ bool HotStepLinkProcessor::pollCapture()
     // the last value the host once gave.
     sourceBpm = bpmKnown && HostSyncState::hostBpmUsable (bpm) ? bpm : 0.0;
 #endif
+    // A finished capture of this instance: the first-run hint is done for good. The flag
+    // is written once; a write that failed or was refused is tried again on the next
+    // capture, one try per capture. Message thread (this function already opens the file).
+    bool noteCapture = ! refHintSaved;
+#if defined (HSLINK_TEST_HOOKS)
+    if (testNoCaptureHintHook.load())
+        noteCapture = false; // teeth: a capture does not save the flag
+    if (testCaptureNotedFirst.load() && firstCaptureNoted)
+        noteCapture = false; // teeth: the old order, noted before the save, never retried
+#endif
+    if (noteCapture)
+    {
+        firstCaptureNoted = true;
+        refHintSaved = saveRefHintSeen();
+    }
     return true;
 }
 
@@ -7238,4 +8882,14 @@ bool HotStepLinkProcessor::deletePreset (const juce::String& name)
         return false; // factory presets are read-only
     const auto f = presetFileFor (getPresetFolder(), sanitizePresetName (name));
     return f != juce::File() && f.existsAsFile() && f.deleteFile();
+}
+
+double HostSyncState::renderGridDownbeat (bool haveGrid, bool handGrid, double handDownbeatSec,
+                                         double measuredDownbeatSec, double measuredLevel)
+{
+    if (! haveGrid)
+        return 0.0;
+    if (handGrid)
+        return handDownbeatSec;
+    return TempoResolve::downbeatOffsetToApply (measuredDownbeatSec, measuredLevel, TempoResolve::kDownbeatConfidence);
 }

@@ -46,6 +46,11 @@ struct HostSyncState
     // The host tempo to hand to TempoResolve::resolve: bpm when the host is active and
     // its tempo is known, else 0 (absent). Pure.
     static double tempoForCascade (double bpm, bool known, bool active) { return active && known ? bpm : 0.0; }
+    // Card 96f2fb35: the grid downbeat an edit render snaps to. A hand grid is used as set;
+    // a measured downbeat only through TempoResolve::downbeatOffsetToApply (medium or
+    // better), else 0 (file start left untouched). No grid: 0. Pure.
+    static double renderGridDownbeat (bool haveGrid, bool handGrid, double handDownbeatSec,
+                                      double measuredDownbeatSec, double measuredLevel);
     double tempoForCascade() const
     {
         return tempoForCascade (bpm.load (std::memory_order_relaxed), bpmKnown.load (std::memory_order_relaxed),
@@ -122,6 +127,11 @@ struct DawStatus
     // Set only when the worker was online at that moment, see DawWorker::computeOnline.
     juce::int64 waitingSinceMs = 0;
     int waitingTimeoutMs = 0;
+    // Backends the connected server lists (GET /api/backends, ids trimmed and lower-cased).
+    // backendsKnown false = no list was read (older server, no answer): nothing is marked.
+    // Display only: the backend setting is never changed from this list.
+    bool backendsKnown = false;
+    juce::StringArray backendIds;
 
     // Pure: the status pill text for an online server. etaBackend is eta.backend from
     // the status reply, engineModel is loaded_model (the ACE model name only).
@@ -156,6 +166,7 @@ struct DawJobRequest
     juce::int64 seed = -1;         // < 0 = random (omit)
     double guidance = -1.0;        // < 0 = Auto (omit); else clamped 0..20
     int steps = 0;                 // <= 0 = Auto (omit); else clamped 1..300
+    double coverStrength = -1.0;   // < 0 = omit; sent as cover_strength (0..1) only for ACE with src_audio
     juce::File sourceWav;          // set = multipart with src_audio
     bool hasRegion = false;        // repaint: region { start_s, end_s }
     double regionStartS = 0.0, regionEndS = 0.0;
@@ -166,6 +177,31 @@ struct DawJobRequest
 #endif
     // Pure: the DiT `model` field to send, empty = omit. Only ACE gets one; lego forces base.
     static juce::String resolveModel (const juce::String& mode, const juce::String& backend, int aceModel);
+    // Pure: the most takes one request may ask of a backend (LINK-side table, the one place
+    // it lives). 0 = no limit beyond the Takes range. HeartMuLa makes one take per request.
+    static int maxTakesForBackend (const juce::String& backendId);
+    // Pure: takes clamped to the backend's limit (unchanged when there is none).
+    static int clampTakesForBackend (int takes, const juce::String& backendId);
+    // Pure: status text when a clamp happens, e.g. "HeartMuLa makes one take per request;
+    // Takes set to 1". Empty when takes is within the limit.
+    static juce::String takesClampNote (int takes, const juce::String& backendId);
+    // Card 65840a44: settings a backend drops silently (LINK-side table, filled from field
+    // tests only). Unknown id = 0 (nothing ignored). The request still sends the field.
+    enum IgnoredField : juce::uint32
+    {
+        ignDuration = 1u << 0, ignBpm = 1u << 1, ignKey = 1u << 2, ignTimesig = 1u << 3,
+        ignSteps = 1u << 4, ignGuidance = 1u << 5, ignSeed = 1u << 6, ignVariation = 1u << 7,
+        ignLyrics = 1u << 8
+    };
+    static juce::uint32 ignoredFieldsForBackend (const juce::String& backendId);
+    // Pure: "MiniMax-M3 ignores Duration" for the fields set in the mask; empty when none.
+    static juce::String ignoredFieldsNote (juce::uint32 mask, const juce::String& backendId);
+    // Pure: note for the fields of this request the backend ignores (Auto/unset fields are
+    // not listed). Empty when none.
+    static juce::String ignoredNote (const DawJobRequest& r, const juce::String& backendId);
+    // Pure: "MiniMax-M3 returned 20.1 s for 15 s asked" when the returned length is off by
+    // more than 10 percent and more than 2 s; empty otherwise or when asked/got <= 0.
+    static juce::String durationMismatchNote (const juce::String& backendLabel, double askedSec, double gotSec);
     // Pure: request JSON body.
     juce::String toJson() const;
 };
@@ -186,6 +222,16 @@ struct DawJob
     bool downloadsComplete = false;
     bool cancelRequested = false;
     juce::String error;
+    // The complete status text behind a cut error (see DawWorker::plainServerError), at most
+    // kServerSaidFullMaxChars of server text; empty when error already is the whole text.
+    juce::String errorFull;
+    // The error text for the tooltip: errorFull while it still belongs to error (same start
+    // up to the cut), else error. A later plain error leaves no stale full text behind.
+    static juce::String fullErrorText (const DawJob& j)
+    {
+        const auto head = j.error.upToFirstOccurrenceOf ("...", false, false);
+        return j.errorFull.isNotEmpty() && head.isNotEmpty() && j.errorFull.startsWith (head) ? j.errorFull : j.error;
+    }
     juce::String ditModel;         // server dit_model, empty = not reported
     juce::String phase;            // server phase (e.g. loading_model), empty = not reported
     juce::Array<juce::int64> takeSeeds; // takes[n].seed, -1 = not reported
@@ -245,6 +291,16 @@ struct DawJob
     // Pure: status suffix for ETA or phase ("  Loading model...", "  ETA 42 s", or empty).
     static juce::String etaText (const DawJob& j);
     static State parseState (const juce::String& s, bool& ok);
+    // Pure: the take total a job shows. The server's take_count wins only when it is
+    // lower than what was asked (a backend that made fewer); a server default above the
+    // request (MiniMax-M3 reported 4 for a 1-take job) never inflates it. requested <= 0
+    // (unknown) keeps the server value.
+    static int effectiveTakeCount (int requested, int serverCount)
+    {
+        if (requested <= 0) return serverCount;
+        if (serverCount <= 0) return requested;
+        return serverCount < requested ? serverCount : requested;
+    }
 };
 
 // Background thread that owns all HTTP to the HOT-Step DAW facade. Never the
@@ -297,11 +353,15 @@ public:
     static std::atomic<bool> keepUnpublished;
     // Test hooks: the next N renames of publishDownload fail without being tried;
     // the number of rename tries made so far.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<int> testFailPublish;
+#endif
     static std::atomic<int> publishAttempts;
     // Test hook, false in the plugin: the worker signals its own exit right after a
     // take's download request returned (a close that arrives as a download completes).
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testExitAfterDownload;
+#endif
     // Offline switch for test and tool processes, false in the plugin. true: no worker
     // of this process opens a request to the live default server (a loopback host on
     // kLivePort, see isLiveDefaultBase): the heartbeat fails and a request returns 0
@@ -309,11 +369,15 @@ public:
     // port) is not touched. gateRequest is the one check, called by heartbeat() and
     // request() before they build their stream; requestsOpened counts the requests that
     // passed it, requestsRefused the ones it stopped.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testNoLiveServer;
+#endif
     // Test hook (teeth), 0 in the plugin: with the switch off, a request for the live
     // default server goes to this loopback port instead, so a mutant run never reaches
     // the real server either.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<int> testLiveRedirectPort;
+#endif
     static std::atomic<int> requestsOpened, requestsRefused;
     static constexpr int kLivePort = 3001;
     // Pure: 127.x.x.x, localhost, 0.0.0.0 or [::1] on kLivePort, with or without a path.
@@ -322,7 +386,19 @@ public:
     // ("http;//", "http:/", "http//") to "://", adds "http://" when no scheme is given,
     // and drops trailing slashes.
     static juce::String normaliseBaseUrl (const juce::String& typed);
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testNoUrlNormalise; // test hook (teeth): true = the typed text is used as is
+#endif
+    // Test hook, false in the plugin: heartbeat() and request() record the URL, extra
+    // headers and redirect limit of each stream they build (read under testCaptureLock).
+    static constexpr int kMaxRedirects = 0; // S2: the key header never follows a redirect
+#if defined (HSLINK_TEST_HOOKS)
+    static std::atomic<bool> testCaptureRequests;
+    static std::mutex testCaptureLock;
+    static juce::StringArray testCapturedUrls, testCapturedHeaders;
+    static juce::Array<int> testCapturedRedirects;
+    static void testCapture (const juce::String& url, const juce::String& headers, int redirects);
+#endif
     // Pure: one attempt log line. code 0 = no response (connect failed).
     static juce::String attemptLine (const juce::String& url, bool connected, int code, juce::int64 elapsedMs,
                                      int timeoutMs, const juce::String& timeText);
@@ -353,7 +429,9 @@ public:
     // Tells the thread to end and cancels the request in flight, without waiting.
     void signalStop();
     // Tests: true while the worker thread runs.
+#if defined (HSLINK_TEST_HOOKS)
     bool testWorkerRunning() const { return isThreadRunning(); }
+#endif
 
     // Any thread except audio.
     void setEndpoint (const juce::String& baseUrl, const juce::String& dawKey);
@@ -432,16 +510,73 @@ public:
     static constexpr int kSwitchTimeoutMs = 10000;
     // Test hook (teeth): false = legacy, no question and no switch, the submit goes as it is.
     std::atomic<bool> switchBackend { true };
+    // Backend list for the picker. Pure: reads the `backends` array of objects with an
+    // `id` out of a GET /api/backends answer. Any code but 200, an empty or non-JSON body,
+    // no array or no usable id gives known = false (fail open: nothing is marked).
+    struct BackendList
+    {
+        bool known = false;
+        juce::StringArray ids; // trimmed, lower-cased, no duplicates, server order
+    };
+    static BackendList parseBackendList (int httpCode, const juce::String& body);
+    // One GET /api/backends each time the server goes from offline to online (not on every
+    // heartbeat), on the worker thread after the status is published, with
+    // kBackendListTimeoutMs. "Offline to online" is the flag backendListDue, not the pill:
+    // it is set at the start, by a failed heartbeat that leaves the worker offline and by an
+    // endpoint change, and cleared by the one request it causes, whether that request got a
+    // list or not. So a server that answers the status but never answers this request is
+    // asked once, not once per heartbeat.
+    // The answer ensureBackend reads before a submit refreshes the same list at no cost.
+    // The timeout is the heartbeat's: well under kOfflineAfterMs, so a request that gets no
+    // answer returns while the last good heartbeat still counts and the pill stays online.
+    static constexpr int kBackendListTimeoutMs = kRequestTimeoutMs;
+    std::atomic<bool> backendListDue { true };
+    // false = no request of its own is sent. The test build starts with it off, because
+    // its request-counting cases count every GET; a test turns it on for itself.
+#if defined (HSLINK_TEST_HOOKS)
+    std::atomic<bool> listBackends { false };
+    // Test build only, teeth for the backendcaps group: one broken variant of the backend
+    // list code at a time, picked by the test binary. 0 = the code as shipped.
+    enum CapsMutant { capsMutNone = 0, capsMutNoParse, capsMutEmptyKnown, capsMutAllAvailable, capsMutNoCarry,
+                      capsMutFetchEveryBeat, capsMutKeepOnUrl, capsMutAutoReset, capsMutSkipApply,
+                      capsMutOldFetchLoop, capsMutStoreAnyUrl, capsMutItemsDisabled, capsMutUrlAfterGet,
+                      capsMutRawIds,      // ids kept and compared as sent: no trim, no lower-casing
+                      capsMutWrongField }; // the list is read from "name" instead of "id"
+    static std::atomic<int> testCapsMutant;
+    // Teeth for the missing-weights message: 0 = as shipped; 1 = the backend context is
+    // not looked at; 2 = never matches; 3 = the job-error site shows the raw text; 4 = the
+    // switch-failure site passes no hint; 5 = the exclusion words are ignored; 6 = the server
+    // text is not clipped; 7 = the debug log's once-set has no cap; 8 = only space, tab and
+    // line ends are collapsed; 9 = the scan of the server text has no bound; 10 = every
+    // character past ASCII is taken for a space; 11 = the match is the old one (plain
+    // substrings on the whole text as sent); 12 = the exclusion words veto a strong
+    // weights-file signal too; 13, 14, 15 = the refused-submit, refused-status and lost-job
+    // sites show the server text as sent; 16 = a text that does not match is returned as
+    // sent, whole (no one-line form, no cut).
+    static inline std::atomic<int> testWeightsMutant { 0 };
+    // Characters of the server text the last plainServerError match looked at.
+    static inline std::atomic<int> testServerSaidExamined { 0 };
+    // The debug log's once-sets, counted without a log file: with countOnly on, the log
+    // remembers keys as if it were enabled and writes nothing.
+    static void setLogCountOnlyForTest (bool on);
+    static int logSeenForTest (bool capped); // entries in the capped / the unlimited once-set
+#else
+    std::atomic<bool> listBackends { true };
+#endif
     // Test hook, null in the plugin: stands in for the two backend requests. Returns the
     // HTTP code (0 = no answer) and fills body. method is GET or POST, path as above.
     using BackendCallFn = int (*) (const juce::String& method, const juce::String& path,
                                    const juce::String& jsonBody, juce::String& body);
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<BackendCallFn> testBackendCall;
+#endif
     // Test hook, null in the plugin: runs on the worker thread at the top of each backend
     // request (the GET and the POST), after the switch mark is set and the lock released,
     // before the cancel check and the publish of the request. Lock not held.
     using BeforeBackendCallFn = void (*) (const juce::String& method, const juce::String& path);
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<BeforeBackendCallFn> testBeforeBackendCall;
+#endif
     // Test hook (teeth): false = legacy, a cancel that lands before the request is
     // published is not seen and the request goes out.
     std::atomic<bool> cancelBeforePublish { true };
@@ -449,7 +584,9 @@ public:
     // picked job, after the locked step that picks it (submitting and the switch mark are
     // set, the lock is released) and before stepJob, so before ensureBackend. Lock not held.
     using BeforeStepFn = void (*) (int localId);
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<BeforeStepFn> testBeforeStep;
+#endif
     // Test hook (teeth): false = legacy, processJobs does not set the switch mark when it
     // picks the job; ensureBackend sets the first one (the row can read sending first).
     std::atomic<bool> earlySwitchMark { true };
@@ -518,7 +655,9 @@ public:
     static std::atomic<bool> zeroByteSkip;
     // Test hook: > 0 = that many coming downloads that end with 200 have their .part
     // file emptied before the completeness test (a 200 with an empty body).
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<int> testEmptyDownloads;
+#endif
     // Test hook: zero-byte sources the rescue skipped (one per file per pass).
     static std::atomic<int> zeroByteSkips;
     // "saved.log" in a temp session folder: append-only, one line per take file of that
@@ -579,6 +718,31 @@ public:
     static juce::String extractServerId (const juce::var& v, bool isUnderstand);
     // Pure: error text from an envelope { error: { code, message } } or the HTTP code.
     static juce::String errorFromBody (const juce::String& body, int code);
+    // Pure: the plain message for "HeartMuLa model weights are not installed on the server",
+    // or empty when serverText is not that case. backendId is the backend the job asked for
+    // ("" = Auto). Matches only in a HeartMuLa context; trigger strings are inferred.
+    static juce::String missingWeightsText (const juce::String& backendId, const juce::String& serverText);
+    // The text shown for a server error. No missing-weights match: raw in the same one-line,
+    // cut form as below without the message in front (a raw of at most kServerSaidMaxChars
+    // characters with nothing but plain spaces between its words comes back unchanged; a
+    // text read whole that ends in keepHint is cut only when the part before the hint is
+    // over the limit). Match:
+    // "<missingWeightsText message> Server said: <raw>", where raw is put on one line (each
+    // run of spaces, tabs, line ends, control characters (0x00-0x1F, 0x7F-0x9F), no-break
+    // spaces and U+2028/U+2029 becomes one space, none at the ends) and, when longer
+    // than kServerSaidMaxChars characters, cut to that many followed by "...". When the cut
+    // removed keepHint (the switch failure's last sentence), " " + keepHint is added at the
+    // end. On a match the bounded one-line text also goes to the debug log, once per distinct text.
+    // fullOut (may be null): set to the same text without the cut when a cut was made (the
+    // one-line server text bounded at kServerSaidFullMaxChars, then "..."), else to empty.
+    // At most kServerSaidScanMaxChars characters of raw are read for the line; a text with
+    // more than that is treated as cut ("..." even when the line read so far is short).
+    static juce::String plainServerError (const juce::String& backendId, const juce::String& raw,
+                                          const juce::String& keepHint = {}, juce::String* fullOut = nullptr);
+    static constexpr int kServerSaidMaxChars = 120;
+    static constexpr int kServerSaidFullMaxChars = 4000; // bound on the tooltip's server text
+    static constexpr int kServerSaidScanMaxChars = 8192; // most characters of raw read for the line
+    static constexpr int kServerSaidLogCap = 64; // distinct texts remembered by the debug log
 
 private:
     void run() override;
@@ -588,6 +752,11 @@ private:
                  const juce::String& fileField, const juce::File& file, const juce::String& formField,
                  juce::String& body, const juce::File& downloadTo = {}, int timeoutOverrideMs = 0,
                  int cancelLocalId = 0);
+    // Worker thread. Asks for the backend list once and stores it in the status snapshot.
+    void fetchBackendList();
+    // Stores a list in the status snapshot under the lock; dropped when the endpoint is no
+    // longer forUrl (the answer belongs to a server that was replaced meanwhile).
+    void storeBackendList (const BackendList& list, const juce::String& forUrl);
     // Lock held. True when the listed job has a cancel waiting. 0 = no job, never true.
     bool cancelWaitingLocked (int localId) const;
     // A request other than the heartbeat came back good: sets status.lastOkMs and clears
@@ -759,7 +928,19 @@ public:
     // its decode job (off the audio thread) and plays that; its length stays the take
     // length (anchors at 0 and the end), so start, end and the play fraction are dst
     // time. Empty: the plain take.
+    // Live (Phase 2): markers that differ from the last ones while a clip plays (not
+    // loading) render the warp again on the decode job from the cached take; the new
+    // clip replaces the playing one at the same play position (dst frame) with a
+    // crossfade of the fade length. The same markers again do nothing.
     void setWarp (std::vector<WarpMarkers::Marker> markers);
+    // Live warp swap crossfade gains. t = the share of the fade still left (1 at the
+    // start, 0 at the end). Equal-power: gIn^2 + gOut^2 = 1.
+    static void swapFadeGains (float t, float& gIn, float& gOut) noexcept
+    {
+        const float ang = juce::jlimit (0.0f, 1.0f, t) * juce::MathConstants<float>::halfPi;
+        gOut = std::sin (ang);
+        gIn = std::cos (ang);
+    }
     // Loop on: the region repeats. Off: it plays to its end once. Takes effect at the
     // next pass through the end of the region.
     void setLoop (bool on) { loopOn.store (on, std::memory_order_relaxed); }
@@ -775,14 +956,18 @@ public:
     }
     static constexpr double kClickSeconds = 0.015, kClickHz = 1500.0;
     static constexpr float kClickLevel = 0.3f;
+#if defined (HSLINK_TEST_HOOKS)
     std::atomic<bool> revSeamCropForTest { false }; // teeth: reverse plus loop mirrors in the crop (pre-roll forward)
     std::atomic<bool> seamNoCorrForTest { false }; // teeth: the loop seam without the render's correlation law
+#endif
     // Audio thread only: the loop seam correlation (TakeEdit::seamRawCorrelation) for the seam it was measured on.
     const float* seamKeySrc = nullptr;
     int seamKeyStart = -1, seamKeyEnd = -1, seamKeyXf = -1, seamKeyRvS = 0, seamKeyRvE = 0, seamKeyLen = -1;
     bool seamKeyRev = false;
     double seamCorrUsed = 0.0;
+#if defined (HSLINK_TEST_HOOKS)
     std::atomic<bool> clickNoDownbeatForTest { false }; // teeth: the click ignores the grid offset
+#endif
     // Any thread: moves the region of the clip that plays (frames of the file, as
     // play()). The audio thread takes it at its next block; a read position outside
     // the new region jumps to its start with a crossfade of the fade length.
@@ -835,10 +1020,15 @@ public:
     std::atomic<bool> interruptible { true }; // test hook, as AuditionEngine::interruptible
     // Test hooks, empty in the plugin (one test each per call, off the audio thread):
     // in play() right after its generation, in poll() between its read and its lock.
+#if defined (HSLINK_TEST_HOOKS)
     std::function<void()> afterGenForTest, pollGapForTest;
     std::function<void()> jobThrowForTest; // test hook: called at the top of the preview job (may throw)
+#endif
 #if defined (HSLINK_TEST_HOOKS)
     std::function<void()> bypassGapForTest; // test build only: in play() and poll(), between the stop() and the flag coming down
+    // Live warp tests: is a swapped-out clip still named in hazardPrev, and how many clips are owned.
+    bool hazardPrevHeldForTest() const { return hazardPrev.load() != nullptr; }
+    int ownedCountForTest() { std::lock_guard<std::mutex> g (ownLock); return (int) owned.size(); }
 #endif
 
 private:
@@ -849,8 +1039,14 @@ private:
         int start = 0, end = 0; // the region in frames of audio
         int fade = 1;
         juce::uint32 serial = 0;
+        bool liveSwap = false; // a warp edit: replaces the playing clip in place (crossfade)
     };
-    void publish (const Audio& a, juce::int64 start, juce::int64 end, juce::int64 length, double atRate, int gen);
+    // liveSwap: only while expectSerial is still the active clip; the loading state is left alone.
+    void publish (const Audio& a, juce::int64 start, juce::int64 end, juce::int64 length, double atRate, int gen,
+                  bool liveSwap = false, juce::uint32 expectSerial = 0);
+    // Pool job: the piecewise stretch of a (the take at the host rate) by warp (frames of the file).
+    static Audio warped (const Audio& a, juce::int64 length, const std::vector<WarpMarkers::Marker>& warp, double r,
+                         const std::function<bool()>& abort);
 
     std::atomic<double> rate { 48000.0 };
     std::atomic<bool> loopOn { false };
@@ -864,6 +1060,7 @@ private:
     std::atomic<int> generation { 0 };
     std::atomic<Clip*> requested { nullptr };
     std::atomic<Clip*> hazard { nullptr };        // audio thread writes: the clip it may read
+    std::atomic<Clip*> hazardPrev { nullptr };    // audio thread writes: the clip a live swap fades out
     std::atomic<juce::uint32> doneSerial { 0 };   // audio thread writes: the clip that played to its end
     std::atomic<juce::uint32> activeSerial { 0 }; // the published clip, 0 = none
     std::atomic<bool> loadingNow { false };
@@ -888,6 +1085,9 @@ private:
     static constexpr juce::uint64 kNoRegion = 0; // never a packed region (end > start)
     juce::uint64 seenRegion = kNoRegion;
     int curStart = 0, curEnd = 0, jumpFrom = 0, jumpLeft = 0;
+    // Live warp swap: the replaced clip fades out under cur over prevLeft samples.
+    Clip* prevClip = nullptr;
+    int prevPos = 0, prevLeft = 0;
     void duckSync();              // takes a new duckLen when the ramp is at one of its ends
     float duckNext (bool down);   // one sample along the ramp, returns the gain there
     // Moves the duck one step per sample over [from, to) of buf, down or up, and
@@ -902,6 +1102,7 @@ private:
     juce::File cacheFile;       // ownLock
     double cacheRate = 0.0;     // ownLock
     std::vector<WarpMarkers::Marker> warpMap; // ownLock, frames of the file; empty = unwarped
+    juce::int64 playStart = 0, playEnd = 0, playLength = 0; // ownLock: the last play()
     juce::AudioFormatManager formats; // the pool thread only, after construction
     juce::ThreadPool pool { 1 };      // declared last, stopped first
 };
@@ -912,14 +1113,22 @@ private:
 namespace EditorFs
 {
     enum Tag { tagTick = 0, tagPaint, tagDrag, tagExport, tagCell, tagSelect, tagCount };
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> testCalls[tagCount];
     inline void count (Tag t) { ++testCalls[t]; }
+#else
+    inline void count (Tag) {}
+#endif
     inline bool exists (const juce::File& f, Tag t) { count (t); return f.existsAsFile(); }
     // Round 7: every file a take cell's waveform thumbnail was given, sorted by where it
     // is: under DawWorker::tempRoot() or anywhere else (the lasting root). The second
     // stays 0 in the plugin. Path compare only, no file call. Tests read and reset both.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> testThumbTemp, testThumbElsewhere;
     void countThumbSource (const juce::File& f);
+#else
+    inline void countThumbSource (const juce::File&) {}
+#endif
 }
 
 // Round 6: the take grid as the editor shows it, built from the processor's take
@@ -938,6 +1147,7 @@ namespace TakeGrid
         bool saved = false;    // stable is set (a verified lasting copy was made)
         bool badge = false;    // NOT SAVED: a lasting-copy attempt failed
         bool pending = false;  // no lasting copy yet and no failed attempt (no badge)
+        bool handingOver = false; // HslinkTakeEntry::handingOver: listed, its file not final yet (registerTake)
         bool dragAllowed = false; // == saved and not missing
         bool missing = false;     // D-fix: HslinkTakeEntry::missing (restored, file gone): dimmed, no audition/edit/export/drag
         bool selected = false, starred = false;
@@ -945,7 +1155,8 @@ namespace TakeGrid
         TempoMeasure::Result tempo;                         // meaningful in state measured
         TempoResolve::Resolved resolved;                    // the tempo of the grid and its source (HslinkTakeEntry::resolvedTempo)
         double durationS = 0.0;                             // HslinkTakeEntry::durationS, 0 = unknown
-        int fitScore = -1;                                  // fitToBarsScore at the host tempo, -1 = no score (set by the editor)
+        int fitScore = -1;                                  // lower of the present fit parts, -1 = no score (set by the editor)
+        int fitLen = -1, fitTempo = -1;                     // fitLengthScore / fitTempoScore, -1 = no part (set by the editor)
         TakeEdit::GridEdit gridEdit;                        // R1b: HslinkTakeEntry::gridEdit
     };
     // Fit to bars. Pure. How well a take lines up with whole host bars at the host tempo,
@@ -960,6 +1171,18 @@ namespace TakeGrid
     constexpr double kFitBeatTolerance  = 1.0;  // beats off a whole bar for a score of 0
     constexpr double kFitTempoTolerance = 0.03; // 3 % tempo error for a score of 0
     int fitToBarsScore (double lengthSec, double takeBpm, double hostBpm, int beatsPerBar);
+
+    // FIT option C (docs/design/FIT_CURVE_NOTE.md). Pure. Both return 0..100, -1 = no part.
+    //   length: gaussian on lengthSec vs requestedSec, sigma kFitLenSigmaFrac * requestedSec.
+    //     requestedSec <= 0 returns -1 (no length part; no bar-grid fallback).
+    //   tempo: measuredBpm folded to the nearest of x0.5 / x1 / x2 of requestedBpm, log2 error,
+    //     linear to 0 at a kFitTempoFoldTol ratio error.
+    constexpr double kFitLenSigmaFrac = 0.10;
+    constexpr double kFitTempoFoldTol = 0.06;
+    int fitLengthScore (double lengthSec, double requestedSec, double bpm, int beatsPerBar);
+    int fitTempoScore (double measuredBpm, double requestedBpm);
+    // The lower of the present parts, -1 when both are missing.
+    int fitMinScore (int lenScore, int tempoScore);
 
     // The tempo tag painted in a take cell. Pure.
     //   not measured: no text.            measuring: "bpm ..." (pending)
@@ -984,6 +1207,8 @@ namespace TakeGrid
     // The fit tag of a take cell: "fit 87", green at 80 and up, amber at 50 and up, else
     // red. score < 0: an empty tag.
     TempoTag fitTagOf (int score);
+    // "len X / tempo Y"; a missing part is hidden ("tempo Y", "len X"), "-" alone when both are missing; coloured by fitMinScore.
+    TempoTag fitTagOf (int lenScore, int tempoScore);
     // The take length painted in a grid cell: under 60 s one decimal ('4.0 s'), else m:ss
     // rounded to the second ('1:15'). {} for an unknown length (0 or less).
     juce::String lengthTextOf (double seconds);
@@ -995,24 +1220,36 @@ namespace TakeGrid
     };
     // Test only. true = the old per-take existsAsFile filter in build (and the old
     // stats in the editor's paint and Export enable), through EditorFs so it is counted.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testEditorStats;
+#endif
     // readouts1 teeth: 1 = lengthTextOf never uses m:ss; 2 = the cell length plate skips its tempo-plate check.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> testLengthMutant;
+#endif
     // Test only (teeth MISSING_IGNORED). true = build drops HslinkTakeEntry::missing (the old grid).
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testMissingIgnored;
+#endif
     // Test only (teeth THUMB_FROM_LASTING). true = the old thumbnail source: Cell::file,
     // which is the lasting copy for a saved take.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testThumbFromLasting;
+#endif
     // The file a cell's waveform thumbnail reads: always the take's temp copy, never the
     // lasting one (JUCE opens the source on the message thread, and again per pixel
     // column in paint for a very short take). Empty temp = no source, a blank waveform.
     // When the temp copy is gone (temp cleanup) and the lasting one exists: the lasting one.
     juce::File thumbSourceOf (const Cell& c);
     // Test only (teeth NO_THUMB_FALLBACK). true = the old source: always Cell::temp.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testNoThumbFallback;
+#endif
     // Test only (teeth NO_TEMP_FALLBACK). true = the old behaviour: a click and Export
     // use Cell::file only, with no fallback to the temp copy.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testNoTempFallback;
+#endif
     // The file a click (select / audition) or Export acts on. Called on a user action
     // only, never from the refresh or paint. Cell::file when it exists (one check); for a
     // saved take whose lasting file is gone, the temp copy when that exists (a second
@@ -1048,12 +1285,32 @@ namespace PeakGuard
     float truePeakDb (const juce::AudioBuffer<float>& buf);
     // Pure: the gain in dB (<= 0) that brings truePeak to the ceiling; 0 when under.
     float gainForPeak (float truePeakDbtp);
+    // Import target (product decision 2026-11-15): kCeilingDbtp - kMarginDb = -1.05 dBTP. The
+    // generated-take guard triggers over -1.0 and lands at -1.05 (margin = tolerance
+    // for the estimate); imports are strict: anything over -1.05 is cut to -1.05.
+    constexpr float kImportTargetDbtp = kCeilingDbtp - kMarginDb;
+    // Pure: the import gain in dB (<= 0); the one switch point for imported files.
+    float importGainForPeak (float truePeakDbtp);
     // Applies the guard to a WAV file in place. Returns the gain applied in dB
     // (0 = nothing done: under the ceiling, disabled, or unreadable).
     float applyToFile (const juce::File& wav);
     // Export: guards dest, but never when dest is the source itself (the take is
     // never rewritten in place by an export; import already guarded it).
     float applyToExport (const juce::File& src, const juce::File& dest);
+    // Result of guardCopy. truePeakDb is the source true peak before the gain;
+    // gainDb is the gain written into dest (<= 0, 0 when under the ceiling).
+    struct GuardCopyResult
+    {
+        bool ok = false;
+        float truePeakDb = -200.0f;
+        float gainDb = 0.0f;
+        juce::String reason;     // empty on success
+    };
+    // Import: reads src (wav, aif/aiff, flac; read-only, never written) and writes a
+    // guarded WAV copy to dest: same rate and channels, bit depth clamped to 16/24/32
+    // (float stays float), WAV metadata kept. Cut only, independent of the Level mode
+    // and of enabled. Writes only dest; a partial dest is deleted on failure.
+    GuardCopyResult guardCopy (const juce::File& src, const juce::File& dest);
     // "Peak guard -2.2 dB" (cut) or "Normalise +6.0 dB" (boost), empty for 0.
     juce::String text (float gainDb);
 }
@@ -1189,19 +1446,45 @@ public:
     TakeEditState getTakeEditState (juce::uint64 ticket) const;
     // Test hook, 0 in the plugin. An edit job whose ticket is this number or higher waits
     // right after it was marked running, until the number is changed or the plugin closes.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<juce::uint64> testHoldEditFromTicket;
+#endif
     // Test hook (teeth), true in the plugin. false = the old report store: one slot, read
     // whatever the ticket asked for, named by the entry's name alone.
     static std::atomic<bool> editReportsByTicket;
     // Tests: gives the listed take with this temp file another name (may be empty).
+#if defined (HSLINK_TEST_HOOKS)
     void setTakeNameForTest (const juce::File& tempFile, const juce::String& name);
+#endif
     // Standalone dev shot hook (--shot-load): list a WAV already on disk as a saved take
     // at the front of the list (take 0), as the edit-result path lists a rendered take.
+    // true = added now or a guarded import is pending (see addShotTakeChecked).
     bool addShotTake (const juce::File& wav);
+    // Message thread. A file whose sample peak is at or under kImportInPlaceDbfs (or
+    // whose peak cannot be read) is listed in place at once: added. Otherwise its true
+    // peak is measured on the stretch pool: at or under the guard it is listed in place
+    // from there; over it, a PeakGuard::guardCopy session copy in the temp session
+    // folder is listed instead (external false, importedFrom = the user's file). The
+    // user's file is never written. pending = queued; wait with waitTakeStretchIdle.
+    // duplicate = already listed (temp or importedFrom) or already pending.
+    // refused = no such file, or closing.
+    enum class AddTake { added, duplicate, pending, refused };
+    AddTake addShotTakeChecked (const juce::File& wav);
+    // The in-place shortcut (no true-peak scan). True peak can sit well over the sample
+    // peak: about +3 dB for a plain tone, and the scan itself (PeakGuard::truePeakDb)
+    // reads up to about +7.3 dB on a worst-case sign pattern, so the earlier -6 dBFS
+    // shortcut could list a file over the guard unscanned. At -12 dBFS a file needs more
+    // than about 11 dB of overshoot to pass -1.05 dBTP, more than the scan can report.
+    // Anything louder is scanned. Imports only: generated takes and exports do not use it.
+    static constexpr float kImportInPlaceDbfs = -12.0f;
+    // The result line of the last finished guarded import (added or failed), handed out once.
+    juce::String takeImportMessage();
     // "Add as take..." / a WAV dropped on the TAKES list uses the same path. Test mutant
     // (teeth), 0 in the plugin: mutAddTakeWrongRate = length counted at the host rate.
     enum AddTakeMutant { mutAddTakeNone = 0, mutAddTakeWrongRate = 1 };
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<int> addTakeMutantForTest;
+#endif
     // Queues a crop or loop render (TakeEdit) of the listed take with this temp file on
     // the pool thread of the stretch (one heavy take job at a time). Any thread but the
     // audio thread; returns at once with the job's ticket (never 0), the key of its
@@ -1246,29 +1529,46 @@ public:
     bool waitSaverIdle (int timeoutMs = 30000);
     // Teeth only. true = registerTake makes the lasting copy itself on the calling
     // thread, as before the saver made every copy (the saver is not woken).
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testWorkerCopies;
+#endif
     // Teeth only. true = the destructor decides keep-or-delete with the old probing
     // (legacyFolderReferenced: file stats under takesLock, one probe of the lasting
     // root per starred take). testDtorLastingProbes counts those lasting-root probes;
     // the shipped destructor makes none.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testDtorProbesLasting;
+#endif
     // Teeth only (D2). testMergeOnLoad = the old merge: a loaded state adds to the live
     // takes instead of replacing them. testRenumberTakes = numbers follow list position
     // (1..n, oldest first) instead of staying with the take.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testMergeOnLoad;
     static std::atomic<bool> testRenumberTakes;
+#endif
     // Teeth only (D2c). true = the old rule: a derived take (crop, loop, stretch) keeps
     // its parent's number instead of getting a fresh one on top.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testDerivedInheritsNum;
+#endif
     // Teeth only. true = writeTakesState drops the measured tempo of every take.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testDropTakeTempoOnSave;
+#endif
     // Tests only: every take remeasure gives no number (as a failed detection).
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testFailRemeasure;
+#endif
     // Teeth only: derived takes get no estimated tempo (the old 'tempo ?').
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testNoDerivedEstimate;
+    static std::atomic<bool> testNoCarryTempo; // F4b teeth: derived takes remeasure as before
+#endif
     // Teeth only: a stretch take whose name gives its target tempo is still marked est.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testStretchEst;
     static std::atomic<int> testDtorLastingProbes;
+#endif
     // false (teeth only) = the worker is told to end only after the wait for the
     // collection pool, as before.
     static std::atomic<bool> signalWorkerEarly;
@@ -1278,30 +1578,44 @@ public:
     static std::atomic<bool> handOverGuard;
     // Test hook, null in the plugin: called by the destructor right before its wait
     // for the collection pool (after the early signals). A test holds the close there.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<void (*) (HotStepLinkProcessor&)> testBeforePoolWait;
+#endif
     // Test hook, null in the plugin: the name of the temp session folder for try
     // number attempt (0 to 4) of the constructor; an empty answer = the normal name.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<juce::String (*) (int attempt)> testSessionNameFor;
+#endif
     // Test hooks. Defaults are the shipped behaviour.
     // true = registerTake returns after the entry is recorded and the marker synced,
     // before the length is read and before the rename (as if the process died there):
     // the complete bytes are in <name>.wav.part and the marker line names <name>.wav.
     // With recordBeforeMetadata false it returns after the metadata was read and before
     // the entry is added: a complete .part with no entry and no marker line.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testStopBeforePublish;
+#endif
     // false = the order before this rule (teeth only): the metadata, with the length
     // read from the .part file, is filled first and the entry is recorded after it.
     static std::atomic<bool> recordBeforeMetadata;
     // true = registerTake returns right after the entry is recorded, the marker synced
     // and the file published, without waking the saver thread (as if the process died
     // there). A timed retry pass of the saver can still copy the take.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testStopAfterRecord;
+#endif
     // teeth TS_NO_WRITE: writeTakesState writes no Takes child (the state before C1).
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testNoTakesWrite;
+#endif
     // teeth TS_TRUST_EXT: readTakesState trusts the saved ext flag for a file outside the takes root.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testTrustExt;
+#endif
     // teeth TS_SKIP_EXTERNAL: writeTakesState skips external (Add as take) takes, the pre-fix bug.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testSkipExternalTakes;
+#endif
     // false = the old order (teeth only): publish, copy, and only then add the entry.
     // With testStopAfterRecord also set, the old order returns after the publish and
     // before the copy and the entry (as if the process died while the copy ran).
@@ -1348,19 +1662,27 @@ public:
     static std::atomic<bool> shutdownGuard;
     // Every lasting-copy attempt waits this long first (a stand-in for a share that
     // does not answer).
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<int> testCopyDelayMs;
+#endif
     // Lasting-copy attempts started after any processor's destructor began.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<int> testAttemptsAfterClose;
+#endif
     // Tests: sets the closing flag without destroying the processor.
+#if defined (HSLINK_TEST_HOOKS)
     void testBeginShutdown() { shuttingDown = true; }
+#endif
     // F1 hooks (rescueMarkedFolders, the loop over a marker's listed takes).
     // testRescueLastingProbes: file calls the loop made on the lasting root to see if a
     // take is already recovered (2 per probed take at most). testBeforeRescueTake: called
     // before each listed take is looked at. testRescueProbeBeforeClosing: true (teeth
     // only) = the old order, the probe runs without a closing check before it.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<int> testRescueLastingProbes;
     static std::atomic<void (*) (HotStepLinkProcessor&)> testBeforeRescueTake;
     static std::atomic<bool> testRescueProbeBeforeClosing;
+#endif
     // Test hooks: calls that entered rescueMarkedFolders; folders it left alone because
     // their owner.lock is held by someone alive.
     static std::atomic<int> rescueCalls;
@@ -1446,7 +1768,9 @@ public:
     // Test hook, null in the plugin (moveToDeletedFolder is called). A test points it
     // at its own function in place of the move; false = failed, the take is kept.
     // The seam of the move itself is DeletedFolder::testFailRename.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool (*) (const juce::File&)> testTrashFile;
+#endif
     // Tests: waits until no committed delete is waiting or running on the pool.
     bool waitTakeDeleteIdle (int timeoutMs = 10000);
     // Test hook (teeth): false = legacy, no take list; takes come from the live job
@@ -1493,14 +1817,60 @@ public:
     juce::String getServerUrl() const;
     juce::String getSavedServerUrl() const;
     static juce::String serverUrlOverride();
-    void setServerUrl (const juce::String& url);
+    // Returns false (and keeps the old value) unless isValidServerUrl (url).
+    bool setServerUrl (const juce::String& url);
+    // Pure check: http:// or https://, non-empty host, optional port 1..65535,
+    // surrounding spaces and one trailing slash allowed.
+    static bool isValidServerUrl (const juce::String& url);
+    // True only for localhost, 127.x.y.z, ::1 / [::1]. Used for the no-key exposure warning.
+    static bool isLoopbackServerUrl (const juce::String& url);
+    // Pure: true when the amber no-key warning shows (no key set and a non-loopback URL).
+    static bool shouldWarnExposure (const juce::String& url, bool keySet);
     // The DAW key is per user, stored in userApplicationDataDirectory/HOT-Step/LINK.settings
     // (env HSLINK_SETTINGS_FILE overrides, for tests). Plugin state keeps only a keySet flag.
     juce::String getDawKey() const;
-    void setDawKey (const juce::String& key);
+    // False when the key could not be stored in the settings file (it is still used for
+    // this session). saveTried (optional) is set true only when the settings file save
+    // was actually called; it stays false for an unchanged key (nothing saved, returns true).
+    bool setDawKey (const juce::String& key, bool* saveTried = nullptr);
     static juce::File keyStoreFile();
     static juce::String loadStoredKey();
-    static void saveStoredKey (const juce::String& key);
+    // Read, set the key, write back: every other value is kept. An existing file that
+    // cannot be read (after short retries) is first copied aside in the same folder as
+    // <name>.unreadable-<yyyyMMdd-HHmmss>, then replaced; the newest 2 such copies are
+    // kept. If that copy cannot be made nothing is written and false is returned. A
+    // missing file is created. The whole read, change and write runs under a lock shared
+    // by every process that uses the same settings file; when the lock cannot be had within
+    // kSettingsLockTimeoutMs nothing is written and false is returned. Message thread
+    // (never the audio thread).
+    static bool saveStoredKey (const juce::String& key);
+    // First-run reference hint seen flag, same file as the key (other values are kept).
+    static bool loadRefHintSeen();
+    // Read, set the one flag, write back: every other key (known or not) is kept. No write
+    // when the flag is already set, and none when an existing file cannot be parsed (an
+    // unreadable file is never replaced). A missing file is created holding only the flag.
+    // Returns true when the flag is set in the file after the call. Same cross-process lock
+    // as saveStoredKey: no lock within kSettingsLockTimeoutMs = no write, false. Message thread.
+    static bool saveRefHintSeen();
+    // Longest wait for the settings file lock held by another process (or thread).
+    static constexpr int kSettingsLockTimeoutMs = 300;
+    // True once this instance has finished a capture (message thread); the flag is saved
+    // on that first capture only, so repeated captures write nothing more.
+    bool firstCaptureDone() const { return firstCaptureNoted; }
+#if defined (HSLINK_TEST_HOOKS)
+    static std::atomic<int> refHintWritesForTest;       // counts real writes of the flag
+    static std::atomic<int> refHintSaveCallsForTest;    // counts calls of saveRefHintSeen
+    static std::atomic<bool> testRefHintFromDefaults;   // teeth: the flag write rebuilds the file from nothing
+    static std::atomic<bool> testNoCaptureHintHook;     // teeth: a capture does not save the flag
+    static std::atomic<bool> testCaptureNotedFirst;     // teeth: a failed flag save is never retried
+    static std::atomic<bool> testKeySaveNoAside;        // teeth: an unreadable file is replaced with no copy
+    static std::atomic<bool> testKeyAsideFails;         // seam: the aside copy cannot be made
+    static inline std::atomic<int> keySaveCallsForTest { 0 }; // counts calls of saveStoredKey
+    static std::atomic<bool> testNoSettingsLock;        // teeth: the settings writers take no lock
+    static std::atomic<int> testFlagPauseAfterReadMs;   // seam: saveRefHintSeen makes <file>.readdone after its read, then waits this long before its write
+    static juce::String settingsLockNameForTest();      // the lock name of the settings file in use
+    bool refHintSavedForTest() const { return refHintSaved; }
+#endif
 
     // Message thread: request with host metadata filled (bpm, timesig, duration
     // from the loop region when looping). manualBpm used in standalone.
@@ -1548,6 +1918,18 @@ public:
     // Server id of the backend param ("" = Auto, "sa3", "ace", "minimax-m3", ...). Message thread.
     juce::String getSelectedBackendId() const;
     static juce::String backendIdForIndex (int index);
+    static constexpr int kBackendChoices = 6; // items of the "backend" choice, Auto first
+    // Pure. Is the backend choice `index` one the server lists? Auto (0) always is, and
+    // with known false (no list read) every choice is. ids are compared trimmed and
+    // lower-cased. Display only: an unlisted choice stays selectable and selected.
+    static bool backendAvailable (int index, bool known, const juce::StringArray& ids);
+    // Pure. Ids the server lists that the fixed choice list does not have (note only).
+    static juce::StringArray backendExtras (bool known, const juce::StringArray& ids);
+    // Pure. Tooltip of the Backend picker; names the marked entries and the extras.
+    // Empty when no list was read or there is nothing to say.
+    static juce::String backendPickerTooltip (bool known, const juce::StringArray& ids);
+    // Pure. Short status note for a selected backend the server does not list, else empty.
+    static juce::String backendUnlistedNote (int index, bool known, const juce::StringArray& ids);
     HostSyncState hostSync;
     CaptureEngine capture;
     DawWorker daw;
@@ -1562,7 +1944,7 @@ public:
     // R6: stable copy of a downloaded temp take (copies once, cached). Any thread
     // except audio. Returns {} if the copy failed.
     juce::File stableTakeFor (const DawJob& job, int takeIndex);
-    // Tests. HSLINK_STABLE_ROOT (read once at start) does the same before the saver thread starts.
+    // Tests. HSLINK_TAKES_ROOT (read once at start) does the same before the saver thread starts.
     void setStableRoot (const juce::File& root) { std::lock_guard<std::mutex> g (takesLock); stableRoot = root; }
     juce::File getStableRoot() const { std::lock_guard<std::mutex> g (takesLock); return stableRoot; }
     juce::File getStableSessionFolder() const;
@@ -1583,6 +1965,12 @@ public:
     // state. Message thread. Default PeakGuard::kGuard.
     int getPeakMode() const;
     void setPeakMode (int mode);
+    // Reference-audio strength (cover_strength), 0..1, default 1. Message thread; persisted in state.
+    double getCoverStrength() const;
+    void setCoverStrength (double v);
+    // Last ACE-Step mode (1..3) kept while another backend forces text2music; persisted in state.
+    int getAceModeId() const;
+    void setAceModeId (int id);
     int getKeyIndex() const;                // 0 = Auto
     void setKeyIndex (int index);
     juce::String getCaption() const;        // stored in state, not automatable
@@ -1701,6 +2089,8 @@ private:
     std::atomic<double> capEndPpq { -1.0 }; // audio thread writes at start
     double capLastPpq = 0.0;          // audio thread
     juce::File sourceFile;            // message thread
+    bool firstCaptureNoted = false;   // message thread, see firstCaptureDone
+    bool refHintSaved = false;        // message thread: the flag write succeeded; until then each capture tries once
 #if defined (HSLINK_TEETH_NO_TEMPO_GATE)
     double sourceLenS = 0.0, sourceStartPpq = 0.0, sourceBpm = 120.0; // teeth: before round 15
 #else
@@ -1722,12 +2112,16 @@ private:
     void wakeSaverForNewTake();        // worker thread: a take was recorded
     std::atomic<int> recordSeq { 0 }, savedSeq { 0 }; // takes recorded / the count the saver's last pass covered
     juce::WaitableEvent saverIdle;     // signalled after every saver pass (waitSaverIdle)
+#if defined (HSLINK_TEST_HOOKS)
     bool legacyFolderReferenced (const juce::File& dir) const; // TEST ONLY, see testDtorProbesLasting
+#endif
     // Declared before saver: the saver thread attaches to it for its whole run.
     ExclusiveFile::IoCanceller saverIo;
     std::unique_ptr<TakeSaver> saver;
     std::atomic<bool> shuttingDown { false };
+#if defined (HSLINK_TEST_HOOKS)
     std::atomic<bool> destructorBegan { false }; // only for testAttemptsAfterClose
+#endif
     bool countCopyAttempt();           // before every lasting copy; false = closing, do not copy
     bool closingNow() const;           // the abort predicate of every lasting copy
     void noteSaved (const juce::File& temp, const juce::File& lasting); // one saved.log line; never under takesLock
@@ -1766,6 +2160,14 @@ private:
     PendingTakeDelete pendingDelete;
     std::vector<PendingTakeDelete> pendingRest; // takesLock; the rest of a clearUnstarredTakes batch (oldest first), only while pendingDelete.active
     juce::String takeDeleteMessage;    // takesLock
+    std::vector<juce::String> pendingImports; // takesLock: importKey of each guarded import queued
+    juce::String importMessage;        // takesLock: see takeImportMessage
+    // The one rule for "same file" in every import duplicate check (pending key, take
+    // temp, take importedFrom): the full path, lower-cased on Windows and Mac (file
+    // systems that ignore case by default), exact elsewhere.
+    static juce::String importKey (const juce::File& f);
+    bool importListedLocked (const juce::String& key) const; // takesLock held; a take lists that file (in place or as importedFrom)
+    bool listUserFileLocked (const juce::File& wav, double durationS); // takesLock held; false = already listed
     void restoreTakeLocked (const PendingTakeDelete& p);
     bool takeStarredLocked (const TakeEntry& t) const;  // takesLock held
     void finishTakeDelete (const PendingTakeDelete& p); // file IO: delete pool thread, or the destructor

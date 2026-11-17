@@ -7,11 +7,13 @@
 #include <algorithm>
 #include <cmath>
 
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> CollectionStore::testDisabled { false };
 std::atomic<bool> CollectionStore::testNoRootGuard { false };
 std::atomic<bool> CollectionStore::testFailSidecar { false };
 std::atomic<bool> CollectionStore::testFailSidecarMove { false };
 std::atomic<bool> CollectionStore::testFailRemoveRollback { false };
+#endif
 
 // ---- TempoResolve: pure ----------------------------------------------------------
 
@@ -144,6 +146,15 @@ TempoResolve::Resolved TempoResolve::resolve (const TempoMeasure::Result& measur
     return r;
 }
 
+double TempoResolve::downbeatOffsetToApply (double measuredOffsetSec, double confidence, double threshold)
+{
+    if (! std::isfinite (measuredOffsetSec) || ! std::isfinite (confidence) || ! (confidence >= threshold))
+        return 0.0;
+    if (std::abs (measuredOffsetSec) < kNegligibleDownbeatSec || std::abs (measuredOffsetSec) > TakeEdit::kMaxGridDownbeatSec)
+        return 0.0;
+    return measuredOffsetSec;
+}
+
 TempoResolve::Resolved TempoResolve::applyFitBars (const Resolved& resolved, double userFitBpm, const TempoMeasure::Result* measured)
 {
     if (resolved.source == Source::fileName || ! hostBpmUsable (userFitBpm))
@@ -156,7 +167,7 @@ TempoResolve::Resolved TempoResolve::applyFitBars (const Resolved& resolved, dou
     // Beat 1 of the new bar from the estimate's own beats, when they are a related pulse.
     if (measured != nullptr && measuredCertain (*measured) && relationTo (measured->bpm, userFitBpm) > 0.0)
     {
-        r.downbeatSec = measured->downbeatSec;
+        r.downbeatSec = downbeatOffsetToApply (measured->downbeatSec, (double) measured->level, kDownbeatConfidence);
         r = rephase (r, *measured, measured->topOnsets);
     }
     return r;
@@ -483,8 +494,10 @@ bool CollectionStore::fromJson (const juce::String& json, CollectionItem& item)
 // the sidecar in one step, so a crash cannot leave a half-written sidecar.
 bool CollectionStore::writeSidecar (const CollectionItem& item)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testFailSidecar.load())
         return false;
+#endif
     const auto dest = item.sidecar();
     const auto tmp = dest.getSiblingFile (dest.getFileName() + ".tmp");
     if (! tmp.replaceWithText (toJson (item), false, false, nullptr))
@@ -526,14 +539,34 @@ bool CollectionStore::readItemLocked (const juce::File& wav, CollectionItem& out
     return true;
 }
 
+juce::StringArray CollectionStore::buildTags (const juce::String& backend, double bpm,
+                                              const juce::String& key, const juce::String& mode)
+{
+    juce::StringArray out;
+    auto push = [&out] (const juce::String& s)
+    {
+        const auto t = s.trim().toLowerCase();
+        if (t.isNotEmpty() && out.size() < kMaxTags)
+            out.addIfNotAlreadyThere (t);
+    };
+    push (backend);
+    if (bpm > 0.0)
+        push (juce::String (juce::roundToInt (bpm)) + "bpm");
+    push (key);
+    push (mode);
+    return out;
+}
+
 CollectionResult CollectionStore::add (const HslinkTakeEntry& take)
 {
     CollectionResult r;
+#if defined (HSLINK_TEST_HOOKS)
     if (testDisabled.load())
     {
         r.error = "collection disabled";
         return r;
     }
+#endif
     if (take.stable == juce::File() || ! take.stable.existsAsFile())
     {
         r.error = "take has no lasting file";
@@ -592,6 +625,7 @@ CollectionResult CollectionStore::add (const HslinkTakeEntry& take)
     it.createdMs = take.createdMs;
     it.addedMs = juce::jmax (juce::Time::currentTimeMillis(), lastAddedMs + 1);
     it.sourceName = take.stable.getFileName();
+    it.tags = buildTags (it.backend, it.bpm, it.key, it.mode);
     if (! writeSidecar (it))
     {
         dest.deleteFile(); // the copy made a few lines up, in this call: no orphan WAV
@@ -607,8 +641,10 @@ CollectionResult CollectionStore::add (const HslinkTakeEntry& take)
 std::vector<CollectionItem> CollectionStore::list() const
 {
     std::vector<CollectionItem> out;
+#if defined (HSLINK_TEST_HOOKS)
     if (testDisabled.load())
         return out;
+#endif
     std::lock_guard<std::mutex> g (ioLock);
     if (! root.isDirectory())
         return out;
@@ -630,8 +666,10 @@ std::vector<CollectionItem> CollectionStore::list() const
 
 bool CollectionStore::setStarred (const CollectionItem& item, bool starred, juce::String* error)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testDisabled.load())
         return false;
+#endif
     std::lock_guard<std::mutex> g (ioLock);
     CollectionItem cur;
     bool corrupt = false;
@@ -657,8 +695,10 @@ bool CollectionStore::setStarred (const CollectionItem& item, bool starred, juce
 
 bool CollectionStore::rename (const CollectionItem& item, const juce::String& newDisplayName, juce::String* error)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testDisabled.load())
         return false;
+#endif
     const auto name = newDisplayName.trim().substring (0, 120);
     if (name.isEmpty())
     {
@@ -690,10 +730,17 @@ bool CollectionStore::rename (const CollectionItem& item, const juce::String& ne
 
 bool CollectionStore::remove (const CollectionItem& item, juce::String* error)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testDisabled.load())
         return false;
+#endif
     std::lock_guard<std::mutex> g (ioLock);
-    if (! testNoRootGuard.load()
+#if defined (HSLINK_TEST_HOOKS)
+    const bool rootGuard = ! testNoRootGuard.load(); // teeth: remove skips the inside-the-root check
+#else
+    const bool rootGuard = true;
+#endif
+    if (rootGuard
         && (! isInsideRootLocked (item.wav) || ! item.wav.hasFileExtension ("wav")))
     {
         setError (error, "refused: not a file directly inside the collection folder");
@@ -724,10 +771,21 @@ bool CollectionStore::remove (const CollectionItem& item, juce::String* error)
         return false;
     }
     const auto side = item.wav.withFileExtension ("json");
+#if defined (HSLINK_TEST_HOOKS)
     const auto sideResult = testFailSidecarMove.load() ? MoveToDeleted::kept : moveToDeletedFolder (side);
+#else
+    const auto sideResult = moveToDeletedFolder (side);
+#endif
     if (sideResult != MoveToDeleted::kept)
         return true;
-    if (wavResult == MoveToDeleted::moved && ! testFailRemoveRollback.load()
+    bool rollback = true;
+#if defined (HSLINK_TEST_HOOKS)
+#if defined (HSLINK_TEST_HOOKS)
+    if (testFailRemoveRollback.load())
+        rollback = false; // teeth: the WAV is not put back
+#endif
+#endif
+    if (wavResult == MoveToDeleted::moved && rollback
         && DeletedFolder::renameBack (wavInDeleted, item.wav))
     {
         setError (error, removeNoteText (RemoveNote::infoKept));
@@ -761,8 +819,10 @@ juce::String CollectionStore::removeResultText (const juce::String& name, bool r
 
 std::vector<CollectionItem> CollectionStore::filter (const std::vector<CollectionItem>& items, const CollectionQuery& query)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testDisabled.load())
         return items;
+#endif
     const auto text = query.text.trim();
     std::vector<CollectionItem> out;
     for (const auto& it : items)
@@ -780,13 +840,17 @@ std::vector<CollectionItem> CollectionStore::filter (const std::vector<Collectio
 }
 
 //==============================================================================
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> CollectionView::testDisabled { false };
+#endif
 
 CollectionQuery CollectionView::queryFor (const CollectionChips& chips)
 {
     CollectionQuery q;
+#if defined (HSLINK_TEST_HOOKS)
     if (testDisabled.load())
         return q;
+#endif
     q.text = chips.search.trim();
     q.backend = chips.backend == CollectionChips::sa3 ? "sa3"
               : chips.backend == CollectionChips::yue2 ? "yue2"
@@ -804,8 +868,10 @@ bool CollectionView::isFiltering (const CollectionChips& chips)
 
 juce::String CollectionView::subtitle (double bpm, const juce::String& key, double durationS)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (testDisabled.load())
         return {};
+#endif
     juce::StringArray parts;
     if (bpm > 0.0)
     {

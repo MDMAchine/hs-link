@@ -6,6 +6,49 @@ Development through v0.4.0 happened inside the MDMAchine_VST monorepo. The plugi
 
 ---
 
+## Unreleased
+
+Not in the 0.5.24 binaries.
+
+- SETTINGS: Show / Hide button beside the DAW key field. Display only: it does not save or change the key, and the key is masked again whenever the panel opens or closes and when the take editor opens. Masking when the host hides the plugin window is unverified until checked in a real host. The button is 24 px high like Close.
+- SETTINGS and SETUP: the server URL, DAW key, Caption and Lyrics fields draw their first text in the theme colour (243,245,250), no longer in plain white.
+- Missing HeartMuLa model weights: a failed job, refused request or failed backend switch now shows a plain message ("HeartMuLa is not installed on the server (model weights missing). Pick another backend or install it in HOT-Step.") followed by " Server said: " and the server's own text on one line (at most 120 characters, then "..."; a failed switch keeps its closing hint sentence). The full server text goes to the debug log. The match is narrow: the text must name a model file (weights, checkpoint, safetensors, .pt, .ckpt, .bin, "model weights", "model file", "model not installed") and say it is absent; the bare word "model" is not enough, and a text about an argument, parameter, field, required value, device or LoRA is never matched. The match strings are inferred (the server's real text has never been captured); on Auto the plain message appears only if the server's text names the backend.
+- Job status line: its tooltip shows the full status text, with the server's whole text (up to 4000 characters); the line itself still cuts the server text to 120 characters. A line that already shows everything, such as "Idle", has no tooltip.
+- Server error line: control characters, DEL, no-break spaces and the Unicode line and paragraph separators in the server's text now become single spaces like tabs and line ends (other non-ASCII text is unchanged), and the line is built from at most the first 8192 characters of the text, so a very large error body no longer stalls the worker; a text longer than that ends in "...".
+- Missing HeartMuLa weights match, tightened: model file words are matched as whole words ("weighted" is no match), file extensions (.safetensors, .ckpt, .pth, .pt, .bin) only at the end of a file name (".ptx" is no match), and a folder named checkpoints or weights in the path of another file is no match. A text that plainly names a weights file (one of those extensions except .bin, "checkpoint file", "weights file", or "weights" right beside "not found", "missing" and the like) is matched even when it also says required, device, field, parameter or argument, such as "HeartMuLa weights not found, download required"; a text about a LoRA is still never matched. The match now reads the text on one line, so a phrase split by a line end matches, and reads only the first 8192 characters. The match strings are still inferred.
+- Server error line, other errors: a server text that is not about missing weights is now also put on one line and cut to 120 characters and "..." on the job line, with the text up to 4000 characters in the tooltip (before, it was shown and kept whole however large). A text of at most 120 characters with only plain spaces is shown exactly as sent, and a failed backend switch keeps its closing hint sentence. The debug log line for missing weights holds at most 4000 characters of the server text and is only built when it is written.
+- Tests: keyreveal (35 checks, 10 mutants) and weightsmsg (153 checks, 16 mutants) groups in the default run.
+
+## v0.5.24 -- 2026-11-15
+
+Changes since v0.5.23:
+
+- Take editor redesign (v5b layout): hero waveform with seconds axis, GRID EDIT card spanning the wave plate, LCD value wells, one-line header, footer with Send to takes and Export loop, helper texts moved to tooltips.
+- Take editor: POS readout shows bar.beat.tick and seconds; start flag snap re-measures loop end in whole beats; Grid BPM field vertical drag (Shift for fine); warp speed labels fit whole or fall back, never under the crop flags.
+- Tempo and beat tracking: downbeat snaps to the strongest nearby onset, steady openings pre-warm the smoother, warp markers seeded from tracked beats with quiet-passage fallback and relock.
+- Apply warp renders only the S/E section; FIT and edit render gate the downbeat on tempo confidence.
+- Takes clamp to the per-backend maximum (HeartMuLa = 1); per-backend ignored settings are greyed with a duration mismatch note.
+- Fixed: TextEditor outline honours explicit colours so amber/red warnings draw.
+- Editor-shot scratch mode (HSLINK_SHOT_SCRATCH) for offscreen proof shots.
+- Reference track discoverability: the empty SOURCE waveform shows a first-run hint (ARM and play, then ACE-Step with repaint or lego in SETTINGS) until a source clip exists; a click hides it for good (flag "refHintSeen" in LINK.settings). The hint also goes away for good after the first capture. It is not drawn when it does not fit the waveform area.
+- SETTINGS: a backend other than ACE-Step now shows "reference audio needs ACE-Step" beside Mode / strength (before, only Auto showed a note). RE-ANALYZE CAPTURE tooltip says it fills KEY, TEMPO EST. and tags only.
+- README: "Quick start: using a reference track".
+- Backend picker: entries and role cards for backends the connected server does not list are marked (dimmed text in the open menu, at 0.6 of the normal text strength so it stays readable, and a dimmed card); the picker's tooltip names them (the role cards have no tooltip). A marked entry is still pickable everywhere: from the dropdown menu, its role card, host automation and saved state. No entry is disabled and the setting is never changed; a selected unlisted backend shows amber picker text and a status note. With no list from the server nothing is marked.
+- Fix (backend picker): a server that answers the status but never answers the backend list request is asked once per offline to online change, with a 2.5 s timeout (was 10 s, and asked again on every heartbeat with the status reading offline in between). A backend list that arrives after the server URL was changed is dropped in the pre-submit path too (test backendcaps C-l, with a stand-in for the list request).
+- Fix (take card): a card made in the short time between a take being listed and its file getting its final name stayed on "loading..." (the file was read once, before it was there, and never again). The card now reads the file again once it is there, at most 9 times per card. Covered by test (nopoll G10); not yet seen with a live engine.
+- Fix (take arrival): a take that arrives is selected on the first refresh after its file has its final name (before, a refresh between "listed" and "renamed" showed "Cannot audition: the take's file is missing" and the take was never selected by itself). The waveform retries of a card are now at least 1000 ms apart (9 at most, was 3), so a file held by another program right after the rename is tried over about 8 s instead of within 3 refreshes.
+- MIDI export: a picker card chooses the parts to write: drums, melody (tonal takes), chords (with the key, per bar or per beat) and a tempo map, as a file per part or one multitrack file. Parts that do not apply are skipped with a reason in words (for example "melody: the take is not tonal"), and the status row lists every file written. Chords are not guessed for drum-only or noise takes, and a kick under the chords no longer pulls the chord name off.
+- Live warp: moving a warp marker (or scale, AUTO-WARP, reset, undo, redo) while a take is auditioning re-renders it and swaps the new audio in at the same place with an equal-power crossfade.
+- Add as take / WAV drop: a file whose true peak is over -1.05 dBTP is listed as a guarded session copy at -1.05 dBTP (WAV, FLAC and AIFF sources; the Level setting does not turn this off). Your own file is never written. Quieter files are listed in place as before. Adding the same file twice says "Already in the take list".
+- SETTINGS: the reference lock follows the backend, with a Mode / strength box (cover strength) for ACE-Step. The ACE mode is remembered when you switch to another backend and back.
+- SETTINGS: when the DAW key cannot be saved, a line in the key caption row says so. The settings file is safer with several plugin instances open (one writer at a time), and an unreadable settings file is copied aside instead of being overwritten.
+- Take cards: bpm and length chips sit in their own row, clear of the waveform. The fit tag leaves out a length or tempo part it does not know (was "-").
+- Take editor: the ruler bars and the seconds axis line up, bar labels thin out on a narrow panel, and the CONF bar shows the tempo confidence in percent.
+- SOURCE card: no header label when there is no source clip (was always CAPTURED).
+- The window opens at 1182 x 760, its smallest size (was 1180, just under it).
+- Readability: the SETTINGS reference note and unlisted backend entries on the highlighted menu row have stronger text contrast.
+- Internal: test-only switches and counters are no longer compiled into the shipped plugin; test fixes and new test groups.
+
 ## v0.5.23 -- 2026-11-13
 
 Changes since v0.5.22:
@@ -61,7 +104,7 @@ Changes since v0.5.20 (4c4f830):
 
 ## v0.5.15 -- 2026-10-31
 
-- Editor: the smallest window is now 1080 x 760 (was 980 x 640), the smallest size that shows the whole Preview section. A host that offers an older, smaller size gets the new minimum.
+- Editor: the smallest window is now 1182 x 760 (was 980 x 640; 1080 in 0.5.15, raised to 1182 with the take editor cards), the smallest size that shows the whole Preview section. A host that offers an older, smaller size gets the new minimum.
 - Loop and warp editor: /2 and x2 buttons halve or double the loop length; the loop start stays.
 - Loop and warp editor: grid resolution box in the warp row. A = automatic, x2 x4 = fewer grid lines, /2 /4 = more.
 - Build: no hardcoded drive paths (JUCE_DIR from the environment or ../JUCE).
@@ -243,7 +286,7 @@ Changes since v0.5.20 (4c4f830):
 - Fix (data loss): a take that could not be copied to the stable folder is no longer hidden and no longer deleted after 24 hours. Before, such a take was left out of the Takes grid with no message, and the temp session folder that held its only copy was removed by the start-up cleanup of any plugin instance started more than 24 hours later. Now the take is shown with a `NOT SAVED` badge (audition, star and Export WAV work; drag to the DAW is refused with the reason shown in the cell), a notice under the Takes grid gives the number of unsaved takes, the folder that could not be written and the temporary folder that holds them, with a Retry save button, and one log line is written per failed take.
 - The temp session folder of an unsaved take carries a marker file (`hslink_unsaved.txt`); the start-up cleanup skips marked folders whatever their age. On a later start the plugin copies the takes listed by such a marker into `takes/recovered_<session>/` on a background thread, removes the marker only when every copy has the right size, and says in the notice how many takes were recovered and where. The temp originals are not deleted by the rescue.
 - Fix (UI stall): the retry of a failed take copy no longer runs in the editor's refresh (about 6 times a second on the message thread). It runs on a background thread every 10 s, backing off to 60 s, and once more at close. `getTakes()` no longer touches the disk.
-- Environment hook for tests: `HSLINK_STABLE_ROOT` (read once at start) points the stable take folder elsewhere; the test binary sets it so no test writes to the real Documents folder.
+- Environment hook for tests: `HSLINK_TAKES_ROOT` (renamed in 0.5.24; read once at start) points the stable take folder elsewhere; the test binary sets it so no test writes to the real Documents folder.
 - Tests: `HSLINK_Tests takes` now also covers unsaved takes (teeth: `HSLINK_TEETH=NO_UNSAVED_GUARD` env var).
 - (Superseded: removed Collection items now go to the Deleted folder, not the Recycle Bin; see the entry at the top.) Collection panel: the COMING SOON placeholder in the Setup plate is now the Collection. Header with the item count (`3 / 8` while a filter is on), a search box over names, captions and tags, chips ALL / SA3 / YuE2 / ACE and a starred toggle, and a scrolling list. A row shows the name, a backend badge, one line such as `104 BPM - Am - 0:30` (an unknown part is left out), a star and an `x`. The star is saved in the item's info file. `x` asks first, then moves the WAV and its info file to the Recycle Bin. Dragging a row drops the WAV into the DAW; clicking a row auditions it like a take (click again to stop). A WAV with no readable info file is listed with a `no info file` marker and still works. The folder is scanned on a background thread when the window opens.
 - Takes: a `+` button on each take cell keeps that take in the Collection. The Collection footer shows `Added to Collection: <name>` (or the error) for a few seconds.

@@ -9,6 +9,7 @@
 // keeps its own rate, and a capture started after it uses the new rate.
 // Writes its WAVs under <cwd>/srate_scratch and removes that folder at the end.
 #include "PluginProcessor.h"
+#include "TestSettingsRedirect.h"
 
 #include <cmath>
 #include <cstdio>
@@ -188,6 +189,7 @@ juce::File captureFor (HotStepLinkProcessor& p, const juce::File& out, int sampl
 
 int main()
 {
+    HslinkTestSettingsRedirect settingsRedirect ("sratechange"); // never the real user settings; first, before any processor
     juce::ScopedJuceInitialiser_GUI init;
     const auto dir = juce::File::getCurrentWorkingDirectory().getChildFile ("srate_scratch");
     dir.deleteRecursively();

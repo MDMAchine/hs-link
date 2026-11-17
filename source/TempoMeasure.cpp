@@ -51,26 +51,63 @@ namespace
             e.assign (frames, 0.0f);
         double l1 = 0.0, l2 = 0.0, m1 = 0.0;
         double e0[3] = { 0.0, 0.0, 0.0 }, e1[3] = { 0.0, 0.0, 0.0 };
+        auto clean = [] (float v) { const double s = (double) v; return std::abs (s) < 1.0e6 ? s : 0.0; }; // NaN, inf or garbage
+        auto step = [&] (double s)
+        {
+            l1 += aLow * (s - l1);
+            l2 += aLow * (l1 - l2);
+            m1 += aMid * (s - m1);
+            const double b[3] = { l2, m1 - l2, s - m1 };
+            for (int k = 0; k < 3; ++k)
+            {
+                e0[k] += aEnv * (b[k] * b[k] + 1.0e-30 - e0[k]);
+                e1[k] += aEnv * (e0[k] - e1[k]);
+            }
+        };
+        // A take that starts mid-note must not rise from zero at frame 0. When the first
+        // 20 ms are not louder than 60-80 ms in (no decaying hit at the start), pre-warm
+        // the filters and the smoother on the opening played backwards, so they end at
+        // sample 0 in the state a continuing signal would have. A hit at sample 0 makes
+        // the first 20 ms louder, keeps the cold start and still rises at frame 0.
+        bool warm = false;
+        {
+            const auto w = (std::size_t) std::lround (0.020 * sr);
+            if (w > 0 && n >= 4 * w)
+            {
+                // Power of the first 20 ms vs 60-80 ms: a held note keeps its level, a hit
+                // at sample 0 decays by then (20-40 ms was too close to tell a kick apart).
+                double eA = 0.0, eB = 0.0;
+                for (std::size_t i = 0; i < w; ++i)
+                {
+                    const double a = clean (x[i]), b = clean (x[3 * w + i]);
+                    eA += a * a;
+                    eB += b * b;
+                }
+                // A hit with a short attack (a short chord at sample 0) can hold its level for
+                // 80 ms. Its power then grows faster than a held note crossing zero: RMS of
+                // 0-0.5 ms vs 0.5-1 ms is about 0.38 for a steady note at phase 0, 1 mid-note,
+                // under 0.2 for a ramp. Under 0.27 counts as a hit.
+                const auto hm = (std::size_t) std::max (2L, std::lround (0.0005 * sr));
+                double r0 = 0.0, r1 = 0.0;
+                for (std::size_t i = 0; i < hm; ++i)
+                {
+                    r0 += clean (x[i]) * clean (x[i]);
+                    r1 += clean (x[hm + i]) * clean (x[hm + i]);
+                }
+                const bool attack = r0 < 0.27 * 0.27 * r1;
+                warm = eA < 2.0 * eB && ! attack;
+                if (warm)
+                    for (std::size_t i = w; i-- > 0;)
+                        step (clean (x[i]));
+            }
+        }
         for (std::size_t f = 0; f < frames; ++f)
         {
             if ((f & 2047) == 0 && aborted (shouldAbort))
                 return false;
             const float* p = x + f * (std::size_t) hop;
             for (int i = 0; i < hop; ++i)
-            {
-                double s = (double) p[i];
-                if (! (std::abs (s) < 1.0e6))
-                    s = 0.0; // NaN, inf or garbage
-                l1 += aLow * (s - l1);
-                l2 += aLow * (l1 - l2);
-                m1 += aMid * (s - m1);
-                const double b[3] = { l2, m1 - l2, s - m1 };
-                for (int k = 0; k < 3; ++k)
-                {
-                    e0[k] += aEnv * (b[k] * b[k] + 1.0e-30 - e0[k]);
-                    e1[k] += aEnv * (e0[k] - e1[k]);
-                }
-            }
+                step (clean (p[i]));
             for (int k = 0; k < 3; ++k)
                 env[k][f] = (float) e1[k];
         }
@@ -95,9 +132,12 @@ namespace
             const double floorE = 0.02 * mean[k];
             for (std::size_t f = 0; f < frames; ++f)
                 lg[f] = (float) std::log ((double) env[k][f] + floorE);
-            for (std::size_t f = span; f < frames; ++f)
+            // Frames before 0 count as the silence floor, so a hit at frame 0 still rises;
+            // after a pre-warm (steady opening) they count as frame 0, so nothing rises.
+            const float silent = warm ? lg[0] : (float) std::log (floorE);
+            for (std::size_t f = 0; f < frames; ++f)
             {
-                const float d = lg[f] - lg[f - span];
+                const float d = lg[f] - (f >= span ? lg[f - span] : silent);
                 if (d > 0.0f)
                 {
                     c.all[f] += d;
@@ -125,7 +165,7 @@ namespace
         const std::ptrdiff_t n = (std::ptrdiff_t) o.size();
         const std::ptrdiff_t reach = 12;
         const float minRise = 0.3f;
-        for (std::ptrdiff_t f = 1; f + 1 < n; ++f)
+        for (std::ptrdiff_t f = 0; f + 1 < n; ++f)
         {
             const float v = o[(std::size_t) f];
             if (v < minRise)
@@ -137,7 +177,7 @@ namespace
                 top = o[(std::size_t) k] <= v;
             if (! top)
                 continue;
-            const double a = o[(std::size_t) (f - 1)], b = v, d = o[(std::size_t) (f + 1)];
+            const double a = f > 0 ? (double) o[(std::size_t) (f - 1)] : 0.0, b = v, d = o[(std::size_t) (f + 1)];
             const double den = a - 2.0 * b + d;
             double delta = den < 0.0 ? 0.5 * (a - d) / den : 0.0;
             delta = std::max (-0.5, std::min (0.5, delta));
@@ -564,7 +604,7 @@ TempoMeasure::Result TempoMeasure::analyse (const float* mono, std::size_t numSa
     // Downbeat guess: of the 4 beat positions, the one with the most low-band onset
     // energy (all bands when the low band is empty). A later position must lead by
     // 5 percent, so even beats give the first beat.
-    double downbeat = first;
+    double downbeat = first, downbeatSnapped = first;
     {
         double acc[2][4] = { { 0.0, 0.0, 0.0, 0.0 }, { 0.0, 0.0, 0.0, 0.0 } };
         const std::ptrdiff_t frames = (std::ptrdiff_t) curves.all.size();
@@ -587,6 +627,33 @@ TempoMeasure::Result TempoMeasure::analyse (const float* mono, std::size_t numSa
             if (use[i] > use[bestClass] * 1.05)
                 bestClass = i;
         downbeat = first + period * (double) bestClass;
+        // The fixed-tempo lattice can sit off the played bar start on a drifting take;
+        // move the downbeat onto the strongest onset within 15 percent of a beat.
+        // Strength is the low-band curve at the onset frame (+-2 frames) when the low
+        // band is present, so a hat right before the kick does not win; all-band weight
+        // otherwise.
+        const bool useLow = lowSum > 1.0e-6;
+        double bestW = 0.0, snapped = downbeat;
+        for (const auto& o : onsets)
+        {
+            if (std::abs (o.t - downbeat) > 0.15 * period)
+                continue;
+            double w = o.w;
+            if (useLow)
+            {
+                const auto c = (std::ptrdiff_t) std::llround ((o.t + kLatencySec) * curves.frameRate);
+                float lm = 0.0f;
+                for (std::ptrdiff_t f = std::max<std::ptrdiff_t> (0, c - 2); f <= std::min (frames - 1, c + 2); ++f)
+                    lm = std::max (lm, curves.low[(std::size_t) f]);
+                w = (double) lm;
+            }
+            if (w > bestW)
+            {
+                bestW = w;
+                snapped = o.t;
+            }
+        }
+        downbeatSnapped = std::max (0.0, snapped);
     }
 
     Result r;
@@ -612,6 +679,7 @@ TempoMeasure::Result TempoMeasure::analyse (const float* mono, std::size_t numSa
     r.valid = r.level >= Level::medium;
     r.bpm = bpm;
     r.downbeatSec = downbeat;
+    r.downbeatSnappedSec = downbeatSnapped;
     r.driftMs = driftMax;
     r.driftEndMs = driftEnd;
     r.firstBeatSec = first;

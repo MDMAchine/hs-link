@@ -12,7 +12,9 @@
 // leave no partial file.
 // Writes only under <cwd>/editexport_scratch and removes it at the end.
 #include "PluginProcessor.h"
+#include "TestSettingsRedirect.h"
 #include "PluginEditor.h"
+#include "ChordExport.h"
 #include "CollectionStore.h"
 #include "TakeEdit.h"
 #include "TakeStretch.h"
@@ -157,16 +159,97 @@ juce::AudioBuffer<float> beatAudio (double bpm, double seconds, double sr, int c
     return b;
 }
 
+// U2 D7: an unpitched drums-only take: a decaying noise burst on every beat and a
+// short noise hat on every off-beat, no tonal bed, so no chord or melody can be found.
+juce::AudioBuffer<float> drumsOnlyAudio (double bpm, double seconds, double sr, int channels)
+{
+    const int n = (int) std::llround (seconds * sr);
+    juce::AudioBuffer<float> b (channels, n);
+    const double beat = 60.0 / bpm * sr;
+    uint32_t rng = 0x9e3779b9u;
+    for (int i = 0; i < n; ++i)
+    {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        const double noise = (double) rng / 2147483648.0 - 1.0;
+        const double ph = std::fmod ((double) i, beat);
+        const double t = ph / sr;
+        double v = 0.8 * std::exp (-t * 25.0) * noise;
+        const double hp = std::fmod ((double) i + 0.5 * beat, beat) / sr;
+        v += 0.25 * std::exp (-hp * 120.0) * noise;
+        for (int c = 0; c < channels; ++c)
+            b.setSample (c, i, (float) (v * (c == 0 ? 1.0 : 0.9)));
+    }
+    return b;
+}
+
+// U2: a tonal 120 BPM take: a loud monophonic melody (one note per beat, 3 harmonics),
+// a quieter triad pad per bar (C F G Am) and a short click on every beat.
+juce::AudioBuffer<float> tonalAudio (double seconds, double sr, int channels)
+{
+    const int n = (int) std::llround (seconds * sr);
+    juce::AudioBuffer<float> b (channels, n);
+    const double beat = 0.5 * sr, bar = 2.0 * sr, tau = 6.283185307179586;
+    const int mel[] = { 72, 76, 79, 76, 77, 81, 84, 81, 79, 83, 86, 83, 76, 81, 84, 81 };
+    const int pad[4][3] = { { 48, 52, 55 }, { 53, 57, 60 }, { 55, 59, 62 }, { 57, 60, 64 } };
+    auto hz = [] (int m) { return 440.0 * std::pow (2.0, (m - 69) / 12.0); };
+    for (int i = 0; i < n; ++i)
+    {
+        const double t = (double) i / sr;
+        const int bi = (int) ((double) i / beat), ba = (int) ((double) i / bar);
+        const double ph = std::fmod ((double) i, beat) / sr;
+        const double f = hz (mel[bi % 16]);
+        double v = 0.30 * (std::sin (tau * f * t) + 0.4 * std::sin (tau * 2.0 * f * t) + 0.2 * std::sin (tau * 3.0 * f * t));
+        for (int k = 0; k < 3; ++k)
+            v += 0.06 * std::sin (tau * hz (pad[ba % 4][k]) * t);
+        v += 0.5 * std::exp (-ph * 30.0) * std::sin (tau * 60.0 * ph);
+        if (ph < 0.004)
+            v += 0.3 * std::sin (tau * 2500.0 * ph) * (1.0 - ph / 0.004);
+        for (int c = 0; c < channels; ++c)
+            b.setSample (c, i, (float) (0.6 * v));
+    }
+    return b;
+}
+
 int partsIn (const juce::File& d) { return d.findChildFiles (juce::File::findFiles, false, "*.editing").size(); }
 } // namespace
 
 int main()
 {
+    HslinkTestSettingsRedirect settingsRedirect ("editorexport"); // never the real user settings; first, before any processor
     juce::ScopedJuceInitialiser_GUI juceInit;
     const auto root = juce::File::getCurrentWorkingDirectory().getChildFile ("editexport_scratch");
     root.deleteRecursively();
     root.createDirectory();
     const double sr = 48000.0;
+
+    // T: tonality gate for chord export (unpitched takes get no chords).
+    {
+        auto noiseAudio = [] (double seconds, double rate)
+        {
+            const int n = (int) std::llround (seconds * rate);
+            juce::AudioBuffer<float> b (2, n);
+            uint32_t rng = 0x1234567u;
+            for (int i = 0; i < n; ++i)
+            {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                const float v = (float) (0.5 * ((double) rng / 2147483648.0 - 1.0));
+                b.setSample (0, i, v); b.setSample (1, i, v);
+            }
+            return b;
+        };
+        auto ton = [&] (const juce::AudioBuffer<float>& b) { return ChordExport::analyseChords (b, sr, 120.0, 0.0, 4); };
+        const auto rd = ton (drumsOnlyAudio (120.0, 16.0, sr, 2));
+        const auto rn = ton (noiseAudio (16.0, sr));
+        const auto rb = ton (beatAudio (120.0, 16.0, sr, 2));
+        const auto rt = ton (tonalAudio (16.0, sr, 2));
+        const double th = ChordExport::kMinTonality;
+        std::printf ("  T tonality: drums=%.3f noise=%.3f beatAudio=%.3f tonalAudio=%.3f threshold=%.3f\n",
+                     rd.tonality, rn.tonality, rb.tonality, rt.tonality, th);
+        check (rd.chords.empty() && rn.chords.empty(), "T: drums-only and noise give no chords");
+        check (! rb.chords.empty() && ! rt.chords.empty(), "T: beatAudio and tonalAudio still give chords");
+        check (rd.tonality < 0.8 * th && rn.tonality < 0.8 * th, "T: drums and noise tonality at least 20% under the threshold");
+        check (rb.tonality > 1.25 * th && rt.tonality > 1.25 * th, "T: tonal fixtures at least 25% over the threshold");
+    }
 
     // A: Export loop through the processor, the way the editor's onApply does it.
     {
@@ -348,6 +431,202 @@ int main()
         std::printf ("  C abort: ok=%d err='%s' part seen while writing=%d dest exists=%d parts after=%d\n", (int) r4.ok, r4.error.toRawUTF8(), partSeen,
                      (int) rq.dest.exists(), partsIn (d));
         check (! r4.ok && partSeen > 0 && ! rq.dest.exists() && partsIn (d) == 0, "C: an export aborted mid write leaves no file and no partial");
+    }
+
+    // D (U2): the MIDI export picker through the editor. A tonal take and a drums-only
+    // take; each toggle writes or omits its file, One file gives a single multitrack file,
+    // the melody file is _melody (never _notes), empty parts give a reason, and the
+    // Saved-to text names every file written. HSLINK_U2_MUTANT=1 forces Chords off (teeth).
+    {
+        auto p = std::make_unique<HotStepLinkProcessor>();
+        p->setStableRoot (root.getChildFile ("ustable"));
+        p->setCollectionRoot (root.getChildFile ("ucoll"));
+        const juce::File wavs[] = { root.getChildFile ("udl").getChildFile ("tonal.wav"), root.getChildFile ("udl").getChildFile ("drums.wav") };
+        writeWav (wavs[0], tonalAudio (16.0, sr, 2), sr, 24);
+        writeWav (wavs[1], drumsOnlyAudio (120.0, 16.0, sr, 2), sr, 24);
+        for (int k = 0; k < 2; ++k)
+        {
+            DawJob j;
+            j.localId = 10 + k;
+            j.request.caption = k == 0 ? "picker tonal" : "picker drums";
+            j.request.expectedBackend = "sa3";
+            j.request.bpm = 120.0;
+            j.request.seed = 500 + k;
+            j.request.durationS = 16.0;
+            j.takeFiles.add (wavs[k]);
+            j.takeSeeds.add (500 + k);
+            p->registerTakeAndWait (j, 0);
+        }
+        p->waitTakeMeasureIdle (120000);
+        p->hostSync.bpm.store (120.0);
+        p->hostSync.timeSigNum.store (4);
+        p->hostSync.bpmKnown.store (true);
+        p->hostSync.hostSyncActive.store (true); // a real host session, as the bpm and meter above describe
+        const auto takes = p->getTakes();
+        auto ed = std::make_unique<HotStepLinkEditor> (*p);
+        ed->midiSyncForTest = true;
+        ed->runRefreshForTest();
+        auto& pk = ed->midiPickerForTest();
+        // Takes list in registration order: 0 = tonal, 1 = drums.
+        auto takeKey = [&] (int k)
+        {
+            for (const auto& t : takes)
+                if (t.name.startsWith (k == 0 ? "tonal" : "drums"))
+                    return t.name;
+            return juce::String();
+        };
+        int selectedTake = -1; // selectTake on the selected take toggles it off: select on change only
+        int mutant = 0;
+        if (const char* m = std::getenv ("HSLINK_U2_MUTANT"))
+            mutant = std::atoi (m);
+        juce::StringArray names;
+        juce::String saved, note;
+        // One export; fills names / saved / note and returns the full paths written.
+        auto run = [&] (int take, bool drums, bool melody, bool chords, bool tempo, bool oneFile) -> juce::StringArray
+        {
+            if (take != selectedTake)
+                ed->selectTakeForTest (takeKey (take));
+            selectedTake = take;
+            ed->runRefreshForTest();
+            ed->setMidiPickerOpenForTest (true);
+            pk.drumsButton.setToggleState (drums, juce::dontSendNotification);
+            pk.melodyButton.setToggleState (melody, juce::dontSendNotification);
+            pk.chordsButton.setToggleState (chords && mutant != 1, juce::dontSendNotification);
+            pk.perBeatButton.setToggleState (false, juce::dontSendNotification);
+            pk.tempoButton.setToggleState (tempo, juce::dontSendNotification);
+            pk.oneFileButton.setToggleState (oneFile, juce::dontSendNotification);
+            ed->exportMidiForTest();
+            const auto files = ed->lastMidiFilesForTest();
+            saved = ed->exportPathTextForTest();
+            note = ed->collectionNoteForTest();
+            names.clear();
+            for (const auto& f : files)
+                names.add (juce::File (f).getFileName());
+            return files;
+        };
+        auto has = [&] (const char* suffix)
+        {
+            for (const auto& n : names)
+                if (n.endsWith (suffix))
+                    return true;
+            return false;
+        };
+        auto cleanup = [] (const juce::StringArray& files)
+        {
+            for (const auto& f : files)
+                juce::File (f).deleteFile();
+        };
+        auto savedListsAll = [&]
+        {
+            if (names.isEmpty() || ! saved.startsWith ("Saved to: "))
+                return false;
+            for (const auto& n : names)
+                if (! saved.contains (mutant == 2 ? n.replace (".mid", ".midx") : n))
+                    return false;
+            return true;
+        };
+        std::printf ("  D takes=%d tonal='%s' drums='%s'\n", (int) takes.size(), takeKey (0).toRawUTF8(), takeKey (1).toRawUTF8());
+
+        // D1: every part on, separate files.
+        HotStepLinkEditor::testSkipExportResult = (mutant == 3);
+        auto files = run (0, true, true, true, true, false);
+        {
+            // KNOWN_ISSUES Export MIDI path feedback: status row text, Show button, real bounds.
+            const auto folder = files.isEmpty() ? juce::String() : juce::File (files[0]).getParentDirectory().getFullPathName();
+            const auto lb = ed->exportPathBoundsForTest(), sb = ed->showExportBoundsForTest();
+            const auto wb = ed->exportWavBoundsForTest(), mb = ed->exportMidiBoundsForTest();
+            const auto edB = ed->getLocalBounds();
+            const juce::Rectangle<int> row (lb.getX(), lb.getY(), sb.getRight() - lb.getX(), lb.getHeight());
+            std::printf ("  D1 status: text='%s' folder='%s'\n", saved.toRawUTF8(), folder.toRawUTF8());
+            std::printf ("  D1 status: label=%d,%d %dx%d show=%d,%d %dx%d vis=%d wav=%d,%d %dx%d midi=%d,%d %dx%d ed=%dx%d\n",
+                         lb.getX(), lb.getY(), lb.getWidth(), lb.getHeight(), sb.getX(), sb.getY(), sb.getWidth(), sb.getHeight(),
+                         (int) ed->showExportVisibleForTest(), wb.getX(), wb.getY(), wb.getWidth(), wb.getHeight(),
+                         mb.getX(), mb.getY(), mb.getWidth(), mb.getHeight(), edB.getWidth(), edB.getHeight());
+            check (folder.isNotEmpty() && saved.startsWith ("Saved to: ") && saved.contains (folder),
+                   "D1: status starts with 'Saved to:' and names the output folder");
+            check (ed->showExportVisibleForTest() && sb.getWidth() >= 40 && sb.getHeight() >= 16 && edB.contains (sb),
+                   "D1: Show button visible, sized and inside the editor");
+            check (lb.getWidth() >= 100 && sb.getY() == lb.getY() && sb.getHeight() == lb.getHeight() && lb.getRight() <= sb.getX()
+                       && row.contains (sb) && ! lb.intersects (sb) && ! sb.intersects (wb) && ! sb.intersects (mb)
+                       && ! lb.intersects (wb) && ! lb.intersects (mb),
+                   "D1: Show button sits in the status row, no overlap with label or export buttons");
+        }
+        HotStepLinkEditor::testSkipExportResult = false;
+        bool allExist = files.size() > 0;
+        for (const auto& f : files)
+            allExist = allExist && juce::File (f).existsAsFile();
+        std::printf ("  D1 all on: files=[%s] exist=%d note='%s'\n", names.joinIntoString (", ").toRawUTF8(), (int) allExist, note.toRawUTF8());
+        std::printf ("  D1 saved: '%s'\n", saved.toRawUTF8());
+        check (allExist && names.size() == 4 && has ("_hits.mid") && has ("_melody.mid") && has ("_chords.mid") && has ("_tempo.mid"),
+               "D1: all parts on gives _hits, _melody, _chords and _tempo, all on disk");
+        check (has ("_melody.mid") && ! names.joinIntoString (",").contains ("_notes"), "D1: the melody file is _melody (no _notes file)");
+        check (savedListsAll(), "D1: the Saved-to text names every file written");
+        cleanup (files);
+
+        // D2..D5: each part off on its own: its file is gone, the other three stay.
+        const char* sfx[] = { "_hits.mid", "_melody.mid", "_chords.mid", "_tempo.mid" };
+        for (int off = 0; off < 4; ++off)
+        {
+            files = run (0, off != 0, off != 1, off != 2, off != 3, false);
+            bool othersOn = true;
+            for (int k = 0; k < 4; ++k)
+                if (k != off)
+                    othersOn = othersOn && has (sfx[k]);
+            const bool gone = ! has (sfx[off]);
+            std::printf ("  D%d %s off: files=[%s] (want the other 3) others=%d saved lists all=%d\n", 2 + off, sfx[off],
+                         names.joinIntoString (", ").toRawUTF8(), (int) othersOn, (int) savedListsAll());
+            const juce::String what = "D" + juce::String (2 + off) + ": " + sfx[off] + " off omits only that file";
+            check (gone && othersOn && names.size() == 3, what.toRawUTF8());
+            const juce::String what2 = "D" + juce::String (2 + off) + ": the Saved-to text names all 3 files";
+            check (savedListsAll(), what2.toRawUTF8());
+            cleanup (files);
+        }
+
+        // D6: One file: a single _multitrack.mid, tempo track + one track per part.
+        files = run (0, true, true, true, true, true);
+        int tracks = 0, tempoEvents = 0, drumNotes = 0, partsWithNotes = 0, separate = 0;
+        if (files.size() == 1)
+        {
+            juce::MidiFile mf;
+            juce::FileInputStream fin { juce::File (files[0]) };
+            if (fin.openedOk() && mf.readFrom (fin))
+            {
+                tracks = mf.getNumTracks();
+                for (const auto* e : *mf.getTrack (0))
+                    tempoEvents += e->message.isTempoMetaEvent() ? 1 : 0;
+                for (int t = 1; t < tracks; ++t)
+                {
+                    int notesHere = 0;
+                    for (const auto* e : *mf.getTrack (t))
+                        if (e->message.isNoteOn())
+                        {
+                            ++notesHere;
+                            drumNotes += (t == 1 && e->message.getChannel() == 10) ? 1 : 0;
+                        }
+                    partsWithNotes += notesHere > 0 ? 1 : 0;
+                }
+            }
+            const auto stem = juce::File (files[0]).getFileNameWithoutExtension().upToLastOccurrenceOf ("_multitrack", false, false);
+            for (const auto* sx : sfx)
+                separate += juce::File (files[0]).getSiblingFile (stem + sx).exists() ? 1 : 0;
+        }
+        std::printf ("  D6 one file: files=[%s] tracks=%d (want 4) tempo events in track 0=%d drum notes ch10 in track 1=%d parts with notes=%d (want 3) separate files=%d (want 0)\n",
+                     names.joinIntoString (", ").toRawUTF8(), tracks, tempoEvents, drumNotes, partsWithNotes, separate);
+        check (files.size() == 1 && names[0].endsWith ("_multitrack.mid") && separate == 0, "D6: One file writes a single _multitrack.mid and no separate files");
+        check (tracks == 4 && tempoEvents >= 1 && drumNotes > 0 && partsWithNotes == 3, "D6: the multitrack file has the tempo track plus one track per part (3)");
+        check (savedListsAll(), "D6: the Saved-to text names the multitrack file");
+        cleanup (files);
+
+        // D7: the drums-only take with melody and chords asked for: skipped, with reasons.
+        files = run (1, true, true, true, true, false);
+        std::printf ("  D7 drums take: files=[%s] note='%s'\n", names.joinIntoString (", ").toRawUTF8(), note.toRawUTF8());
+        check (has ("_hits.mid") && ! has ("_melody.mid") && ! has ("_chords.mid"), "D7: a drums-only take writes _hits but no _melody or _chords");
+        check (note.contains ("skipped") && note.contains ("melody: the take is not tonal") && note.contains ("chords: no chord found"),
+               "D7: the note shows the skip reason for melody and for chords");
+        check (savedListsAll(), "D7: the Saved-to text names every file written");
+        cleanup (files);
+        ed->setMidiPickerOpenForTest (false);
+        ed.reset();
     }
 
     // R (gated, HSLINK_REALTAKE=1): a real take exported with quantize 1/16 at 100%;

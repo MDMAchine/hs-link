@@ -7,6 +7,7 @@
 // empty tempo field with Apply blocked.
 // Writes only under <cwd>/takeflow_scratch and removes it at the end.
 #include "PluginProcessor.h"
+#include "TestSettingsRedirect.h"
 #include "TakeEditorPanel.h"
 #include "PluginEditor.h"
 #include "TakeEdit.h"
@@ -99,6 +100,7 @@ bool openAndWait (TakeEditorPanel& p, const juce::File& f, double bpm)
 
 int main()
 {
+    HslinkTestSettingsRedirect settingsRedirect ("takeeditorflow"); // never the real user settings; first, before any processor
     juce::ScopedJuceInitialiser_GUI juceInit;
     {
         // Ruler clip: a label near the right edge must not run under the playhead overlay.
@@ -178,6 +180,8 @@ int main()
         Fakes fk;
         fk.hostBpm = 90.0;
         fk.wire (panel);
+        // Since 133d6a4 Warp to host reads the real host tempo (onWarpHostBpm) only, never onHostBpm.
+        panel.onWarpHostBpm = [&fk] { return fk.hostBpm; };
         check (openAndWait (panel, wavFile, 120.0), "A2: peaks ready");
         panel.setWarpForTest (true);
         panel.clickWarpToHostForTest();
@@ -321,12 +325,14 @@ int main()
                                      juce::MouseInputSource::defaultTiltX, juce::MouseInputSource::defaultTiltY, &panel, &panel, t, down.toFloat(), t, clicks, dragged);
         };
         auto& comp = static_cast<juce::Component&> (panel);
-        // Plain drag: snaps to the beat grid (4eed68e), so +30 px falls back on marker 1's own beat.
+        // Plain drag: snaps (4eed68e) to the visible grid, down to 1/64 beat since 5607926, so a
+        // nudge under half the drawn step falls back on marker 1's own line.
+        const juce::Point<int> nudge (from.x + 2, from.y);
         comp.mouseDown (mev (from, from, false, 1));
-        comp.mouseDrag (mev (to, from, true, 1));
-        comp.mouseUp (mev (to, from, true, 1));
+        comp.mouseDrag (mev (nudge, from, true, 1));
+        comp.mouseUp (mev (nudge, from, true, 1));
         const int movedAfterSnapDrag = WarpMarkers::movedCount (panel.warpMarkersForTest());
-        std::printf ("  E: plain +30 px drag moved=%d (want 0, snapped back to its beat)\n", movedAfterSnapDrag);
+        std::printf ("  E: plain +2 px drag moved=%d (want 0, snapped back to its beat)\n", movedAfterSnapDrag);
         check (movedAfterSnapDrag == 0, "E: plain drag snaps to the beat grid");
         // Shift held: free placement under the pointer.
         comp.mouseDown (mev (from, from, false, 1, true));

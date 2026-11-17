@@ -21,6 +21,7 @@
 
 namespace ExclusiveFile
 {
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> testLegacyOverwrite { false };
 std::atomic<int> testLostRenames { 0 };
 std::function<void (const juce::File& picked)> testBeforePublish;
@@ -45,6 +46,7 @@ std::atomic<int> testCreateFaultsLeft { -1 };
 std::atomic<int> testCreateCalls { 0 };
 std::atomic<int> testFolderTries { 0 };
 std::atomic<bool> testLegacyFolderRetry { false };
+#endif
 
 namespace
 {
@@ -130,8 +132,10 @@ void IoCanceller::setInCall (bool nowInCall, bool isCleanup)
 
 bool IoCanceller::cancelInFlight()
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (! ioCancelEnabled.load())
         return false;
+#endif
     std::lock_guard<std::mutex> g (lock);
     if (thread == nullptr || ! inCall)
         return false;
@@ -139,9 +143,13 @@ bool IoCanceller::cancelInFlight()
     if (cleanup && juce::Time::getMillisecondCounter() - cleanupSince < (juce::uint32) cleanupGraceMs)
         return false;
    #if JUCE_WINDOWS
+#if defined (HSLINK_TEST_HOOKS)
     ++testIoCancelCalls;
     if (CancelSynchronousIo ((HANDLE) thread) != 0)
         ++testIoCancelHits; // otherwise ERROR_NOT_FOUND: no synchronous call was in flight
+#else
+    CancelSynchronousIo ((HANDLE) thread); // ERROR_NOT_FOUND = no synchronous call was in flight
+#endif
     return true;
    #else
     return false;
@@ -151,10 +159,12 @@ bool IoCanceller::cancelInFlight()
 int threadTag() { return threadTagSlot(); }
 ScopedThreadTag::ScopedThreadTag (int tag) : previous (threadTagSlot()) { threadTagSlot() = tag; }
 ScopedThreadTag::~ScopedThreadTag() { threadTagSlot() = previous; }
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<bool> sessionLockEnabled { true };
 std::atomic<bool> testSessionLockFails { false };
 std::atomic<bool> testNoLegacyGuard { false };
 std::atomic<int> testOwnerAcquires { 0 };
+#endif
 
 SessionLock& SessionLock::operator= (SessionLock&& o) noexcept
 {
@@ -173,26 +183,36 @@ SessionLock& SessionLock::operator= (SessionLock&& o) noexcept
 
 SessionLock::Result SessionLock::tryAcquire (const juce::File& folder)
 {
+#if defined (HSLINK_TEST_HOOKS)
     ++testOwnerAcquires;
+#endif
     release();
+#if defined (HSLINK_TEST_HOOKS)
     if (testSessionLockFails.load())
         return Result::Failed;
+#endif
     return acquire (folder, true);
 }
 
 SessionLock::Result SessionLock::tryAcquireExisting (const juce::File& folder)
 {
     release();
+#if defined (HSLINK_TEST_HOOKS)
     return acquire (folder, testNoLegacyGuard.load());
+#else
+    return acquire (folder, false);
+#endif
 }
 
 SessionLock::Result SessionLock::acquire (const juce::File& folder, bool create)
 {
+#if defined (HSLINK_TEST_HOOKS)
     if (! sessionLockEnabled.load())
     {
         held = true; // teeth: nothing is locked
         return Result::Held;
     }
+#endif
     const auto file = folder.getChildFile (fileName());
    #if JUCE_WINDOWS
     // No write and no delete sharing: a second open with these arguments, from any
@@ -245,7 +265,11 @@ namespace
 // apart from deleting its own .part file.
 bool abortedNow (const AbortFn& shouldAbort)
 {
-    return shouldAbort && ! testIgnoreAbort.load() && shouldAbort();
+#if defined (HSLINK_TEST_HOOKS)
+    if (testIgnoreAbort.load())
+        return false; // teeth: shouldAbort is never read
+#endif
+    return shouldAbort && shouldAbort();
 }
 
 // After a step that passed, the thread counts as "in a call" for IoCanceller until the
@@ -255,10 +279,16 @@ bool step (const char* name, const AbortFn& shouldAbort)
     ioCall (false);
     if (abortedNow (shouldAbort))
         return false;
+#if defined (HSLINK_TEST_HOOKS)
     ++testStepsByTag[juce::jlimit (0, (int) tagCount - 1, threadTag())];
+#endif
     ioCall (true);
+#if defined (HSLINK_TEST_HOOKS)
     if (auto* hook = testStepHook.load())
         hook (name);
+#else
+    juce::ignoreUnused (name);
+#endif
     return true;
 }
 
@@ -267,6 +297,7 @@ enum class MadeDir { failed, parentMissing, created, wasThere };
 // One native call, one level, no probing (juce createDirectory probes every level).
 MadeDir makeOneDir (const juce::File& dir)
 {
+#if defined (HSLINK_TEST_HOOKS)
     ++testCreateCalls;
     if (const int fault = testCreateFault.load())
     {
@@ -278,6 +309,7 @@ MadeDir makeOneDir (const juce::File& dir)
             return fault == 2 ? MadeDir::parentMissing : MadeDir::failed;
         }
     }
+#endif
    #if JUCE_WINDOWS
     if (CreateDirectoryW (dir.getFullPathName().toWideCharPointer(), nullptr) != 0)
         return MadeDir::created;
@@ -300,12 +332,22 @@ enum class CopyOutcome { done, failed, existed, cancelled, interrupted };
 // One poll of the running byte copy. true = cancel it.
 bool copyPoll (const AbortFn& shouldAbort, juce::int64 done, juce::int64 total)
 {
+#if defined (HSLINK_TEST_HOOKS)
     ++testCopyProgressCalls;
+#endif
     bool cancel = false;
+#if defined (HSLINK_TEST_HOOKS)
     if (auto* hook = testCopyProgressHook.load())
         cancel = hook (done, total) != 0;
+#else
+    juce::ignoreUnused (done, total);
+#endif
     cancel = cancel || abortedNow (shouldAbort);
+#if defined (HSLINK_TEST_HOOKS)
     return cancel && copyCancelEnabled.load();
+#else
+    return cancel;
+#endif
 }
 
 #if JUCE_WINDOWS
@@ -325,7 +367,9 @@ DWORD CALLBACK copyProgress (LARGE_INTEGER total, LARGE_INTEGER done, LARGE_INTE
 // Elsewhere: an exclusive create and a loop of 256 KB chunks.
 CopyOutcome copyToNew (const juce::File& src, const juce::File& dest, const AbortFn& shouldAbort)
 {
+#if defined (HSLINK_TEST_HOOKS)
     ++testCopiesStarted;
+#endif
    #if JUCE_WINDOWS
     if (CopyFileExW (src.getFullPathName().toWideCharPointer(), dest.getFullPathName().toWideCharPointer(),
                      copyProgress, (LPVOID) &shouldAbort, nullptr, COPY_FILE_FAIL_IF_EXISTS) != 0)
@@ -333,12 +377,16 @@ CopyOutcome copyToNew (const juce::File& src, const juce::File& dest, const Abor
     const auto err = GetLastError();
     if (err == ERROR_REQUEST_ABORTED)
     {
+#if defined (HSLINK_TEST_HOOKS)
         ++testCopiesCancelled;
+#endif
         return CopyOutcome::cancelled;
     }
     if (err == ERROR_OPERATION_ABORTED)
     {
+#if defined (HSLINK_TEST_HOOKS)
         ++testCopiesCancelled;
+#endif
         return CopyOutcome::interrupted;
     }
     return err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS ? CopyOutcome::existed : CopyOutcome::failed;
@@ -394,7 +442,9 @@ CopyOutcome copyToNew (const juce::File& src, const juce::File& dest, const Abor
         outcome = CopyOutcome::failed;
     if (outcome == CopyOutcome::cancelled)
     {
+#if defined (HSLINK_TEST_HOOKS)
         ++testCopiesCancelled;
+#endif
         ::unlink (dest.getFullPathName().toRawUTF8()); // created by this call
     }
     return outcome;
@@ -407,6 +457,7 @@ void removePart (const juce::File& part)
     ioCall (true, true);
    #if JUCE_WINDOWS
     const auto path = part.getFullPathName();
+#if defined (HSLINK_TEST_HOOKS)
     if (testLegacyPartCleanup.load())
     {
         // Teeth: what juce::File::deleteFile does (exists, isDirectory, delete).
@@ -427,7 +478,11 @@ void removePart (const juce::File& part)
         ++testCleanupCalls;
         DeleteFileW (path.toWideCharPointer());
     }
+#else
+    DeleteFileW (path.toWideCharPointer());
+#endif
    #else
+#if defined (HSLINK_TEST_HOOKS)
     if (testLegacyPartCleanup.load())
     {
         testCleanupCalls += 3;
@@ -438,6 +493,9 @@ void removePart (const juce::File& part)
         ++testCleanupCalls;
         ::unlink (part.getFullPathName().toRawUTF8());
     }
+#else
+    ::unlink (part.getFullPathName().toRawUTF8());
+#endif
    #endif
     ioCall (false);
 }
@@ -522,7 +580,9 @@ bool ensureFolder (const juce::File& folder, const AbortFn& shouldAbort, bool* a
     // again. Every step of every try reads shouldAbort first.
     for (int attempt = 0; attempt < 8; ++attempt)
     {
+#if defined (HSLINK_TEST_HOOKS)
         ++testFolderTries;
+#endif
         if (! step ("folder probe", shouldAbort))
             return stop();
         if (folder.isDirectory())
@@ -552,8 +612,13 @@ bool ensureFolder (const juce::File& folder, const AbortFn& shouldAbort, bool* a
                 if (! missing.getReference (i).isDirectory())
                     return false; // a file has the name: no try can succeed
             }
+#if defined (HSLINK_TEST_HOOKS)
             if (r == MadeDir::failed && ! testLegacyFolderRetry.load())
                 return false;
+#else
+            if (r == MadeDir::failed)
+                return false;
+#endif
             made = r != MadeDir::failed && r != MadeDir::parentMissing;
         }
         if (made)
@@ -625,6 +690,7 @@ juce::File copyUnique (const juce::File& src, const juce::File& folder, const ju
         return finish (folderAborted ? CopyResult::Aborted : CopyResult::Failed);
     const int kMaxIndex = 10000;
 
+#if defined (HSLINK_TEST_HOOKS)
     if (testLegacyOverwrite.load())
     {
         int i = 1;
@@ -639,13 +705,18 @@ juce::File copyUnique (const juce::File& src, const juce::File& folder, const ju
             *result = CopyResult::Copied;
         return dest;
     }
+#endif
 
     if (! step ("source size", shouldAbort))
         return finish (CopyResult::Aborted);
     const auto size = src.getSize();
     // Not in the folder before this call: the token differs per call and per process.
+#if defined (HSLINK_TEST_HOOKS)
     const auto* fixedToken = testPartToken.load();
     const auto part = folder.getChildFile (name + "." + (fixedToken != nullptr ? juce::String (fixedToken) : uniqueToken (12)) + ".part");
+#else
+    const auto part = folder.getChildFile (name + "." + uniqueToken (12) + ".part");
+#endif
     if (! step ("part probe", shouldAbort))
         return finish (CopyResult::Aborted);
     if (part.exists())
@@ -662,8 +733,12 @@ juce::File copyUnique (const juce::File& src, const juce::File& folder, const ju
         case CopyOutcome::existed:
             // A file of that name appeared after the probe (or the token collided): it
             // is not ours and stays.
+#if defined (HSLINK_TEST_HOOKS)
             ++testPartExistsFailures;
-            return testLegacyPartDelete.load() ? drop (CopyResult::Failed) : finish (CopyResult::Failed);
+            if (testLegacyPartDelete.load())
+                return drop (CopyResult::Failed); // teeth: deleted like any other failure
+#endif
+            return finish (CopyResult::Failed);
     }
     // From here on the .part file exists and is ours: every way out removes it.
     if (! step ("size check", shouldAbort))
@@ -671,7 +746,9 @@ juce::File copyUnique (const juce::File& src, const juce::File& folder, const ju
     if (part.getSize() != size)
         return drop (CopyResult::Failed);
     int lost = 0;
+#if defined (HSLINK_TEST_HOOKS)
     bool hooked = false;
+#endif
     for (int i = 1; i < kMaxIndex && lost < 50; ++i)
     {
         const auto dest = candidate (folder, name, i);
@@ -679,9 +756,11 @@ juce::File copyUnique (const juce::File& src, const juce::File& folder, const ju
             return drop (CopyResult::Aborted);
         if (dest.exists())
             continue;
+#if defined (HSLINK_TEST_HOOKS)
         if (testBeforePublish && ! hooked)
             testBeforePublish (dest); // first pick only
         hooked = true;
+#endif
         if (! step ("rename", shouldAbort))
             return drop (CopyResult::Aborted);
         if (moveNoReplace (part, dest))
@@ -695,7 +774,9 @@ juce::File copyUnique (const juce::File& src, const juce::File& folder, const ju
         if (! dest.exists())
             break; // refused for another reason than a taken name
         ++lost;
+#if defined (HSLINK_TEST_HOOKS)
         ++testLostRenames;
+#endif
     }
     return drop (CopyResult::Failed);
 }

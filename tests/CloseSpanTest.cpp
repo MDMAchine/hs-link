@@ -16,6 +16,7 @@
 // Needs node and the contract stub (HSLINK_STUB, default HSLINK_STUB_DEFAULT_PATH from CMake).
 // Scratch under <cwd>/close_span_scratch, removed at the end.
 #include "PluginProcessor.h"
+#include "TestSettingsRedirect.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -149,6 +150,7 @@ juce::AudioBuffer<float> noise (int ch, int n, juce::uint32 seed)
 
 int main()
 {
+    HslinkTestSettingsRedirect settingsRedirect ("closespan"); // never the real user settings; first, before any processor
     juce::ScopedJuceInitialiser_GUI init;
     stallMs = juce::SystemStats::getEnvironmentVariable ("HSLINK_CLOSE_STALL_MS", "0").getIntValue();
     auto scratch = juce::File::getCurrentWorkingDirectory().getChildFile ("close_span_scratch");

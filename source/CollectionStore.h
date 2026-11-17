@@ -53,6 +53,14 @@ namespace TempoResolve
     // medium or high, and a grid TakeEdit accepts. The test the take cell and
     // requestTakeEdit already used.
     bool measuredCertain (const TempoMeasure::Result& measured);
+    // Card 96f2fb35 pick B: the downbeat offset (seconds into the file) that a grid,
+    // export or FIT may honour. confidence is (double) TempoMeasure::Level; the offset is
+    // 0 (file start, today's behaviour) when confidence < threshold, the offset is not
+    // finite, under kNegligibleDownbeatSec or beyond TakeEdit::kMaxGridDownbeatSec.
+    // Threshold kDownbeatConfidence = medium, the same gate as measuredCertain.
+    constexpr double kNegligibleDownbeatSec = 0.001;
+    constexpr double kDownbeatConfidence = (double) TempoMeasure::Level::medium;
+    double downbeatOffsetToApply (double measuredOffsetSec, double confidence, double threshold);
     // How an estimate relates to a known tempo: 1, 2, 0.5, 1.5 or 2/3 when it is within
     // kRelationTol of that multiple of known, else 0 (unrelated or not positive).
     constexpr double kRelationTol = 0.03;
@@ -108,6 +116,7 @@ struct HslinkTakeEntry
     // --shot-load option, addShotTake). Delete only takes it out of the list: the file
     // is never moved, renamed or deleted.
     bool external = false;
+    juce::File importedFrom;     // original user path of a guarded import, used only for the duplicate check (not saved)
     juce::File destFolder;
     juce::String logKey;         // adopted: the saved.log key (a .wav.part is logged under its .wav name)
     // Generate settings known when the download completed.
@@ -160,7 +169,7 @@ struct CollectionItem
     juce::int64 seed = -1;
     juce::int64 createdMs = 0, addedMs = 0;
     bool starred = false;
-    juce::StringArray tags;      // always written, empty for now
+    juce::StringArray tags;      // always written; filled at add() by buildTags()
     // Measured tempo of the take, copied from it at add(). tempoMeasured false = not
     // measured (every sidecar written before the measurement existed reads like that).
     bool tempoMeasured = false;
@@ -215,6 +224,13 @@ public:
     // written the copied WAV is removed again, so no orphan is left.
     CollectionResult add (const HslinkTakeEntry& take);
 
+    // Pure: the tags add() stores, from metadata the take already has: backend id,
+    // whole-number BPM as "<n>bpm" (bpm > 0), key, mode. Trimmed, lowercased, empty
+    // and duplicate entries dropped, at most kMaxTags, in that order.
+    static constexpr int kMaxTags = 8;
+    static juce::StringArray buildTags (const juce::String& backend, double bpm,
+                                        const juce::String& key, const juce::String& mode);
+
     // Scans the root: every *.wav, newest added first. A WAV whose sidecar is missing
     // or unreadable is listed with sidecarMissing set and metadata derived from the
     // file; list() never deletes or rewrites anything. A sidecar with no WAV is ignored.
@@ -254,10 +270,14 @@ public:
     // testDisabled: add / list / remove / star / rename do nothing, filter returns its input.
     // testNoRootGuard: remove skips the inside-the-root check.
     // testFailSidecar: the next sidecar writes fail (exercises the no-orphan path).
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testDisabled, testNoRootGuard, testFailSidecar;
+#endif
     // remove() only, false in the plugin. testFailSidecarMove: the sidecar is not moved
     // and counts as kept. testFailRemoveRollback: the WAV is not put back after that.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testFailSidecarMove, testFailRemoveRollback;
+#endif
 
 private:
     bool isInsideRootLocked (const juce::File& f) const;
@@ -290,5 +310,7 @@ struct CollectionView
     static juce::String countText (int shown, int total, bool filtering); // "8" or "3 / 8"
     // Test hook (teeth), HSLINK_TEETH=NO_COLL_VIEW: subtitle returns an empty string,
     // queryFor returns the default query, the processor's background rescan does nothing.
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testDisabled;
+#endif
 };

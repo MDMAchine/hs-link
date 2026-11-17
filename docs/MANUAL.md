@@ -1,6 +1,6 @@
 # HOT-STEP LINK user manual
 
-Version 0.5.23 beta. This manual covers the plugin (VST3 and CLAP, which behave the same) and the Standalone application together; differences between the two are called out in each section.
+Version 0.5.24 beta. This manual covers the plugin (VST3 and CLAP, which behave the same) and the Standalone application together; differences between the two are called out in each section.
 
 ---
 
@@ -34,7 +34,7 @@ The pill colour and label also track the current job state: grey `offline`, whit
 
 ## Server URL and key
 
-Click SETTINGS in the header to open the settings panel. It holds the Server URL, DAW key, Mode, Backend and ACE model fields.
+Click SETTINGS in the header to open the settings panel. It holds the Server URL, DAW key, Mode, strength, Backend and ACE model fields.
 
 ![Settings panel open](images/LINK_settings.png)
 
@@ -43,6 +43,8 @@ The Server URL field sets the HOT-Step address. The default is `http://127.0.0.1
 The Key field holds the `X-DAW-Key` value. If your HOT-Step instance has `HOTSTEP_DAW_KEY` set in `config.yaml`, enter the same value here. The key is saved to your user application data folder (`HOT-Step/LINK.settings`), not to the project file. This means the key does not move with a session you share.
 
 Both fields are in plugin state and are saved and restored with your DAW project normally.
+
+**Reference mode.** The Mode / strength row controls whether reference audio is used. Only ACE-Step reads reference audio (`src_audio`). When the backend is set to Auto, the note "pick a backend to use reference audio" appears next to the row and the strength box is inactive; with any other backend than ACE-Step the note reads "reference audio needs ACE-Step". The first time the plugin opens, the empty SOURCE waveform shows a short hint for the reference flow (click it to hide it for good; see "Quick start: using a reference track" in the README). When ACE-Step is selected, the strength box accepts a value from 0.0 to 1.0 (sent as `cover_strength`, default 1.00); type a value or drag the box. The ACE model selection (Turbo or Base) is remembered when you switch to a different backend and back.
 
 ---
 
@@ -251,35 +253,49 @@ The Collection is a curated store of takes you want to keep across sessions. It 
 
 Click **Edit take** in the Takes header row to open the take editor for the selected take. The editor covers the Generate area; the Source, Takes, Queue and Preview areas stay usable while it is open. The editor works offline, with no HOT-Step server.
 
-![Take editor as opened](images/LINK_editor.png)
+The editor is laid out in five zones: a header strip, a waveform panel with a floating GRID EDIT panel to its right, a transport row, two rows of framed cards, and a footer strip.
 
-**What the editor shows.** The take name, tempo, sample rate, channel count and duration in the info row. A ruler in bars and beats. The warp marker lane, the loop lane and the waveform (two lanes for stereo). A scroll bar with the Loop and zoom buttons, a readout line, then rows for the toggles, audition, grid, warp, level and the action buttons. Undo, Redo and Close sit in the header.
+**Header strip.** The take file name and file info appear on the left. The POS readout shows the playhead position as bar.beat.tick and seconds (for example `0.4.4 | 0.000 s`). Undo and Redo step through the edit history. Close keeps the current crop points and returns to the main view.
 
-**Crop handles.** The `S` and `E` handles mark the start and end of the crop; the area outside is dimmed. Drag a handle to move it (Shift + drag places it freely). Handles cannot get closer than 20 ms. **Apply crop** makes a new take from the crop region; the original take is not changed. **Reset** puts the handles back at the file ends and clears the loop. **Cancel** restores the crop points from when the editor was opened. **Close** keeps the current points.
+**Waveform panel.** The panel holds a ruler in seconds, the warp marker lane, the loop lane, and the waveform (two lanes for stereo). The `S` and `E` crop handles mark the start and end of the crop; the area outside them is dimmed. Drag a handle to move it; Shift + drag places it freely. Handles cannot get closer than 20 ms. Click or drag in the loop lane to set a loop region (green flags with a bar between them). Below the waveform, an overview strip lets you jump to any part of the take by clicking it, and a scroll bar scrolls the view.
 
-**Readouts (new in 0.5.19).** The readout line under the waveform shows the crop and the loop with start, end and length, for example `Crop 1.219 s to 15.000 s (13.781 s)  Loop 0.848 s to 6.148 s (5.300 s)`. The grid row shows the grid offset (`offset 0 ms`) from the downbeat set by Set 1, Reset grid or opening the take. Under the warp row a hint line reads `Double-click: add marker. Double-click or Alt + click a marker: remove`, or the number of selected markers. The Export loop button names the repeat count (`Export loop x4`).
+**GRID EDIT panel.** A floating panel to the right of the waveform holds the grid controls.
 
-**Snap to grid and Zero crossing.** With Snap to grid on, a dragged handle or loop flag jumps from beat to beat of the take tempo. With Zero crossing on, Apply crop moves each cut to the nearest zero crossing within 3 ms so it does not click; loop points are not moved. **Zero crossing readout (new):** after Apply crop the result line says how far each cut moved, for example `cuts moved: start +0.0 ms, end +0.0 ms`.
+- **BPM.** Shows the current grid tempo as a large value (for example `120.00`). Drag the field vertically to adjust; hold Shift for fine steps.
+- **CONF.** A bar that fills according to grid quality. When a grid has been measured it also shows a confidence percentage (for example `92%`). Three indicator dots show which mode the grid detector is in: AUTO (tracked automatically), RAW (using the raw measurement), or LOW (below the confidence threshold).
+- **AUTO-WARP.** Sets the grid to the measured tempo and downbeat, then places warp markers on the tracked beats. Below medium confidence the markers stay on the grid.
+- **Set 1.** Puts the downbeat at the current playhead position. Alt + click on the ruler puts it there instead.
+- **Nudge earlier / nudge later.** Shift the grid by 1 ms (hold Shift for 10 ms). Ctrl + drag on the ruler drags the grid offset freely.
+- **/2 / x2.** Halve or double the grid tempo.
+- **+PIN / -PIN.** Add or remove a pin marker to lock a drift section of the grid.
 
-**Fit to bars.** With Fit to bars on, the readout next to the tempo field shows how many whole bars the crop covers and what is left over, for example `5 bars, +144.9 ms`. The tempo field now opens on the take tempo (30 to 300 BPM) and switches to what you type. Apply crop with Fit to bars on records the bar count in the result line. **Stretch to fit** then makes one more take, stretched with pitch kept to exactly that many bars at the field tempo. Fit to bars alone stretches nothing.
+**Transport row.** Below the waveform panel: Play, Stop, Loop, Loop /2, Loop x2, Click, Snap, Zero-X, zoom out (-), zoom in (+), Fit and Loop zoom.
 
-**Loop lane.** Click or drag in the loop lane to set a loop (green flags with a bar between them). **Loop /2** and **Loop x2** halve or double its length; the start stays. **Repeats** (1 to 64, default 4) sets how many times **Export loop** plays it in the new take. The result line warns in amber when the loop seam does not join cleanly. In 0.5.20 the audition loop seam uses the same crossfade as the render, forwards and reversed, so what you hear at the seam is what Export loop writes.
+Play starts audition from the current position. Stop halts it. Loop repeats the loop region (or the whole take when no loop is set) until Stop. Loop /2 halves the loop length; Loop x2 doubles it; the loop start stays. Click adds a metronome click on the grid beats to audition only; it is not written to any render. Snap makes dragged handles and loop flags jump to the nearest beat of the grid tempo. Zero-X makes Send to takes move each cut to the nearest zero crossing within 3 ms to avoid clicks; after each send the result line shows how far each cut moved. The zoom buttons and the mouse wheel change the waveform magnification; Shift + wheel scrolls.
 
-![Take editor with crop, loop, Fit to bars, Zero crossing, Click and Rev on](images/LINK_loop.png)
+**TIMING & GRID card.** The left card in the first row.
 
-**Audition and Click.** Play plays the loop (the whole take while no loop is set) on the editor's own clock; the host transport does not have to run. With Loop on it repeats until Stop. **Click (new)** adds a metronome on the grid beats to the audition only; it is never in a render.
+Grid BPM: a number box (-/value/+) that sets the grid tempo. Next to it, Offset shows how far the downbeat has been nudged (for example `0 ms`). Host BPM shows the tempo reported by the host (`--` when unavailable). Reset grid returns to the detected grid. Target BPM: sets the tempo used for Fit to bars and Stretch to fit. Fit to bars shows how many whole bars the crop covers at the target tempo and what is left over. Stretch to fit makes a new take, time-stretched with pitch kept, to exactly that number of bars at the target tempo.
 
-**Grid row.** Set 1 puts the downbeat at the playhead or the last click (Alt + click on the ruler does it there). `< 1ms` and `1ms >` nudge the grid (Shift: 10 ms; Ctrl + drag on the ruler drags it). The BPM field and its - / + buttons set the grid tempo; Grid /2 and Grid x2 halve or double it; Reset grid goes back to the detected grid.
+**WARP & QUANTIZE card.** The right card in the first row.
 
-**Warp row.** Warp on previews the take with the warp markers applied. Warp to host moves the markers so the whole take plays at the host tempo (the Fit to bars tempo with no host). Reset markers puts them back. Apply warp makes a new take with the warp rendered in. Select in loop, the To note value, Strength and Quantize move the selected markers toward the grid.
+WARP (the lit button in the card header) enables warp preview; the take plays with the warp markers applied. Warp to host moves the markers so the whole take plays at the host tempo. Select in loop selects all warp markers inside the loop region. Reset markers puts all markers back at their original positions. Warp res: a number box sets the grid resolution for the warp lane. Strength: how far each selected marker moves toward the grid on a Quantize operation. To: the note value to quantize to. Quantize moves the selected markers. Apply warp makes a new take with the warp rendered in; it renders only the S/E crop section.
 
-**Level row (new).** Fade **In** and **Out** (0 to 2000 ms, sine fades at the crop ends), loop crossfade **Xf** (0 to 500 ms, equal power at the loop seam) and **Gain** (-24 to +24 dB), each with a value box and - / + buttons. **Normalize** sets the gain so the peak of the cropped take is -1 dBFS. `Pk` shows that peak after the gain. The level settings apply to audition, Apply crop and Export loop, can be undone and are cleared by Reset.
+**FADES & LEVEL card.** The left card in the second row.
 
-**Reverse (new).** **Rev** plays the cropped take backwards in audition, Apply crop and Export loop. It is saved with the take edits, can be undone and is cleared by Reset.
+In (ms): fade-in length at the crop start (sine curve, 0 to 2000 ms). Out (ms): fade-out length at the crop end. Xf (ms): crossfade length at the loop seam (equal power, 0 to 500 ms). Gain (dB): overall level shift (-24 to +24 dB). Normalize sets the gain so the peak of the cropped take is -1 dBFS. Rev plays and renders the cropped take backwards. Peak shows the peak level of the cropped take after gain is applied. All level settings apply to audition, Send to takes and Export loop, can be undone, and are cleared by Reset.
 
-![After Apply crop: new take T2 selected, cuts moved readout in the result line](images/LINK_crop.png)
+**REGION & SPLICE card.** The right card in the second row.
 
-**Zoom.** `-`, `+` and Fit zoom the waveform; the mouse wheel zooms about the pointer, Shift + wheel scrolls.
+The Start, End, Length and Frames readouts show the current crop boundaries in seconds and in raw sample frames.
+
+Repeats: a number box sets how many times Export loop plays the loop region in the new take. The Export loop button label shows the current count (for example `Export loop x8`).
+
+**Cut / Splice** removes the loop region from the take and joins the two remaining ends with an equal-power crossfade. The result is a new take that plays through without the looped material. The crossfade length comes from the Xf setting in the FADES & LEVEL card.
+
+**Export loop** renders the loop region the set number of times and writes the result as a new take in the Takes grid.
+
+**Footer strip.** Runs along the bottom of the editor. The readout area shows the crop and loop positions (for example `Crop 1.440 s to 6.400 s (4.960 s)  Loop 2.400 s to 4.960 s (2.560 s)`); when an action completes, a result line replaces it briefly. Reset puts the S and E handles back at the file ends and clears the loop and all level settings. Cancel restores the crop points from when the editor was opened. Send to takes applies the crop, fades, gain and reverse settings and writes the result as a new take.
 
 ---
 
@@ -370,7 +386,7 @@ These items are not yet proven in practice. They are listed so you know what to 
 - **Host testing.** Ableton Live was tested by hand on 2026-10-07 (scanning, loading, generating, drag to timeline). Reaper, Samplitude and Bitwig have not been tested by hand; basic host operations such as state save and restore and transport sync are unverified in those hosts.
 - **Backend switch, 10 s timeout.** The 10 s wait that ends a switch attempt against a server that does not answer is not covered by any test. The test fake returns code 0 immediately; the actual wait has not been measured.
 - **Backend switch, cancel in flight.** When Cancel is pressed while the switch POST is in flight, the plugin calls `cancel()` on the HTTP request. This path is not covered by any test, because the test fake does not create a real socket.
-- **Backend switch, live server.** The backend switch has not been checked against a live HOT-Step server. Its `/api/backends` and `/api/backends/active` endpoints were designed for this use, but the round trip, the timing and the `backend_mismatch` error from the generate facade have not been observed in a real session.
+- **Backend switch, live server.** Checked against a live HOT-Step server on 2026-11-13 (LINK 0.5.21 standalone, four jobs with a switch between each: SA3, YuE2, ACE base, MiniMax-M3); every switch completed and every job finished. The `backend_mismatch` error from the generate facade has not been observed in a real session.
 - **Effect of a switch on a running render.** When HOT-Step switches backends, any render already in progress on the server continues under the old backend (the switch frees that backend's memory once the job ends). The plugin does not know when that job ends; the effect on takes in progress is not known.
 - **Drag to DAW timeline.** Drag to timeline uses the JUCE external drag API (`performExternalDragDropOfFiles`). Tested in Ableton Live on 2026-10-07; Reaper and Bitwig have not been tested by hand. Sandboxed hosts (Logic Pro, Bitwig) may block the file drop.
 

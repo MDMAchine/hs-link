@@ -77,12 +77,25 @@ public:
     void drawButtonBackground (juce::Graphics&, juce::Button&, const juce::Colour&, bool, bool) override;
     void drawButtonText (juce::Graphics&, juce::TextButton&, bool, bool) override;
     void drawComboBox (juce::Graphics&, int, int, bool, int, int, int, int, juce::ComboBox&) override;
+    void positionComboBoxText (juce::ComboBox&, juce::Label&) override;
     void fillTextEditorBackground (juce::Graphics&, int, int, juce::TextEditor&) override;
     void drawTextEditorOutline (juce::Graphics&, int, int, juce::TextEditor&) override;
     void drawLinearSlider (juce::Graphics&, int, int, int, int, float, float, float,
                            juce::Slider::SliderStyle, juce::Slider&) override;
     void drawRotarySlider (juce::Graphics&, int, int, int, int, float, float, float, juce::Slider&) override;
     juce::Font getLabelFont (juce::Label&) override;
+    // A menu item with its own text colour (a marked Backend entry) keeps that colour
+    // while the mouse is over it; every other item is drawn by the base class.
+    void drawPopupMenuItem (juce::Graphics&, const juce::Rectangle<int>&, bool, bool, bool, bool, bool,
+                            const juce::String&, const juce::String&, const juce::Drawable*, const juce::Colour*) override;
+    // Text colour of a Backend menu entry the server does not list: on the menu
+    // background (alpha 0.6) and on the highlight bar (alpha 0.7, so the text keeps
+    // WCAG 4.5:1 or better against the brighter bar).
+    static juce::Colour unlistedItemColour (bool onHighlightBar);
+#if defined (HSLINK_TEST_HOOKS)
+    // Teeth: true = the highlighted row keeps the menu-background alpha (the code before).
+    static inline bool testNoHighlightLift = false;
+#endif
 };
 
 // Banner over the Generate controls while the server is unreachable (the rest of the
@@ -127,7 +140,7 @@ public:
     void setIndex (int i) { if (i != index) { index = i; repaint(); } }
     // The measured-tempo tag in the waveform's lower left corner (TakeGrid::tempoTagOf).
     void setTempoTag (const TakeGrid::TempoTag& t) { if (t != tempoTag) { tempoTag = t; repaint(); } }
-    void setFitTag (const TakeGrid::TempoTag& t) { if (t != fitTag) { fitTag = t; repaint(); } }
+    void setFitTag (const TakeGrid::TempoTag& t, int score = -1) { if (t != fitTag || score != fitScore) { fitTag = t; fitScore = score; repaint(); } }
     const TakeGrid::TempoTag& getFitTag() const { return fitTag; }
     const TakeGrid::TempoTag& getTempoTag() const { return tempoTag; }
     // The take length in the waveform's lower right corner (TakeGrid::lengthTextOf).
@@ -135,9 +148,13 @@ public:
     const juce::String& getLengthText() const { return lengthText; }
     // true when the length plate is drawn: inside the waveform, its text not cut, and
     // clear of the tempo plate. plateOut/tempoOut: where they are ({} = not drawn).
+#if defined (HSLINK_TEST_HOOKS)
+    juce::Rectangle<int> waveAreaForTest() const { return waveArea(); }
+    int chipGapForTest() const; // waveform bottom to the nearest chip top, px (negative = overlap, 1000 = none)
     bool lengthFitsForTest (juce::Rectangle<int>* plateOut = nullptr, juce::Rectangle<int>* tempoOut = nullptr) const;
     juce::String tempoShownForTest() const { return tempoShown(); }
     static float lengthTextWidthForTest (const juce::String& t) { return lengthTextWidth (t); }
+#endif
     const juce::String key, label;
     // What the "x" button hands to onDelete: the full path of the take's temp file
     // (the processor's delete key). Two takes can share a name, so key is not used.
@@ -147,7 +164,21 @@ public:
     juce::File thumbFile;
     // src: TakeGrid::thumbSourceOf now. Re-points the waveform when thumbFile no longer
     // exists and src does (the temp copy was cleaned up after the cell was made).
+    // Also reads thumbFile again while the thumbnail has no length and the file is
+    // there: a cell can be made after its take is listed and before the take's file
+    // has its final name. At most kThumbRetries such reads per cell (an empty or
+    // unreadable file is not opened on every refresh); each is counted as tagCell.
+    // The first is made as soon as the file is there, the next ones at least
+    // kThumbRetryGapMs after the one before (millisecond counter, no file call).
+    // 9 reads 1000 ms apart cover the 8000 ms after the first one (3 covered 2000 ms).
+    // The reads are made by the owner's refresh only: a cell that is gone, has its
+    // length or has used its reads makes none.
     bool repointThumbIfGone (const juce::File& src);
+    static constexpr int kThumbRetries = 9;
+    static constexpr int kThumbRetryGapMs = 1000;
+    int thumbRetries = 0;
+    juce::uint32 thumbRetryAtMs = 0; // counter value at the last retry
+    static juce::uint32 thumbNowMs();
     // Every action names the take by its key; the file is looked up by the owner then.
     std::function<void (const juce::String&)> onSelect;
     std::function<void (const juce::String&, bool)> onStar;
@@ -162,10 +193,24 @@ public:
     // The check made once per drag gesture before the external drag starts: the file
     // exists and is not empty (counted as one EditorFs::tagDrag call). false = refuse.
     static bool dragFileUsable (const juce::File& f);
+#if defined (HSLINK_TEST_HOOKS)
     bool isDragRefusedForTest() const { return dragRefused; }
     bool isDragMissingForTest() const { return dragMissing; }
     bool isDragStartedForTest() const { return dragStarted; }
     void setDragStartedForTest (bool b) { dragStarted = b; }
+#endif
+#if defined (HSLINK_TEST_HOOKS)
+    // Seconds of audio the waveform thumbnail knows about (0 = nothing read: "loading...").
+    double thumbLengthForTest() const { return thumb.getTotalLength(); }
+    // The clock of the retry spacing (null = the millisecond counter).
+    static inline std::function<juce::uint32()> testThumbClock;
+    // Teeth: true = no spacing between the retries (the code before).
+    static inline bool testThumbNoSpacing = false;
+    // existsAsFile calls made by repointThumbIfGone on the same-path branch.
+    static inline std::atomic<int> testThumbExistsCalls { 0 };
+    // Teeth: above 0 = the retry cap used instead of kThumbRetries (3 = the code before).
+    static inline int testThumbRetryCap = 0;
+#endif
 private:
     void changeListenerCallback (juce::ChangeBroadcaster*) override { repaint(); }
     int index;
@@ -178,8 +223,12 @@ private:
     bool missing = false;
     bool dragMissing = false; // the refusal is for a lasting file that is gone or empty
     TakeGrid::TempoTag tempoTag, fitTag;
+    int fitScore = -1; // fitMinScore, drives the FIT bar
     juce::String lengthText;
     juce::Rectangle<int> waveArea() const;       // the waveform rectangle paint() draws in
+    bool hasChipRow() const;                     // a bpm or length chip is shown
+    juce::Rectangle<int> chipRow() const;        // the chip row under the waveform ({} = none)
+    static constexpr int kChipRowH = 12, kChipGap = 3;
     juce::Rectangle<int> tempoPlate() const;     // {} = no tempo tag
     juce::Rectangle<int> lengthPlate() const;    // {} = no length (or no room in the whole waveform width)
     juce::String tempoShown() const;             // the tempo tag, shortened so the length always shows
@@ -276,7 +325,9 @@ public:
     void setSelected (bool s) { if (s != selected) { selected = s; repaint(); } }
     // Tests: what mouseDrag does once the pointer has moved far enough. True = the file
     // was there at the one check this gesture makes (the drag itself is not started here).
+#if defined (HSLINK_TEST_HOOKS)
     bool dragCheckForTest() { return checkDragFile(); }
+#endif
     const CollectionItem item;
     std::function<void (const CollectionItem&)> onSelect, onRemove;
     std::function<void (const CollectionItem&, bool)> onStar;
@@ -303,6 +354,9 @@ public:
     const CollectionChips& getChips() const { return chips; }
     // Footer message, held until it expires (tick) so nothing overwrites it early.
     void showNote (const juce::String& text, bool isError, int holdMs = 4500);
+#if defined (HSLINK_TEST_HOOKS)
+    juce::String noteTextForTest() const { return note; }
+#endif
     void tick();
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -337,6 +391,10 @@ class RoleCardRow : public juce::Component
 public:
     RoleCardRow() { setMouseCursor (juce::MouseCursor::PointingHandCursor); }
     void setActive (int card) { if (card != active) { active = card; repaint(); } }
+    // Bit i set = card i is painted dimmed (its backend is not listed by the server).
+    // Look only: a dimmed card still takes the click.
+    void setDimmed (unsigned mask) { if (mask != dimmed) { dimmed = mask; repaint(); } }
+    unsigned getDimmed() const { return dimmed; }
     int getActive() const { return active; }
     void paint (juce::Graphics&) override;
     void mouseMove (const juce::MouseEvent&) override;
@@ -348,6 +406,7 @@ private:
     juce::Rectangle<int> cardBounds (int i) const;
     int cardAt (juce::Point<int> p) const;
     int active = -1, hover = -1;
+    unsigned dimmed = 0;
 };
 
 // SOURCE panel waveform (Mockup A): min/max peaks of the source clip, bar ruler under
@@ -362,6 +421,8 @@ public:
     enum class CaptureState { idle, recording, captured };
     struct HeaderStyle { juce::Colour text; bool dot = false; };
     static HeaderStyle headerStyleFor (CaptureState s);
+    // Pure: the small header label. No source and not recording = empty (nothing is drawn).
+    static juce::String headerLabelFor (bool recording, bool hasSource);
     ~SourceWaveView() override;
     // Message thread. Starts a peak build when file or length changed; empty file clears.
     void setSource (const juce::File& file, double lengthS, double bpm);
@@ -369,9 +430,36 @@ public:
     bool poll();
     void setRecording (bool r) { if (r != recording) { recording = r; repaint(); } }
     void paint (juce::Graphics&) override;
+#if defined (HSLINK_TEST_HOOKS)
     bool hasPeaksForTest() const { return peaks != nullptr && peaks->ok; }
+#endif
+
+    // First-run reference hint: drawn in the empty waveform area in place of "no capture
+    // yet" until a source exists or the user clicks it. Never drawn when it does not fit.
+    static constexpr float kRefHintFontH = 10.5f;
+    static constexpr int kRefHintLineH = 13;
+    // Pure: the hint lines. compact = the one-line form for a short waveform area.
+    static juce::StringArray refHintLines (bool standalone, bool compact);
+    // Pure: every line fits the width and the lines fit the height.
+    static bool refHintFits (const juce::StringArray& lines, juce::Rectangle<int> area);
+    // Pure: the lines to draw in that area (two-line form first, then compact); empty = none fit.
+    static juce::StringArray refHintFor (bool standalone, juce::Rectangle<int> area);
+    void setRefHint (bool on, bool standaloneApp);
+    juce::Rectangle<int> waveArea() const; // the one source for paint and the hint
+    bool refHintShowing() const;           // hint on, no source, not recording, and it fits
+    void mouseDown (const juce::MouseEvent&) override;
+    std::function<void()> onRefHintDismiss;
+#if defined (HSLINK_TEST_HOOKS)
+    // Teeth (tests only, default off): refHintFits always true; refHintShowing ignores the source.
+    static std::atomic<bool> testHintAlwaysFits, testHintIgnoresSource;
+    // Teeth (tests only, default off): the header label reads CAPTURED with no source (the old code).
+    static std::atomic<bool> testLabelAlwaysCaptured;
+    juce::String headerLabelForTest() const { return headerLabel(); }
+#endif
 
 private:
+    juce::String headerLabel() const; // what paint() draws in the header, from the view's own state
+    bool refHintOn = false, refHintStandalone = false;
     struct Shared
     {
         std::mutex lock;
@@ -390,6 +478,19 @@ private:
 
 // Settings popover (Mockup A): holds the former SETUP form. The controls are
 // reparented here once; they keep their values and attachments across open/close.
+// Export MIDI picker: a small hardware card anchored above the split Export MIDI button.
+class MidiExportPopover : public juce::Component
+{
+public:
+    juce::TextButton drumsButton { "Drums" }, melodyButton { "Melody" }, chordsButton { "Chords" },
+        perBeatButton { "Per beat" }, tempoButton { "Tempo" }, oneFileButton { "One file" };
+    juce::TextButton closeButton { "Close" };
+    MidiExportPopover();
+    void paint (juce::Graphics&) override;
+    void resized() override;
+    static constexpr int kW = 228, kH = 10 + 24 + 8 + 3 * 24 + 2 * 6 + 10;
+};
+
 class SettingsPopover : public juce::Component
 {
 public:
@@ -410,6 +511,14 @@ struct MidiBuildInputs
     int mutant = 0;                          // test mutants (0 = real)
     int quantDiv = 0;                        // export quantize grid: 0 off, 16, 8
     double quantStrength = 1.0;              // 0..1
+    bool chords = false;                     // also write <name>_chords.mid (and a KeySig in every file)
+    // Export picker (U1). Melody and chords are Auto: asked for, but skipped with a reason
+    // in MidiBuildResult::skipped when the take is not tonal / no chord is found.
+    bool drums = true;                       // <name>_hits.mid
+    bool melody = true;                      // <name>_melody.mid (tonal takes only)
+    bool tempo = true;                       // <name>_tempo.mid (takes with a tempo only)
+    bool combined = false;                   // one <name>_multitrack.mid instead of the separate files
+    int chordMode = 0;                       // 0 per-bar, 1 per-beat (ChordExport::Mode)
     // The loop (else the crop) of the take in frames of src (through the warp when one is
     // in effect); end exclusive. -1 = file start / file end. Only hits inside are kept,
     // timed from regionStart, and the tempo map is shifted to match.
@@ -418,6 +527,18 @@ struct MidiBuildInputs
 struct MidiBuildResult
 {
     juce::File tempo, hits, notes;           // {} = not written (notes: only for tonal takes)
+    juce::File chords;                       // {} = not asked for, or no chord found
+    juce::File combined;                     // {} = not asked for (in.combined), else the multitrack file
+    juce::StringArray skipped;               // why an asked-for part was not written ("melody: ...")
+    // Every file written, in drag / Saved-to order (combined, hits, melody, chords, tempo).
+    juce::Array<juce::File> files() const
+    {
+        juce::Array<juce::File> out;
+        for (const auto& f : { combined, hits, notes, chords, tempo })
+            if (f != juce::File())
+                out.add (f);
+        return out;
+    }
     juce::String err;                        // empty = ok
 };
 // Reads in.src, writes <name>_hits.mid (and <name>_tempo.mid when hasTempo, and
@@ -453,7 +574,8 @@ private:
     bool dragStarted = false, building = false;
 };
 
-class HotStepLinkEditor : public juce::AudioProcessorEditor, public juce::FileDragAndDropTarget, public juce::KeyListener
+class HotStepLinkEditor : public juce::AudioProcessorEditor, public juce::FileDragAndDropTarget, public juce::KeyListener,
+                          private juce::AudioProcessorValueTreeState::Listener
 {
 public:
     explicit HotStepLinkEditor (HotStepLinkProcessor&);
@@ -464,7 +586,10 @@ public:
     using juce::AudioProcessorEditor::keyPressed;
     bool keyPressed (const juce::KeyPress&, juce::Component*) override;
     void parentHierarchyChanged() override;
+    void visibilityChanged() override; // masks the DAW key again when the editor is hidden
+#if defined (HSLINK_TEST_HOOKS)
     static std::atomic<bool> testNoTopLevelKeys; // teeth: the top-level undo/redo route is off
+#endif
 
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -490,16 +615,21 @@ public:
     // Test access (the test binary has no display). runRefreshForTest runs one VBlank
     // tick including the part that runs on every 10th tick. getTakeGridForTest is the
     // model the grid was last filled from; getTakeCellKeysForTest the keys of the cells.
+#if defined (HSLINK_TEST_HOOKS)
     void runRefreshForTest() { tick (true); }
+#endif
     // Label of the "+4 more like" button for a take label ({} = none selected); short so it fits.
     // availWidth = button width minus the 4 px side margins; the take id is dropped when it would not fit.
     static juce::String moreLikeTextFor (const juce::String& takeLabel, float availWidth = 1.0e9f);
     static float moreLikeLabelWidth (const juce::String& text);
+#if defined (HSLINK_TEST_HOOKS)
     juce::TextButton& getMoreLikeButtonForTest() { return moreLikeButton; }
     const TakeGrid::Model& getTakeGridForTest() const { return takeModel; }
     juce::StringArray getTakeCellKeysForTest() const { return takeList.getCellKeys(); }
     const void* getTakeCellForTest (const juce::String& key) const { return takeList.cellForKey (key); }
+#endif
     // The file the cell's waveform thumbnail was given ({} = no cell, or no source).
+#if defined (HSLINK_TEST_HOOKS)
     juce::File getTakeThumbSourceForTest (const juce::String& key) const
     {
         const auto* c = takeList.cellForKey (key);
@@ -508,43 +638,126 @@ public:
     void selectTakeForTest (const juce::String& key) { selectTake (key); }
     void setSettingsOpenForTest (bool open) { setSettingsOpen (open); }
     bool settingsOpenForTest() const { return settingsPopover.isVisible(); }
+#endif
+#if defined (HSLINK_TEST_HOOKS)
+    juce::ComboBox& backendBoxForTest() { return backendBox; }
+    unsigned roleDimmedForTest() const { return roleCards.getDimmed(); }
+    // true when the Backend menu item at this index (0..5) carries the "not listed by
+    // the server" text colour. Read from the menu the popup is built from.
+    bool backendItemMarkedForTest (int index) { return backendItemMarked (index); }
+    // Teeth: true = a take still being handed over counts as known at once, so its
+    // auto-select runs while its file is not there (the code before).
+    static inline bool testSelectInHandOver = false;
+    juce::TextEditor& keyEditorForTest() { return keyEditor; }
+    const juce::Label& keySaveNoteForTest() const { return keySaveNote; }
+    const juce::Label& keyCaptionForTest() const { return keyCaption; }
+    juce::TextButton& keyRevealButtonForTest() { return keyRevealButton; }
+    bool keyRevealedForTest() const { return keyRevealed; }
+    // Teeth, test build only: 0 = the code as shipped; 1 = the toggle leaves the password
+    // character alone; 2 = opening or closing the panel does not mask again; 3 = the toggle saves;
+    // 4 = the key field gets its text before it has a parent (set before the editor is built);
+    // 5 = hiding the editor does not mask again; 6 = opening the take editor does not mask again;
+    // 7 = the button is 26 px high (set before the editor is built); 8 = the job line sets no tooltip;
+    // 9 = the tooltip ignores the full text (the cut text at most); 10 = the tooltip is always the
+    // line's text, short or not (9 and 10 together are the code before the full-text tooltip).
+    static inline int testKeyRevealMutant = 0;
+    juce::TextEditor& urlEditorForTest() { return urlEditor; }
+    juce::Label& jobLabelForTest() { return jobLabel; }
+    void setCurrentJobForTest (int localId) { currentJob = localId; }
+#endif
+    // Pure: the refused-save note that fits availWidth px at the note font (10 pt), long form
+    // first, then the short form; empty when neither fits.
+    static juce::String keySaveNoteTextFor (float availWidth);
+    static float keySaveNoteWidth (const juce::String& text);
+    // Reference lock (repaint, lego, strength are ACE-Step only).
+#if defined (HSLINK_TEST_HOOKS)
+    void applyBackendRefLockForTest() { applyBackendRefLock(); }
+    void setServerModelsForTest (bool nonTurbo, bool base) { lastNonTurbo = nonTurbo; lastBase = base; applyBackendRefLock(); }
+    bool modeItemEnabledForTest (int id) const { return modeBox.isItemEnabled (id); }
+    juce::TextEditor& strengthEditorForTest() { return strengthEditor; }
+    const juce::Label& refLockNoteForTest() const { return refLockNote; }
+#endif
+    // Pure: the note beside "Mode / strength" for a backend id ("" = Auto); empty = no note.
+    static juce::String refLockNoteText (const juce::String& backendId);
+    // First-run reference hint in the SOURCE waveform (seen flag lives in LINK.settings).
+#if defined (HSLINK_TEST_HOOKS)
+    SourceWaveView& sourceWaveForTest() { return sourceWave; }
+    bool refHintSeenForTest() const { return refHintSeen; }
+    void dismissRefHintForTest() { dismissRefHint(); }
+    void refreshSourceForTest() { refreshSource(); }
+    juce::Rectangle<int> sourcePanelForTest() const { return sourcePanel; }
+    juce::String sourceTextForTest() const { return lastSourceText; }
+    juce::Rectangle<int> settingsPopoverBoundsForTest() const { return settingsPopover.getBounds(); }
+    juce::String reanalyzeTooltipForTest() { return reanalyzeButton.getTooltip(); }
+    juce::Rectangle<int> modeBoxBoundsForTest() const { return modeBox.getBounds(); }
+    juce::ComboBox& modeBoxForTest() { return modeBox; }
+#endif
+    // S2: exposure warning state (label shown, URL outline colour or transparent if unset, tooltip).
+#if defined (HSLINK_TEST_HOOKS)
+    bool exposureShownForTest() const { return exposureLabel.isVisible(); }
+    juce::Colour urlOutlineForTest() const
+    {
+        return urlEditor.isColourSpecified (juce::TextEditor::outlineColourId)
+                   ? urlEditor.findColour (juce::TextEditor::outlineColourId) : juce::Colours::transparentBlack;
+    }
+    juce::String urlTooltipForTest() { return urlEditor.getTooltip(); }
     juce::File dragFileForTest (const juce::String& key) { return dragFileFor (key); }
     bool exportEnabledForTest() const { return exportWavButton.isEnabled(); }
+#endif
     // The file Export WAV would read now ({} = nothing selected); no chooser is opened.
+#if defined (HSLINK_TEST_HOOKS)
     juce::File exportSourceForTest() { return exportSource(); }
+#endif
     // Teeth (HSLINK_TEETH=NO_WARP_EXPORT): Export and drag ignore the editor's warp.
+#if defined (HSLINK_TEST_HOOKS)
     bool noWarpExportForTest = false;
+#endif
     // Test mutants: skip the cache cap / the tempo tag on a newly written warped file.
+#if defined (HSLINK_TEST_HOOKS)
     bool noWarpCacheCapForTest = false;
     bool noWarpTagForTest = false;
+#endif
     // Keep at most kWarpCacheMax files in <root>_warped and drop any older than
     // kWarpCacheMaxAgeDays, oldest first; keep is never removed.
     static constexpr int kWarpCacheMax = 64;
     static constexpr int kWarpCacheMaxAgeDays = 7;
     static void trimWarpCache (const juce::File& dir, const juce::File& keep);
+#if defined (HSLINK_TEST_HOOKS)
     juce::File warpedFileForTest (const juce::File& temp, const juce::File& src) { return warpedFileFor (temp, src); }
+#endif
     // The "x" of a take cell and the Undo button, without a click.
+#if defined (HSLINK_TEST_HOOKS)
     void deleteTakeForTest (const juce::String& tempPath) { deleteTake (tempPath); }
     void undoDeleteForTest() { undoDelete(); }
     bool moreLikeEnabledForTest() const { return moreLikeButton.isEnabled(); }
+#endif
     // The "+4 more like take N" click for a take key, without a click.
+#if defined (HSLINK_TEST_HOOKS)
     void startMoreLikeForTest (const juce::String& key) { startMoreLike (key); }
     void loadTakeIntoSlotForTest (const juce::String& key, int slot) { loadTakeIntoSlot (key, slot); }
     bool undoRowVisibleForTest() const { return undoDeleteButton.isVisible(); }
+#endif
     // The "Edit take" button without a click (false = no take cell is selected), and the panel.
+#if defined (HSLINK_TEST_HOOKS)
     bool openTakeEditorForTest() { return openTakeEditor(); }
     TakeEditorPanel& getTakeEditorForTest() { return takeEditor; }
+#endif
     juce::Component::SafePointer<juce::Component> keyHost; // top-level component our KeyListener is on
+#if defined (HSLINK_TEST_HOOKS)
     bool editTakeEnabledForTest() const { return editTakeButton.isEnabled(); }
+#endif
     // -1 = no cell for key, else 1 when the cell shows missing and is dimmed.
+#if defined (HSLINK_TEST_HOOKS)
     int takeCellMissingForTest (const juce::String& key) const;
     juce::Rectangle<int> editTakeBoundsForTest() const { return editTakeButton.getBounds(); }
     juce::Rectangle<int> reanalyzeBoundsForTest() const { return reanalyzeButton.getBounds(); }
     juce::Rectangle<int> setupPlateForTest() const { return setupPlate; }
     juce::Rectangle<int> generateBoundsForTest() const { return generateButton.getBounds(); }
+#endif
     // Offline banner (covers only the Generate controls) and the WAV-to-take path.
     // Mutant: mutOverlayFullWindow = the banner covers the whole window again.
     enum OfflineMutant { mutOfflineNone = 0, mutOverlayFullWindow = 1 };
+#if defined (HSLINK_TEST_HOOKS)
     int offlineMutantForTest = mutOfflineNone; // call resized() after setting
     juce::Rectangle<int> offlineBannerBoundsForTest() const { return overlay.getBounds(); }
     bool offlineBannerVisibleForTest() const { return overlay.isVisible(); }
@@ -552,42 +765,73 @@ public:
     juce::Rectangle<int> addTakeBoundsForTest() const { return addTakeButton.getBounds(); }
     bool generateEnabledForTest() const { return generateButton.isEnabled(); }
     bool addTakeFromFileForTest (const juce::File& f) { return addTakeFromFile (f); }
+#endif
     // 0 take list, 1 Edit take, 2 audition Play, 3 Export WAV, 4 collection panel.
+#if defined (HSLINK_TEST_HOOKS)
     juce::Component* offlineTargetForTest (int which)
     {
         juce::Component* c[] = { &takeList, &editTakeButton, &playButton, &exportWavButton, &collectionPanel };
         return which >= 0 && which < 5 ? c[which] : nullptr;
     }
     bool forceStandaloneForTest = false; // the test exe is not a standalone app: lets filesDropped run
+#endif
     // Teeth: true = Add as take and WAV drop are Standalone only again (the pre-E1 gate).
+#if defined (HSLINK_TEST_HOOKS)
     bool addTakeStandaloneOnlyForTest = false;
     bool addTakeVisibleForTest() const { return addTakeButton.isVisible(); }
     void applyAddTakeGateForTest() { addTakeButton.setVisible (addTakeAllowed()); resized(); }
     bool noAutoSelectForTest = false; // teeth: a newly arrived take is not selected by refreshTakes
+#endif
     // Header counters (b1e6a71): the TAKES and QUEUE counts the editor last repainted for.
     // Teeth HEADER_NO_REPAINT: noHeaderRepaintForTest restores the old code (no repaint
     // after setCards, none on the auto-select early return of refreshTakes).
+#if defined (HSLINK_TEST_HOOKS)
     bool noHeaderRepaintForTest = false;
     int queueCountShownForTest() const { return lastQueueCountShown; }
     int takeCountShownForTest() const { return lastTakeCountShown; }
+    juce::Rectangle<int> cancelBoundsForTest() const { return cancelButton.getBounds(); }
+    juce::Rectangle<int> jobCardForTest() const { return jobCard; }
+    juce::Rectangle<int> takeListBoundsForTest() const { return takeList.getBounds(); }
     bool openEditorBlocksSelectForTest = false; // teeth: an open take editor blocks the auto-select (the v0.5.19 bug)
     int takeCellCountForTest() const { return takeList.getNumCells(); }
     juce::Rectangle<int> exportWavBoundsForTest() const { return exportWavButton.getBounds(); }
+#endif
     // Smallest window with the whole Preview section. Height: the rows of the middle plate
     // take 700 px, and previewWaveArea() needs a card of 60 px. Hosts clamp to this too.
-    static constexpr int kMinWindowW = 1080, kMinWindowH = 760;
+    static constexpr int kMinWindowW = 1182, kMinWindowH = 760; // v5b R1: 1182 fits the take editor cards (content w 568)
+#if defined (HSLINK_TEST_HOOKS)
     juce::Rectangle<int> exportMidiBoundsForTest() const { return exportMidiButton.getBounds(); }
     juce::Rectangle<int> quantizeBoundsForTest() const { return quantizeBox.getBounds(); }
+    juce::Rectangle<int> quantStrengthBoundsForTest() const { return quantStrengthSlider.getBounds(); }
+    const juce::ComboBox& quantizeBoxForTest() const { return quantizeBox; }
+    static inline bool testOldQuantLayout = false; // teeth: HSLINK_TEETH=QB_OLD restores the pre-ac7e6c7 Q combo sizing
     juce::Rectangle<int> midiDragBoundsForTest() const { return midiDrag.getBounds(); }
     bool exportMidiEnabledForTest() const { return exportMidiButton.isEnabled(); }
+#endif
     // Export MIDI without a click. midiSyncForTest = run the export and its completion on
     // this thread (no worker, no callAsync). Mutants: 1 = the writer uses a fixed 120 BPM,
     // 2 = every hit one onset hop (2.5 ms) late.
+#if defined (HSLINK_TEST_HOOKS)
     bool midiSyncForTest = false;
     int midiMutantForTest = 0;
     void exportMidiForTest() { exportMidi(); }
     juce::File lastMidiTempoForTest() const { return lastMidiTempo; }
     juce::File lastMidiHitsForTest() const { return lastMidiHits; }
+#endif
+    // Export picker (U1): open state, the toggles, and the bounds for the layout check.
+#if defined (HSLINK_TEST_HOOKS)
+    void setMidiPickerOpenForTest (bool open) { setMidiPickerOpen (open); }
+    bool midiPickerOpenForTest() const { return midiPicker.isVisible(); }
+    MidiExportPopover& midiPickerForTest() { return midiPicker; }
+    juce::Rectangle<int> midiPickerBoundsForTest() const { return midiPicker.getBounds(); }
+    juce::Rectangle<int> midiMenuBoundsForTest() const { return exportMidiMenuButton.getBounds(); }
+    juce::StringArray lastMidiFilesForTest() const { return lastMidiFiles; }
+    juce::String exportPathTextForTest() const { return exportPathLabel.getText(); }
+    juce::Rectangle<int> exportPathBoundsForTest() const { return exportPathLabel.getBounds(); }
+    juce::Rectangle<int> showExportBoundsForTest() const { return showExportButton.getBounds(); }
+    bool showExportVisibleForTest() const { return showExportButton.isVisible(); }
+    static inline bool testSkipExportResult = false; // teeth: HSLINK_U2_MUTANT=3 skips the Saved-to status update
+    juce::String collectionNoteForTest() const { return collectionPanel.noteTextForTest(); } // U2: skip reasons
     bool midiDragEnabledForTest() const { return midiDrag.isEnabled(); }
     bool midiDragBuildingForTest() const { return midiDrag.isBuilding(); }
     juce::Rectangle<int> playBoundsForTest() const { return playButton.getBounds(); }
@@ -599,22 +843,41 @@ public:
     juce::Rectangle<int> genPlateForTest() const { return genPlate; }
     juce::Rectangle<int> previewHeaderForTest() const { return previewHeaderArea(); }
     juce::Rectangle<int> queueListBoundsForTest() const { return queueList.getBounds(); }
+#endif
     // True while the seed field holds a text that was refused (over the limit).
+#if defined (HSLINK_TEST_HOOKS)
     bool isSeedRefusedForTest() const { return seedRefused; }
+#endif
     // Types into the seed field without committing it (no Return, no focus loss).
+#if defined (HSLINK_TEST_HOOKS)
     void typeSeedForTest (const juce::String& t) { seedEditor.setText (t, false); }
+#endif
     // Header bar animation phase (advanced by the VBlank tick at about 20 fps).
+#if defined (HSLINK_TEST_HOOKS)
     int getHeaderAnimFrameForTest() const { return headerAnimFrame; }
+#endif
 
 private:
     HslinkLook look; // declared first so it outlives every child
     juce::Rectangle<int> headerArea, statusArea, collectionArea, setupPlate, genPlate, queuePlate, jobCard, previewCard, sourceSlot;
     void paintSection (juce::Graphics&, juce::Rectangle<int> plate, const juce::String& title, int count) const;
     void refreshSyncReadout();
+    void applyTakesLimit (bool announce);
+    void applyBackendRefLock();       // reference audio (repaint, lego, strength) is ACE-Step only
+    void applyIgnoredSettings();      // card 65840a44: grey controls the backend ignores
+    juce::StringArray durationNotedKeys; // takes already checked for a Duration mismatch
+    void parameterChanged (const juce::String& id, float) override; // backend -> Takes clamp, any thread
+    juce::String takesNote; juce::uint32 takesNoteUntilMs = 0; // status line note after a Takes clamp
     void refreshSource();
     void useSourceFile (const juce::File& f);
     void refreshServerStatus();
     void applyModeGating (const DawStatus& st);
+    // Backend picker entries and role cards the connected server does not list are marked
+    // (dimmed text; never hidden, never disabled, the setting is never changed).
+    // Message thread, from refreshServerStatus.
+    void applyBackendAvailability (const DawStatus& st);
+    bool backendItemMarked (int index);
+    juce::String lastBackendAvailKey { "?" };
     // takesOverride > 0 and seedOverride >= 0 replace the takes count and the seed of
     // this one request only (the "+4 more like take N" button); the settings stay as they are.
     void startJob (int takesOverride = 0, juce::int64 seedOverride = -1);
@@ -622,7 +885,9 @@ private:
     // for this take (takeSeed + 1, so none of the four repeats take N exactly).
     void startMoreLike (const juce::String& key);
     void loadTakeIntoSlot (const juce::String& key, int slot); // per-row A/B: take settings into the header A/B slot
+#if defined (HSLINK_TEST_HOOKS)
     void seedDebugTakes();                                      // standalone debug hook only (HSLINK_DEBUG_SEED_TAKES)
+#endif
     void refreshJob();
     void refreshTakes();
     void tick (bool periodic);
@@ -654,7 +919,11 @@ private:
     juce::TextButton addTakeButton { "Add as take..." };
     std::unique_ptr<juce::FileChooser> addTakeChooser;
     // Add as take + WAV drop: every format (VST3, CLAP, Standalone) since E1.
+#if defined (HSLINK_TEST_HOOKS)
     bool addTakeAllowed() const { return standalone || forceStandaloneForTest || ! addTakeStandaloneOnlyForTest; }
+#else
+    bool addTakeAllowed() const { return true; }
+#endif
     bool addTakeFromFile (const juce::File& f); // false = not a readable audio file / already listed
     bool lastServerOnline = true;               // false = known offline: Generate is blocked
     // CAPTURE (Mockup A): stop-and-keep while recording (armCapture(false) keeps the
@@ -687,6 +956,10 @@ private:
 
     // R6 export
     juce::TextButton exportWavButton { "Export WAV" }, exportMidiButton { "Export MIDI" };
+    juce::TextButton exportMidiMenuButton { "v" }; // split half: opens the MIDI export picker
+    MidiExportPopover midiPicker;
+    void setMidiPickerOpen (bool open);
+    void applyMidiPicker (MidiBuildInputs& in) const; // picker toggles into the build inputs
     juce::ComboBox quantizeBox;
     juce::Slider quantStrengthSlider { juce::Slider::LinearHorizontal, juce::Slider::NoTextBox };
     std::unique_ptr<juce::FileChooser> exportChooser;
@@ -696,9 +969,10 @@ private:
     juce::Label exportPathLabel;
     juce::TextButton showExportButton { "Show in folder" };
     juce::File lastExportFile;
-    void showExportResult (const juce::File& written);
+    void showExportResult (const juce::File& written, const juce::StringArray& names = {});
     juce::File lastMidiSelection;          // the selected take the files below belong to
     juce::File lastMidiTempo, lastMidiHits, lastMidiNotes; // {} = not written (tempo: the take had no tempo)
+    juce::StringArray lastMidiFiles;       // full paths of every file the last build wrote (drag list)
 
     // R5 take list + audition
     TakeListComponent takeList;
@@ -729,7 +1003,22 @@ private:
     void refreshPreview();
 
     // R4 job hookup
-    juce::Label captionCaption, jobLabel;
+    juce::Label captionCaption;
+    // The job line elides long text (28 px, 11 px font). Its tooltip is the complete status
+    // text, set only when there is more than the line shows (a fuller text than the line's,
+    // or a line too long for its box); otherwise there is no tooltip. Message thread only.
+    struct JobLabel : juce::Label
+    {
+        // shown: the line. full: the complete text, or empty when shown is all there is.
+        void setStatus (const juce::String& shown, const juce::String& full);
+        void textWasChanged() override;
+        void resized() override;
+        bool lineIsCut() const; // the text does not fit the label's box
+        void updateTip();
+        juce::String fullText;
+        bool inSetStatus = false;
+    };
+    JobLabel jobLabel;
     juce::TextEditor captionEditor;
     juce::Label lyricsCaption;
     juce::TextEditor lyricsEditor;
@@ -741,7 +1030,7 @@ private:
     int selectedJob = 0; // queue card whose takes the TAKES area shows, 0 = all
     QueueListComponent queueList;
     void refreshQueue();
-    juce::String lastJobText;
+    juce::String lastJobText, lastJobFull;
 
     HotStepLinkProcessor& proc;
     const bool standalone;
@@ -764,7 +1053,15 @@ private:
     void closeTakeEditor (bool restore);
 
     juce::Label titleLabel, versionLabel, syncLabel, urlCaption, keyCaption;
+    juce::Label exposureLabel; // S2: "Remote server, no key set"
     juce::Label modeCaption, serverLabel;
+    juce::TextEditor strengthEditor;  // cover_strength 0..1, no steppers
+    juce::Label refLockNote;          // shown when the backend is not ACE-Step (text per refLockNoteText)
+    juce::Label keySaveNote;          // "DAW key" caption row: the last key save was tried and refused
+    void noteKeySave (bool saveTried, bool stored); // shows on a refused save, clears on a save that went through
+    static constexpr int kKeyNoteGap = 6; // least clear px between the caption text and the note text
+    bool refHintSeen = false;         // LINK.settings "refHintSeen"; written by a click on the hint or the first capture
+    void dismissRefHint();
     juce::ComboBox modeBox; // UI-only for now (not automatable), wired to jobs in R4
     OfflineOverlay overlay;
     int vblankTick = 0;
@@ -784,8 +1081,10 @@ private:
     juce::String lastServerText;
     PillState pillState = PillState::offline;
 public:
+#if defined (HSLINK_TEST_HOOKS)
     PillState getPillStateForTest() const { return pillState; }
     juce::String getServerTextForTest() const { return lastServerText; }
+#endif
 private:
     bool lastOnline = true, lastBase = true, lastNonTurbo = true, gatingInit = false;
     juce::Label backendCaption, durationCaption, takesCaption, variationCaption, guidanceCaption, stepsCaption, aceModelCaption, bpmCaption;
@@ -794,6 +1093,15 @@ private:
     juce::String lastModelGateMode;
     void applyAceModelGating (bool baseOk);
     juce::TextEditor urlEditor, keyEditor;
+    // Show / Hide beside the DAW key field (same SETTINGS card row). Display only: it never
+    // changes or saves the key. Masked again every time the panel opens or closes.
+    juce::TextButton keyRevealButton { "Show" };
+    bool keyRevealed = false;
+    void setKeyRevealed (bool revealed);
+    static constexpr int kKeyRevealW = 44; // px, short-label button (36 px least)
+    static constexpr int kKeyRevealH = 24; // px, the panel's button height (same as Close)
+    void commitServerUrl();
+    void updateExposureWarning();
     juce::ComboBox backendBox;
     juce::Slider durationSlider, takesSlider, variationKnob, guidanceKnob, stepsKnob;
     int generateCount = 0; // generates sent from this editor: n of SeedSpread::spread

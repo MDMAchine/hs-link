@@ -30,7 +30,10 @@ namespace TempoMeasure
         double bpm = 0.0;
         double confidence = 0.0;     // 0..1
         Level level = Level::none;
-        double downbeatSec = 0.0;    // guess: time of the first bar start in the file
+        double downbeatSec = 0.0;    // guess: first bar start on the fixed-tempo lattice (fixed-grid callers)
+        // The same downbeat moved onto the strongest onset within 15 percent of a beat
+        // (the played bar start on a drifting take). Only for WarpMarkers::trackBeats.
+        double downbeatSnappedSec = 0.0;
         // How far the beats wander from a fixed grid at bpm: the largest mean distance
         // of the onsets from the grid over any window of some beats, in ms.
         double driftMs = 0.0;

@@ -25,7 +25,9 @@
 
 namespace TakeStretch
 {
+#if defined (HSLINK_TEST_HOOKS)
 std::atomic<const char*> testPartToken { nullptr };
+#endif
 
 namespace
 {
@@ -199,7 +201,11 @@ namespace
         in.setSize (0, 0);
 
         // Write beside dest under a temporary name, then rename without replacing.
+#if defined (HSLINK_TEST_HOOKS)
         const auto* fixedToken = testPartToken.load();
+#else
+        const char* const fixedToken = nullptr;
+#endif
         const auto part = rq.dest.getSiblingFile (rq.dest.getFileName() + "." + (fixedToken != nullptr ? juce::String (fixedToken) : ExclusiveFile::uniqueToken (6))
                                                  + ".stretching");
         // Created here, exclusively: a file that is already at that name is not ours and is

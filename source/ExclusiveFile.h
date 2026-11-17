@@ -108,9 +108,11 @@ namespace ExclusiveFile
     // cancelInFlight calls that reached CancelSynchronousIo. testIoCancelHits: those for
     // which it reported success (a synchronous call was in flight and was marked
     // cancelled).
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> ioCancelEnabled;
     extern std::atomic<int> testIoCancelCalls;
     extern std::atomic<int> testIoCancelHits;
+#endif
 
     // True for the partial files copyUnique writes ("*.part").
     bool isPartial (const juce::File& f);
@@ -174,26 +176,36 @@ namespace ExclusiveFile
     // calls. testNoLegacyGuard true (teeth only) = tryAcquireExisting creates the lock
     // file like tryAcquire, so a folder without owner.lock counts as a dead session, and
     // the lockless-instance registry of DawWorker is ignored (the behaviour of 3cf372b).
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> sessionLockEnabled;
     extern std::atomic<bool> testSessionLockFails;
     extern std::atomic<bool> testNoLegacyGuard;
     extern std::atomic<int> testOwnerAcquires;
+#endif
 
     // Test hooks. Defaults are the shipped behaviour.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testLegacyOverwrite;  // true = pick a free name, then juce copyFileTo
     extern std::atomic<int> testLostRenames;       // renames refused because the name was taken
+#endif
     // Called on the copying thread after the name was picked and before the file is
     // published under it. Set and cleared only while no copy is running.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::function<void (const juce::File& picked)> testBeforePublish;
+#endif
     // true = shouldAbort is never read (the behaviour before the abort check; teeth only).
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> testIgnoreAbort;
+#endif
     // Called on the copying thread before each blocking step of ensureFolder and
     // copyUnique, after the abort check, with the step's name: "source", "folder probe",
     // "parent probe", "create", "created probe", "source size", "part probe", "copy",
     // "size check", "name probe", "rename". Null in the shipped plugin. A test may delay
     // or hold the thread in it. It runs "in a call" for IoCanceller, so a synchronous
     // read it blocks in is ended by cancelInFlight.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<void (*) (const char* step)> testStepHook;
+#endif
 
     // The byte copy of copyUnique. copyCancelEnabled false (teeth) = once the copy has
     // started neither shouldAbort nor the hook's answer stops it (the behaviour of the
@@ -206,11 +218,13 @@ namespace ExclusiveFile
     // the copy like shouldAbort does. Counters: testCopiesStarted = byte copies
     // started, testCopiesCancelled = byte copies cancelled (by shouldAbort, by the hook
     // or by IoCanceller), testCopyProgressCalls = progress routine calls.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<bool> copyCancelEnabled;
     extern std::atomic<int (*) (juce::int64 done, juce::int64 total)> testCopyProgressHook;
     extern std::atomic<int> testCopiesStarted;
     extern std::atomic<int> testCopiesCancelled;
     extern std::atomic<int> testCopyProgressCalls;
+#endif
 
     // Cleanup of the .part file. testCleanupCalls counts the file-system calls made to
     // remove a .part file on failure or abort (1 per copyUnique call that removes one;
@@ -218,8 +232,10 @@ namespace ExclusiveFile
     // its own partial file, and 0 when the copy failed on an existing name).
     // testLegacyPartCleanup true (teeth) = the three calls juce::File::deleteFile makes
     // (exists, isDirectory, delete), each counted.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> testCleanupCalls;
     extern std::atomic<bool> testLegacyPartCleanup;
+#endif
 
     // The .part name. testPartToken, when not null, replaces the random token of every
     // copyUnique call ("<name>.<token>.part"); the pointer must stay valid while set.
@@ -228,9 +244,11 @@ namespace ExclusiveFile
     // testStepHook at the "copy" step. testPartExistsFailures counts copies that failed
     // because the name existed. testLegacyPartDelete true (teeth) = that failure deletes
     // the file like any other failure (the behaviour before).
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<const char*> testPartToken;
     extern std::atomic<int> testPartExistsFailures;
     extern std::atomic<bool> testLegacyPartDelete;
+#endif
 
     // ensureFolder. testCreateFault: 0 = none; 1 = creates fail with a hard error (as
     // access denied or a dead share would); 2 = they fail with "parent missing". A
@@ -239,17 +257,19 @@ namespace ExclusiveFile
     // down to 0, after which creates are real again. testCreateCalls counts create
     // attempts (faulted or real), testFolderTries the tries (loop passes) of all
     // ensureFolder calls. testLegacyFolderRetry true (teeth) = 8 tries on any failure.
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> testCreateFault;
     extern std::atomic<int> testCreateFaultsLeft;
     extern std::atomic<int> testCreateCalls;
     extern std::atomic<int> testFolderTries;
     extern std::atomic<bool> testLegacyFolderRetry;
+#endif
 
     // Which thread makes a blocking step. A thread carries a tag (default tagOther):
     // the take saver thread sets tagSaver for its whole run, registerTake and the
     // DawWorker thread set tagWorker, and the processor's destructor sets tagClosing on
     // the thread that runs it. testStepsByTag[tag] counts every step that passed its
-    // abort check, in the shipped plugin too (one atomic increment per file step).
+    // abort check (test builds only; the shipped plugin does not count).
     // threadTag() can be read inside testStepHook. Tests reset the counters themselves.
     enum ThreadTag { tagOther = 0, tagWorker = 1, tagSaver = 2, tagClosing = 3, tagCount = 4 };
     int threadTag();
@@ -259,5 +279,7 @@ namespace ExclusiveFile
         ~ScopedThreadTag();
         int previous;
     };
+#if defined (HSLINK_TEST_HOOKS)
     extern std::atomic<int> testStepsByTag[tagCount];
+#endif
 }
