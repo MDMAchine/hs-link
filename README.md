@@ -197,7 +197,7 @@ RE-ANALYZE CAPTURE is not a step in this: it only fills KEY, TEMPO EST. and the 
 
 ## Network and security
 
-HOT-Step binds on `0.0.0.0` with CORS wide open. The DAW facade accepts any origin by default. On a typical setup the plugin and server are on the same machine, so only loopback traffic is involved.
+HOT-Step v1.5.2 and later bind to `127.0.0.1` (loopback) by default and reject requests from foreign web origins. Older HOT-Step versions listened on all interfaces with permissive CORS; if you run an older version, update to v1.5.2 or newer. On a typical setup the plugin and server are on the same machine, so only loopback traffic is involved.
 
 If you run HOT-Step on a different machine on your LAN, set a shared secret in HOT-Step's `config.yaml` (`HOTSTEP_DAW_KEY`) and enter the same value in the plugin's Key field. The plugin sends the key as `X-DAW-Key` on every request. Requests arriving from a non-loopback address without the correct key are rejected.
 
